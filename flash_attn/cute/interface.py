@@ -1402,12 +1402,15 @@ def _flash_attn_bwd(
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
         m_block_size = 64
         n_block_size = 64
-        if head_dim <= 64:
-            num_stages_Q = 2
-            num_stages_dO = 2
-        else:
-            num_stages_Q = 1
-            num_stages_dO = 1
+        # num_stages=1 across all head_dim on consumer Blackwell. At
+        # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base
+        # default was ns=2 but the async pipeline overhead exceeds the
+        # latency-hiding benefit at small tile size. Phase 17C tightened
+        # paired validation (RTX 5090, n_measure=30, interleaved trials)
+        # confirms geomean speedup ~1.06x on 19 d=64 cells with 0
+        # regressions >2%.
+        num_stages_Q = 1
+        num_stages_dO = 1
         SdP_swapAB = False
         dKV_swapAB = False
         dQ_swapAB = False
