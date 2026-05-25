@@ -1420,7 +1420,7 @@ def _flash_attn_bwd(
         V_in_regs = False
         cluster_size = 1
         use_2cta_instrs = False
-        num_threads = 128
+        num_threads = 256
         dQ_single_wg = True
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
@@ -2028,6 +2028,15 @@ def _flash_attn_bwd(
             # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
             num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
             num_threads_post_dKV = cfg.num_wg * 128
+        elif arch // 10 == 12:
+            # SM120: postprocess MUST match the main kernel's num_threads
+            # because the dq_accum/dk_accum byte buffers are written by the main
+            # kernel using a thread-major partition (gmem_tiled_copy_dQaccum)
+            # whose stride is num_threads. The postprocess reader uses the same
+            # convention; otherwise the per-thread element->address mapping
+            # diverges between writer and reader.
+            num_threads_post_dQ = num_threads
+            num_threads_post_dKV = num_threads
         else:
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128

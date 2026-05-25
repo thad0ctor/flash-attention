@@ -827,7 +827,25 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
+            # SM120-only: the R2P bitmask fast-path in mask.py assumes the
+            # per-thread MMA accumulator column indices follow the standard
+            # SM80/SM90 pattern (col pairs at stride 8). When AtomLayoutSdP has
+            # multiple N-warps (the SM120 256-thread / 8-warp configuration
+            # uses AtomLayoutSdP=(4,2,1) -> 2 N-warps), the per-thread cols
+            # interleave at stride 16 instead, breaking the bitmask mapping.
+            # Disable r2p in that case. Gated to sm_120 (FlashAttentionBackwardSm120
+            # sets `arch = 120`); the SM80 path is unaffected because it does
+            # not subclass with that attribute.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                num_mma_warps_sdp = self.num_threads // cute.arch.WARP_SIZE
+                n_warps_sdp_val = num_mma_warps_sdp // self.AtomLayoutMSdP if not self.SdP_swapAB else self.AtomLayoutMSdP
+                r2p_compatible = cutlass.const_expr(n_warps_sdp_val == 1)
+            else:
+                r2p_compatible = cutlass.const_expr(True)
+            mask = AttentionMask(
+                self.m_block_size, self.n_block_size, seqlen,
+                r2p_compatible=r2p_compatible,
+            )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
@@ -924,9 +942,6 @@ class FlashAttentionBackwardSm80:
                 )
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
-        bidx = 0
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
         for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
             acc_S_mn[r, None].store(cute.math.exp2(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r], fastmath=True))
