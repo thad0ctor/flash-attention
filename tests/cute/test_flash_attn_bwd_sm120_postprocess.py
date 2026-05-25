@@ -146,13 +146,15 @@ def test_sm120_postprocess_uses_universal_copy_for_dq_store(D):
     """
     _sm120_only()
     import inspect
+    import re
     from flash_attn.cute import flash_bwd_postprocess
 
     src = inspect.getsource(flash_bwd_postprocess.FlashAttentionBackwardPostprocess)
     # The fix introduces a `store_atom_arch` variable that picks 80 for
     # arch in [8, 12] before calling get_smem_store_atom. Concretely, the
     # bare `self.arch` must not be the first positional argument anymore.
-    assert "get_smem_store_atom(\n                        self.arch," not in src, (
+    # Whitespace-agnostic so a reformat can't silently disarm the guard.
+    assert re.search(r"get_smem_store_atom\(\s*self\.arch\s*,", src) is None, (
         "flash_bwd_postprocess passes self.arch (==120 on SM120) into "
         "get_smem_store_atom, which selects stmatrix despite the SM80 MMA "
         "output layout. See commit bc67a9c for the forward-side analog."
