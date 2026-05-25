@@ -212,6 +212,11 @@ def _run_paged_case(
 
 TOL_BF16 = 0.05
 
+# Deterministic per-pattern seeds. Python's builtin `hash(str)` is
+# process-randomized (PYTHONHASHSEED), which would make these tests
+# non-reproducible across runs and harder to debug on tolerance failures.
+PATTERN_SEEDS = {"identity": 101, "permuted": 202, "shared": 303}
+
 
 @pytest.mark.parametrize("page_size,seqlen_k", [(16, 256), (64, 256), (256, 512)])
 def test_page_sizes(page_size, seqlen_k):
@@ -226,7 +231,7 @@ def test_page_sizes(page_size, seqlen_k):
 def test_page_table_patterns(page_table_pattern):
     _sm120_only()
     md, _ = _run_paged_case(
-        page_table_pattern=page_table_pattern, seed=hash(page_table_pattern) & 0xFFFF,
+        page_table_pattern=page_table_pattern, seed=PATTERN_SEEDS[page_table_pattern],
     )
     assert md < TOL_BF16, f"max diff {md:.5f} >= {TOL_BF16}"
 
@@ -285,7 +290,7 @@ def test_d_gt64_page_table_patterns(d, page_table_pattern):
     _sm120_only()
     md, _ = _run_paged_case(
         d=d, page_table_pattern=page_table_pattern,
-        seed=d * 1000 + (hash(page_table_pattern) & 0xFFFF),
+        seed=d * 1000 + PATTERN_SEEDS[page_table_pattern],
     )
     assert md < TOL_BF16, f"d={d} {page_table_pattern}: max diff {md:.5f} >= {TOL_BF16}"
 
