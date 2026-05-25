@@ -106,6 +106,13 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
             f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for hd256."
         )
+    elif compute_capability == 12:
+        # Validate host-side; without this, invalid head_dims reach the kernel
+        # and fault with cudaErrorMisalignedAddress.
+        assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM120. "
+            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+        )
 
 
 @dataclass(frozen=True)
@@ -426,7 +433,7 @@ def _flash_attn_fwd(
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
-    if arch // 10 not in [8, 12]:
+    if arch // 10 != 8:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim) if qv is None else 1.0 / math.sqrt(head_dim + head_dim_v)
@@ -435,14 +442,16 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-        # `pack_gqa.compute_ptr` trips `cute.crd2idx` on SM_120 because
-        # cuTeDSL collapses the composite (qhead_per_kvhead, seqlen_q) mode
-        # in `mO[None, 0]` to a rank-1 layout, then refuses the rank-2 coord
-        # `((h_idx, m_idx),)` at pack_gqa.py:139. Default the consumer
-        # Blackwell path to the unpacked GQA codepath; an explicit
-        # `pack_gqa=True` from the caller is still honoured.
-        if pack_gqa and arch // 10 == 12:
-            pack_gqa = False
+    # pack_gqa + paged-KV on the SM80-base SM120 path produces wrong output
+    # (PagedKVManager's K/V indexing doesn't consume mQ's packed composite mode).
+    if page_table is not None and pack_gqa:
+        pack_gqa = False
+    # pack_gqa_layout makes mQ.shape[0] composite ((qhead_per_kvhead, seqlen_q));
+    # cute.local_tile by (tile_m, tile_hdim) needs tile_m % qhead_per_kvhead == 0
+    # at the qhead boundary. SM120's tile_m=128 covers 1/2/4/8/16-way GQA but
+    # not 7-way (qwen2.5-7b 28q/4kv). Other arches choose tile_m differently.
+    if arch // 10 == 12 and pack_gqa and qhead_per_kvhead > 1 and 128 % qhead_per_kvhead != 0:
+        pack_gqa = False
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
@@ -503,15 +512,62 @@ def _flash_attn_fwd(
         num_threads = 128
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
+    sm120_num_stages = 1
     if tile_mn is None:
         if arch // 10 == 12:
-            # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim <= 64:
+            # SM120 forward tile lookup tuned on RTX 5090. See phase5c/REPORT.md
+            # for methodology and per-cell wins. Misses fall back to the
+            # head_dim-only brackets below.
+            _SM120_TILE_LOOKUP = {
+                # (head_dim, qhead_per_kvhead, seqlen, causal): (tile_m, tile_n, num_stages)
+                (64, 1, 512, 0): (128, 128, 1), (64, 1, 512, 1): (64, 64, 1),
+                (64, 1, 1024, 0): (128, 128, 1),(64, 1, 1024, 1): (64, 64, 1),
+                (64, 1, 2048, 0): (64, 64, 1),  (64, 1, 2048, 1): (64, 64, 2),
+                (64, 1, 4096, 0): (64, 48, 1),  (64, 1, 4096, 1): (64, 64, 1),
+                (64, 1, 8192, 0): (64, 48, 1),  (64, 1, 8192, 1): (64, 64, 2),
+                (64, 1, 16384, 0): (128, 32, 1),(64, 1, 16384, 1): (128, 128, 1),
+                (64, 4, 512, 0): (64, 128, 1),  (64, 4, 512, 1): (64, 64, 2),
+                (64, 4, 1024, 0): (128, 128, 1),(64, 4, 1024, 1): (64, 48, 1),
+                (64, 4, 2048, 0): (128, 128, 1),(64, 4, 2048, 1): (64, 64, 1),
+                (64, 4, 4096, 0): (64, 128, 1), (64, 4, 4096, 1): (64, 48, 1),
+                (64, 4, 8192, 0): (128, 128, 1),(64, 4, 8192, 1): (64, 128, 1),
+                (64, 4, 16384, 0): (128, 128, 1),(64, 4, 16384, 1): (64, 64, 2),
+                (128, 4, 512, 0): (128, 64, 1), (128, 4, 512, 1): (64, 128, 1),
+                (128, 4, 1024, 0): (128, 32, 1),(128, 4, 1024, 1): (64, 16, 1),
+                (128, 4, 2048, 0): (64, 64, 1), (128, 4, 2048, 1): (64, 96, 1),
+                (128, 4, 4096, 0): (64, 64, 1), (128, 4, 4096, 1): (64, 96, 1),
+                (128, 4, 8192, 0): (128, 64, 1),(128, 4, 8192, 1): (64, 64, 1),
+                (128, 4, 16384, 0): (128, 64, 1),(128, 4, 16384, 1): (64, 64, 1),
+                (128, 7, 512, 0): (128, 64, 1), (128, 7, 512, 1): (64, 64, 2),
+                (128, 7, 1024, 0): (64, 96, 1), (128, 7, 1024, 1): (64, 128, 1),
+                (128, 7, 2048, 0): (128, 64, 1),(128, 7, 2048, 1): (64, 128, 1),
+                (128, 7, 4096, 0): (64, 32, 2), (128, 7, 4096, 1): (64, 96, 1),
+                (128, 7, 8192, 0): (128, 64, 1),(128, 7, 8192, 1): (64, 128, 1),
+                (128, 7, 16384, 0): (128, 64, 1),(128, 7, 16384, 1): (64, 128, 1),
+            }
+            sl = max_seqlen_k if max_seqlen_k is not None else seqlen_k
+            lookup_key = (head_dim, qhead_per_kvhead, sl, int(bool(causal)))
+            # Paged-KV needs tile_n >= num_threads (128) so PagedKVManager's
+            # page_entry_per_thread = tile_n // num_threads >= 1. For
+            # head_dim <= 128 force (128, 128, ns=1); SMEM fits (48 KB at
+            # d=64, 72 KB at d=96, 96 KB at d=128 with d==dv). head_dim>128
+            # is rejected in the gate below.
+            if page_table is not None and head_dim <= 128 and head_dim_v <= 128:
                 fwd_cfg = FwdConfig(128, 128, True, True)
+                sm120_num_stages = 1
+            elif head_dim > 128:
+                # d=256: (128, 64) overflows the 99 KB SMEM cap; shrink to 64x64.
+                fwd_cfg = FwdConfig(64, 64, True, True)
+            elif lookup_key in _SM120_TILE_LOOKUP:
+                tm, tn, ns = _SM120_TILE_LOOKUP[lookup_key]
+                fwd_cfg = FwdConfig(tm, tn, True, True)
+                sm120_num_stages = ns
             else:
-                fwd_cfg = FwdConfig(128, 64, True, True)
+                # Conservative fallback for shapes outside the tuned lookup.
+                if head_dim <= 64:
+                    fwd_cfg = FwdConfig(128, 128, True, True)
+                else:  # 64 < head_dim ≤ 128
+                    fwd_cfg = FwdConfig(128, 64, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -721,6 +777,16 @@ def _flash_attn_fwd(
         pack_gqa,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
+        # On SM120 the SM80-base paged-KV mainloop (phase4R) bakes
+        # page_size assumptions into FastDivmodDivisor; without keying on
+        # page_size, reusing the kernel across calls with different
+        # page_size values produces cudaErrorIllegalAddress.
+        page_size if (arch // 10 == 12 and page_size is not None) else None,
+        # SM120 forward picks num_stages per shape from the Phase 5c lookup;
+        # different lookup entries with the same (tile_m, tile_n) but differing
+        # num_stages would otherwise share a compile_key and silently reuse the
+        # first-compiled kernel.
+        sm120_num_stages if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -919,13 +985,29 @@ def _flash_attn_fwd(
                     use_clc_scheduler=use_clc_scheduler,
                 )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            # TMA kernel when: no paged KV, no varlen, no block sparsity
-            is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
+            # SM120 (Blackwell GeForce / DGX Spark): SM80 MMA with 99 KB SMEM.
+            # Paged-KV needs tile_n >= num_threads (PagedKVManager's
+            # page_entry_per_thread = tile_n // num_threads >= 1). The
+            # tile-picker above forces (128, 128, ns=1) for head_dim <= 128,
+            # which fits SMEM. head_dim>128 with paged-KV would require
+            # tile_n>=128 + d>128 -> SMEM overflow, so reject.
+            if page_table is not None and head_dim > 128:
+                raise NotImplementedError(
+                    f"Paged KV with head_dim={head_dim} (>128) is not supported "
+                    f"on SM 12.0: tile_n>=128 (required by PagedKVManager) at "
+                    f"head_dim>128 overflows the 99 KB SMEM cap. Use head_dim<=128 "
+                    f"or run on SM100/SM90."
+                )
+            # The TMA kernel builds a fixed (tile_m, tile_hdim) Q TMA atom
+            # from the unpacked layout, so pack_gqa=True must take the
+            # SM80-base path (which calls pack_gqa_layout). is_varlen here
+            # is the outer-scope value that includes seqused_q/seqused_k —
+            # do not narrow it to only cu_seqlens.
             use_tma_sm120 = (
                 page_table is None
                 and not is_varlen
                 and not use_block_sparsity
+                and not pack_gqa
             )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n,
@@ -948,6 +1030,23 @@ def _flash_attn_fwd(
                     has_aux_tensors=aux_tensors is not None,
                 )
             else:
+                assert not is_split_kv, "SplitKV not supported on SM 12.0 (SM80-base kernel)"
+                # can_implement gates configs that would either overflow SMEM
+                # or fault on bad head_dim divisibility. head_dim > head_dim_v
+                # is supported on this (non-TMA) path; the TMA path still
+                # rejects it via can_implement and falls through here.
+                assert FlashAttentionForwardSm120.can_implement(
+                    dtype, head_dim, head_dim_v, tile_m, tile_n,
+                    num_stages=sm120_num_stages, num_threads=num_threads, is_causal=causal,
+                    Q_in_regs=False,
+                ), (
+                    f"FlashAttentionForwardSm120 cannot implement "
+                    f"(head_dim={head_dim}, head_dim_v={head_dim_v}, "
+                    f"tile_m={tile_m}, tile_n={tile_n}) on SM 12.0. "
+                    f"Common causes: "
+                    f"tile_m*head_dim + 2*tile_n*head_dim*num_stages > 99 KB, "
+                    f"or head_dim not divisible by 8."
+                )
                 fa_fwd = FlashAttentionForwardSm120(
                     dtype,
                     head_dim,
@@ -955,11 +1054,10 @@ def _flash_attn_fwd(
                     qhead_per_kvhead,
                     is_causal=causal,
                     is_local=local,
-                    is_split_kv=is_split_kv,
                     pack_gqa=pack_gqa,
                     tile_m=tile_m,
                     tile_n=tile_n,
-                    num_stages=1,
+                    num_stages=sm120_num_stages,
                     num_threads=num_threads,
                     Q_in_regs=False,
                     score_mod=score_mod,
@@ -970,7 +1068,7 @@ def _flash_attn_fwd(
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
-        # TODO: check @can_implement
+        # TODO: check @can_implement for non-SM120 paths too
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
@@ -1320,10 +1418,19 @@ def _flash_attn_bwd(
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
+        dQ_single_wg = True
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
-        assert deterministic is False, "deterministic backward not supported on SM 12.0"
+        # Not an SM120-specific SMEM issue: the SM80 base kernel itself uses
+        # raw atomic_add_fp32 for dQ accumulation and asserts on mdQ_semaphore
+        # being None (see flash_bwd.py:~395). The semaphore-based dQ scheduler
+        # for deterministic writes only exists in SM90/SM100.
+        assert deterministic is False, (
+            "deterministic backward not supported on SM 12.0 "
+            "(SM80 base kernel lacks the dQ_semaphore code path; "
+            "see flash_bwd.py:~395 'determinism not supported yet for Sm80')"
+        )
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(
             head_dim,
@@ -1445,7 +1552,7 @@ def _flash_attn_bwd(
         ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
-    if arch // 10 != 12:
+    if arch // 10 != 8:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)

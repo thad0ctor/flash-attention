@@ -42,6 +42,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
             return False
         if head_dim_v % 8 != 0:
             return False
+        # NOTE: head_dim > head_dim_v works fine on this SM80-base non-TMA
+        # path. The previous Bug E hang lives in FlashAttentionForwardSm120Tma
+        # (which still rejects head_dim > head_dim_v in its can_implement);
+        # the dispatcher falls through to this non-TMA path when the TMA
+        # path refuses, so d > dv shapes are handled here.
         if tile_n % 16 != 0:
             return False
         if num_threads % 32 != 0:

@@ -108,10 +108,14 @@ class SeqlenInfoQK:
         if const_expr(mSeqUsedQ is not None):
             seqlen_q = mSeqUsedQ[batch_idx]
         else:
+            # SM80/SM120 over-launch wasted grid tiles with batch_idx clamped
+            # to num_batch (unlike SM90, which gates on work_tile.is_valid_tile).
+            # Clamp the cu_seqlens index so the read stays in-allocation and
+            # the wasted tile sees seqlen=0.
             seqlen_q = (
                 seqlen_q_static
                 if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - offset_q
+                else mCuSeqlensQ[cutlass.min(batch_idx + 1, mCuSeqlensQ.shape[0] - 1)] - offset_q
             )
         if const_expr(mSeqUsedK is not None):
             seqlen_k = mSeqUsedK[batch_idx]
@@ -119,7 +123,7 @@ class SeqlenInfoQK:
             seqlen_k = (
                 seqlen_k_static
                 if const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - offset_k
+                else mCuSeqlensK[cutlass.min(batch_idx + 1, mCuSeqlensK.shape[0] - 1)] - offset_k
             )
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n

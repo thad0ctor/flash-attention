@@ -483,8 +483,10 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
+    # nvvm.atomicrmw on cutlass-dsl >= 4.x: result type is inferred from `a`;
+    # the older `res=` kwarg was removed.
     nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+        op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
     )
 
 

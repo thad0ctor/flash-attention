@@ -30,10 +30,16 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.pack_gqa import PackGQA
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import run_block_sparse_mainloop_sm80, get_total_block_count
+from cutlass.cute import FastDivmodDivisor
+from flash_attn.cute.block_sparse_utils import (
+    run_block_sparse_mainloop_sm80,
+    get_curr_blocksparse_tensors,
+    sparse_tensor_m_block,
+)
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 
 
@@ -351,13 +357,12 @@ class FlashAttentionForwardBase:
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
-        # The SM80 base class uses mma.sync.aligned.m16n8k16. Its output
-        # register layout is NOT compatible with the SM90 stmatrix path that
-        # get_smem_store_atom picks for any arch >= 90. On consumer Blackwell
-        # self.arch comes from the DSL as sm_120, so this would silently
-        # scramble the rmem->smem transfer in the epilogue. Force the
-        # SM80-compatible universal copy here regardless of self.arch.
-        smem_copy_atom_O = utils.get_smem_store_atom(80, self.dtype)
+        # SM80/SM120 use SM80 MMA (m16n8k16) whose register layout is incompatible
+        # with the SM90 stmatrix path get_smem_store_atom picks for arch >= 90;
+        # force universal copy for them. SM90 keeps stmatrix (matches WGMMA layout).
+        arch_int = self.arch.major * 10 + self.arch.minor
+        store_atom_arch = 80 if arch_int // 10 in [8, 12] else arch_int
+        smem_copy_atom_O = utils.get_smem_store_atom(store_atom_arch, self.dtype)
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
@@ -581,6 +586,11 @@ class FlashAttentionForwardBase:
                 pred=tVpV if const_expr(self.check_hdim_v_oob) else None,
             )
 
+    # Paged-KV variants. Same call signature as non-paged load_K/load_V above
+    # so the mainloop is unchanged. load_K refreshes the page-table register
+    # fragment for n_block; load_V on the same n_block reuses those indices.
+    # need_predicates is ignored — PagedKVManager.load_KV bounds reads internally.
+
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     def _get_smem_layout_atom(self):
@@ -685,6 +695,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        # Fold qhead_per_kvhead into the seqlen mode of mQ/mO/mLSE so the
+        # mainloop iterates over KV heads with packed Q rows. Required for
+        # the epilogue's pack_gqa.store_O strides to make sense.
+        if const_expr(self.pack_gqa):
+            nheads_kv = mK.shape[2]
+            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            if const_expr(mLSE is not None):
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
         # TileScheduler for varlen, simple grid for non-varlen
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -695,8 +714,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             if const_expr(mCuSeqlensQ is not None)
             else mQ.shape[3]
         )
+        # When pack_gqa is True, mQ.shape[0] is a composite (qhead_per_kvhead,
+        # seqlen_q) mode, so we use cute.size() to get the flat number of
+        # packed rows; mQ.shape[2] is nheads_kv (not nheads_q).  Mirrors the
+        # SM90 dispatch in flash_fwd_sm90.py:322-336.
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mQ.shape[0], self.tile_m),
+            num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
             num_splits=1,
@@ -726,6 +749,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             softmax_scale_log2,
             softmax_scale,
             window_size_left,
@@ -766,6 +790,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -805,10 +830,26 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
+        # When pack_gqa is True, mQ.shape[0] is a composite (qhead_per_kvhead,
+        # seqlen_q) mode produced by pack_gqa_layout in __call__.  The static
+        # seqlen_q is the second sub-mode (shape[0][1]); shape[0] itself would
+        # be the packed total qhead_per_kvhead * seqlen_q.
+        seqlen_q_static = (
+            mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1]
+        )
+        # When paged KV is enabled, mK has shape (page_size, d, h_k, num_pages)
+        # after the KV_layout_transpose in __call__. The logical seqlen_k upper
+        # bound is page_size * max_pages_per_seq, not page_size; mSeqUsedK gives
+        # the true per-batch length and (if present) overrides this static value.
+        seqlen_k_static = (
+            mK.shape[0]
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1]
+        )
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_size,
-            seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
+            seqlen_q_static=seqlen_q_static,
+            seqlen_k_static=seqlen_k_static,
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
@@ -827,20 +868,33 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        num_head_kv = num_head // self.qhead_per_kvhead
+        # With pack_gqa, num_head iterates over KV heads (mQ.shape[2] is
+        # nheads_kv) and equals head_idx_kv directly; without pack_gqa,
+        # num_head iterates over all Q heads and we divide to get the KV head.
+        num_head_kv = (
+            num_head // self.qhead_per_kvhead
+            if const_expr(not self.pack_gqa)
+            else num_head
+        )
         if const_expr(not seqlen.has_cu_seqlens_q):
             mQ_cur = mQ[None, None, num_head, batch_size]
         else:
             mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
-        if const_expr(not seqlen.has_cu_seqlens_k):
-            mK_cur = mK[None, None, num_head_kv, batch_size]
-            mV_cur = mV[None, None, num_head_kv, batch_size]
+        # gK/gV are only used by the contiguous (non-paged) load path. For paged KV
+        # the PagedKVManager indexes mK/mV directly via the page table.
+        if const_expr(mPageTable is None):
+            if const_expr(not seqlen.has_cu_seqlens_k):
+                mK_cur = mK[None, None, num_head_kv, batch_size]
+                mV_cur = mV[None, None, num_head_kv, batch_size]
+            else:
+                mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
+                mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
+            gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
+            gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
         else:
-            mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
-            mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
+            gK = None
+            gV = None
         gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
-        gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
-        gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -859,9 +913,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
         gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
         # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
+        tKsK = gmem_thr_copy_K.partition_D(sK)
+        tVsV = gmem_thr_copy_V.partition_D(sV)
+        if const_expr(mPageTable is None):
+            tKgK = gmem_thr_copy_K.partition_S(gK)
+            tVgV = gmem_thr_copy_V.partition_S(gV)
+        else:
+            tKgK = None
+            tVgV = None
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile MMA compute thread partitions and allocate accumulators
@@ -943,27 +1002,30 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tSsK=tSsK,
             tOsVt=tOsVt,
         )
-        load_K = partial(
-            self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
-        )
-        load_V = partial(
-            self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
-        )
+        if const_expr(mPageTable is None):
+            load_K = partial(
+                self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK,
+                seqlen=seqlen.seqlen_k,
+            )
+            load_V = partial(
+                self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
+                seqlen=seqlen.seqlen_k,
+            )
 
-        compute_one_n_block = partial(
-            self.compute_one_n_block,
-            mma_params=mma_params,
-            smem_copy_params=smem_copy_params,
-            softmax=softmax,
-            load_K=load_K,
-            load_V=load_V,
-            score_mod=self.score_mod,
-            batch_idx=batch_size,
-            head_idx=num_head,
-            m_block=m_block,
-            aux_tensors=aux_tensors,
-            fastdiv_mods=fastdiv_mods,
-        )
+            compute_one_n_block = partial(
+                self.compute_one_n_block,
+                mma_params=mma_params,
+                smem_copy_params=smem_copy_params,
+                softmax=softmax,
+                load_K=load_K,
+                load_V=load_V,
+                score_mod=self.score_mod,
+                batch_idx=batch_size,
+                head_idx=num_head,
+                m_block=m_block,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
+            )
 
         if const_expr(blocksparse_tensors is not None):
             # ///////////////////////////////////////////////////////////////////////////////
@@ -971,9 +1033,22 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             qkv_factor = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             subtile = self.q_subtile_factor if self.q_subtile_factor is not None else 1
-            total_block_cnt = get_total_block_count(
-                blocksparse_tensors, batch_size, num_head, m_block, qkv_factor, subtile
+            # SM80/SM120 don't support split-kv for block-sparse — sum mask + full
+            # block counts directly. Calling get_total_block_count (which routes
+            # through split_block_range -> cute.ceil_div with Int32 constants)
+            # trips a DSL ICE: "cute.derefine ... explicitly marked illegal".
+            # Mirror the simpler inline path used by run_block_sparse_mainloop_sm80
+            # itself (block_sparse_utils.py:741+).
+            bs_m_block = sparse_tensor_m_block(m_block, qkv_factor, subtile)
+            (
+                curr_mask_block_cnt,
+                _,
+                curr_full_block_cnt,
+                _,
+            ) = get_curr_blocksparse_tensors(
+                batch_size, num_head, bs_m_block, blocksparse_tensors, seqlen,
             )
+            total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
 
             bs_mask = AttentionMask(
                 self.tile_m, self.tile_n, seqlen, window_size_left, window_size_right, qkv_factor
@@ -991,8 +1066,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
             if total_block_cnt > 0:
                 gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-                self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block,
-                            seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
+                if const_expr(self.pack_gqa):
+                    # See note above on pack_gqa_helper in the non-blocksparse path.
+                    pack_gqa_helper = PackGQA(
+                        self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+                    )
+                    pack_gqa_helper.load_Q(
+                        mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                    )
+                else:
+                    self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block,
+                                seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
                 cute.arch.cp_async_commit_group()
                 if const_expr(self.Q_in_regs):
                     cute.arch.cp_async_wait_group(0)
@@ -1041,13 +1125,27 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 None, tiled_mma_pv, tidx, m_block, num_head, batch_size,
             )
 
-        if const_expr(blocksparse_tensors is None):
+        if const_expr(blocksparse_tensors is None and mPageTable is None):
             # ///////////////////////////////////////////////////////////////////////////////
             # Prologue
             # ///////////////////////////////////////////////////////////////////////////////
             # Start async loads of the last mn-tile, where we take care of the mn residue
             gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-            self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
+            if const_expr(self.pack_gqa):
+                # pack_gqa.load_Q computes per-row gmem pointers from the
+                # packed mQ's composite (qhead_per_kvhead, seqlen) stride,
+                # which the plain cp_async self.load_Q cannot do correctly
+                # because cute.local_tile collapses adjacent qhead rows that
+                # actually live at non-adjacent strides (qhead stride 64 vs
+                # seqlen stride num_head*head_dim).
+                pack_gqa_helper = PackGQA(
+                    self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+                )
+                pack_gqa_helper.load_Q(
+                    mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                )
+            else:
+                self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
             cute.arch.cp_async_commit_group()
 
             def preprocess_Q():
@@ -1170,6 +1268,104 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 num_head,
                 batch_size,
             )
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Paged-KV mainloop (inline). Mirrors the dense path's prologue ->
+        # masked iteration -> unmasked iterations -> epilogue structure, but
+        # routes every K/V load through PagedKVManager so per-n_block reads
+        # follow the page table. We keep this fully inline rather than
+        # reusing compute_one_n_block: the latter would require passing
+        # paged_kv_manager through a @cute.jit boundary, which the CuTe DSL
+        # verifier rejects ("operand does not dominate this use") when the
+        # manager's mutable register fragments are referenced from inside
+        # nested scf.if / scf.for regions inside compute_one_n_block.
+        # ///////////////////////////////////////////////////////////////////////////////
+        if const_expr(blocksparse_tensors is None and mPageTable is not None):
+            # Paged-KV mainloop: build the PagedKVManager and delegate to
+            # _paged_kv_mainloop. That method is @cute.jit and takes
+            # paged_kv_manager as an explicit argument so the manager's
+            # mutable register fragments dominate every use inside.
+            #
+            # Requires tile_n >= num_threads so PagedKVManager.create's
+            # page_entry_per_thread = tile_n // num_threads >= 1; we assert
+            # this at the interface.py dispatch (see paged-KV branch).
+            assert self.tile_n >= self.num_producer_threads, (
+                f"Paged-KV mainloop requires tile_n >= num_threads "
+                f"(got tile_n={self.tile_n}, num_threads={self.num_producer_threads}). "
+                f"This typically means head_dim>=128 — use a smaller head_dim "
+                f"or route paged KV to SM100."
+            )
+            # CRITICAL: skip wasted varlen grid tiles. SingleTileVarlenScheduler
+            # rounds the grid up so blockIdx may correspond to batch_idx >=
+            # num_batch; for those, work_tile.is_valid_tile is False and the
+            # tile_idx components (batch_idx in particular) are garbage. The
+            # dense path tolerates this because its loads are page-table-free
+            # and predicated by seqlen_q/seqlen_k (which OOB-read to 0/garbage
+            # and then short-circuit). The paged path actively dereferences
+            # mPageTable[batch_idx, ...] -> mK[..., page] before any
+            # predicate, which dereferences garbage page indices and faults.
+            paged_kv_manager = PagedKVManager.create(
+                mPageTable,
+                mK,
+                mV,
+                FastDivmodDivisor(mK.shape[0]),
+                batch_size,
+                num_head_kv,
+                tidx,
+                seqlen.seqlen_k,
+                0,  # leftpad_k
+                self.tile_n,
+                self.tile_hdim,
+                self.tile_hdimv,
+                self.num_producer_threads,
+                mK.element_type,
+                arch=90,  # SM90 layout convention: V matches K, no gmem transpose
+            )
+            # Skip wasted varlen grid tiles (batch_idx >= num_batch). For
+            # these, batch_idx is garbage and mPageTable[garbage, ...] would
+            # dereference unmapped pages and fault.
+            if work_tile.is_valid_tile:
+                self._paged_kv_mainloop(
+                    paged_kv_manager,
+                    mO,
+                    mLSE,
+                    mQ,
+                    acc_O,
+                    softmax,
+                    sQ,
+                    sK,
+                    sV,
+                    sVt,
+                    sO_layout,
+                    gmem_tiled_copy_Q,
+                    gmem_tiled_copy_O,
+                    tiled_mma_pv,
+                    thr_mma_qk,
+                    thr_mma_pv,
+                    tSrQ,
+                    tSrK,
+                    tOrVt,
+                    tSsQ,
+                    tSsK,
+                    tOsVt,
+                    smem_thr_copy_Q,
+                    smem_thr_copy_K,
+                    smem_thr_copy_V,
+                    n_block,
+                    n_block_min,
+                    n_block_max,
+                    block_info,
+                    seqlen,
+                    m_block,
+                    batch_size,
+                    num_head,
+                    window_size_left,
+                    window_size_right,
+                    gQ,
+                    tidx,
+                    aux_tensors=aux_tensors,
+                    fastdiv_mods=fastdiv_mods,
+                )
 
     @cute.jit
     def compute_one_n_block(
@@ -1372,8 +1568,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 m_block,
                 acc_S,
                 n_block,
-                seqlen,
                 softmax_scale=softmax.softmax_scale,
+                seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
             )
@@ -1396,6 +1592,323 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mma_params.tOrVt,
             smem_copy_params.tOsVt[None, None, None, 0],
             smem_copy_params.smem_thr_copy_V,
+        )
+
+    @cute.jit
+    def _paged_kv_mainloop(
+        self,
+        paged_kv_manager: PagedKVManager,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        mQ: cute.Tensor,
+        acc_O: cute.Tensor,
+        softmax: Softmax,
+        sQ: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        sVt: cute.Tensor,
+        sO_layout: cute.ComposedLayout,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        gmem_tiled_copy_O: cute.TiledCopy,
+        tiled_mma_pv: cute.TiledMma,
+        thr_mma_qk,
+        thr_mma_pv,
+        tSrQ: cute.Tensor,
+        tSrK: cute.Tensor,
+        tOrVt: cute.Tensor,
+        tSsQ: cute.Tensor,
+        tSsK: cute.Tensor,
+        tOsVt: cute.Tensor,
+        smem_thr_copy_Q,
+        smem_thr_copy_K,
+        smem_thr_copy_V,
+        n_block: Int32,
+        n_block_min: Int32,
+        n_block_max: Int32,
+        block_info: BlockInfo,
+        seqlen: SeqlenInfoQK,
+        m_block: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+        gQ: cute.Tensor,
+        tidx: Int32,
+        aux_tensors=None,
+        fastdiv_mods=None,
+    ):
+        """Inline mainloop for paged-KV (cp.async, num_stages=1) on SM80/SM120.
+
+        This mirrors the structure of the dense path
+        (prologue -> first masked iter -> causal/local-masked iters ->
+        unmasked iters -> epilogue) but performs every K/V load through
+        the supplied PagedKVManager. Because we are @cute.jit, the manager
+        is reconstructed once at function entry and its SSA values
+        dominate every nested scf.if / scf.for region inside.
+
+        We support only num_stages == 1 here: that matches the configuration
+        the SM80 base kernel ships with on consumer Blackwell, and matches
+        SM90's paged_kv_non_tma path (which also runs single-stage when
+        page_size != tile_n).
+        """
+        assert self.num_stages == 1, (
+            "Paged-KV mainloop currently supports num_stages=1 only."
+        )
+
+        # Prologue: Q load, first K load.
+        gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
+        self.load_Q(
+            gmem_thr_copy_Q, gQ, sQ, m_block,
+            seqlen=seqlen.seqlen_q, headdim=mQ.shape[1],
+        )
+        cute.arch.cp_async_commit_group()
+
+        paged_kv_manager.load_page_table(n_block)
+        paged_kv_manager.load_KV(n_block, sK[None, None, 0], "K")
+        cute.arch.cp_async_commit_group()
+
+        if const_expr(self.Q_in_regs):
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
+            cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
+            cute.arch.barrier()
+        else:
+            # Wait for Q so we can use sQ in GEMM_QK below.
+            cute.arch.cp_async_wait_group(1)
+
+        mask = AttentionMask(
+            self.tile_m,
+            self.tile_n,
+            seqlen,
+            window_size_left,
+            window_size_right,
+            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        )
+
+        # ---- One n-block iteration, inlined. Sequence (single-stage):
+        #   1. wait for K(nb)
+        #   2. issue V(nb) load (cp.async)
+        #   3. GEMM_QK -> acc_S
+        #   4. wait for V(nb) and (if nb > n_block_min) issue K(nb-1) load
+        #   5. mask, softmax, rP
+        #   6. GEMM_PV
+        # We cannot factor this into a Python helper (closures over
+        # paged_kv_manager are rejected in dynamic control flow), so the
+        # body is open-coded per iteration site below.
+        smem_pipe_read = Int32(0)
+        smem_pipe_write = Int32(0)
+        nb = n_block
+
+        # ---- First (masked) iteration ----
+        acc_S = cute.make_fragment(
+            thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
+        )
+        acc_S.fill(0.0)
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+        # Issue V(nb)
+        paged_kv_manager.load_KV(nb, sV[None, None, 0], "V")
+        cute.arch.cp_async_commit_group()
+        sm80_utils.gemm(
+            thr_mma_qk,
+            acc_S,
+            tSrQ,
+            tSrK,
+            tSsQ,
+            tSsK[None, None, None, 0],
+            smem_thr_copy_Q,
+            smem_thr_copy_K,
+            A_in_regs=self.Q_in_regs,
+        )
+        if const_expr(self.score_mod is not None):
+            self.apply_score_mod(
+                thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
+                softmax_scale=softmax.softmax_scale, seqlen=seqlen,
+                aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+            )
+        # Wait for V; issue K(nb-1) if any remaining
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+        if nb - 1 >= n_block_min:
+            paged_kv_manager.load_page_table(nb - 1)
+            paged_kv_manager.load_KV(nb - 1, sK[None, None, 0], "K")
+        cute.arch.cp_async_commit_group()
+        mask.apply_mask(
+            acc_S, n_block=nb,
+            batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+            thr_mma=thr_mma_qk,
+            mask_causal=self.is_causal, mask_local=self.is_local,
+            aux_tensors=aux_tensors,
+            fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+            mask_mod=self.mask_mod,
+            mask_seqlen=True,
+        )
+        row_scale = softmax.online_softmax(acc_S, is_first=True, check_inf=True)
+        softmax.rescale_O(acc_O, row_scale)
+        rP = cute.make_fragment_like(acc_S, self.dtype)
+        rP.store(acc_S.load().to(self.dtype))
+        tOrP = layout_utils.reshape_acc_to_frgA(rP)
+        sm80_utils.gemm_rs(
+            thr_mma_pv,
+            acc_O,
+            tOrP,
+            tOrVt,
+            tOsVt[None, None, None, 0],
+            smem_thr_copy_V,
+        )
+
+        # ---- Causal/local masked iterations ----
+        # After this block, `unmasked_n_block_start` is the n_block from
+        # which the unmasked loop should iterate downward (exclusive).
+        # For non-causal, that's n_block (= n_block_max - 1).
+        unmasked_n_block_start = n_block
+        if const_expr(self.is_causal or self.is_local):
+            n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                seqlen, m_block, n_block_min
+            )
+            unmasked_n_block_start = n_block_min_causal_local_mask
+            for n_tile in cutlass.range(
+                n_block_max - 1 - n_block_min_causal_local_mask, unroll=1
+            ):
+                nb = n_block_max - 2 - n_tile
+                acc_S = cute.make_fragment(
+                    thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
+                )
+                acc_S.fill(0.0)
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+                paged_kv_manager.load_KV(nb, sV[None, None, 0], "V")
+                cute.arch.cp_async_commit_group()
+                sm80_utils.gemm(
+                    thr_mma_qk,
+                    acc_S,
+                    tSrQ,
+                    tSrK,
+                    tSsQ,
+                    tSsK[None, None, None, 0],
+                    smem_thr_copy_Q,
+                    smem_thr_copy_K,
+                    A_in_regs=self.Q_in_regs,
+                )
+                if const_expr(self.score_mod is not None):
+                    self.apply_score_mod(
+                        thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
+                        softmax_scale=softmax.softmax_scale, seqlen=seqlen,
+                        aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                    )
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+                if nb - 1 >= n_block_min:
+                    paged_kv_manager.load_page_table(nb - 1)
+                    paged_kv_manager.load_KV(nb - 1, sK[None, None, 0], "K")
+                cute.arch.cp_async_commit_group()
+                mask.apply_mask(
+                    acc_S, n_block=nb,
+                    batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+                    thr_mma=thr_mma_qk,
+                    mask_causal=self.is_causal, mask_local=self.is_local,
+                    aux_tensors=aux_tensors,
+                    fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+                    mask_mod=self.mask_mod,
+                    mask_seqlen=True,
+                )
+                row_scale = softmax.online_softmax(acc_S, is_first=False, check_inf=True)
+                softmax.rescale_O(acc_O, row_scale)
+                rP = cute.make_fragment_like(acc_S, self.dtype)
+                rP.store(acc_S.load().to(self.dtype))
+                tOrP = layout_utils.reshape_acc_to_frgA(rP)
+                sm80_utils.gemm_rs(
+                    thr_mma_pv,
+                    acc_O,
+                    tOrP,
+                    tOrVt,
+                    tOsVt[None, None, None, 0],
+                    smem_thr_copy_V,
+                )
+
+        # ---- Unmasked iterations ----
+        for n_tile in cutlass.range(unmasked_n_block_start, unroll=1):
+            nb = unmasked_n_block_start - n_tile - 1
+            acc_S = cute.make_fragment(
+                thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
+            )
+            acc_S.fill(0.0)
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            paged_kv_manager.load_KV(nb, sV[None, None, 0], "V")
+            cute.arch.cp_async_commit_group()
+            sm80_utils.gemm(
+                thr_mma_qk,
+                acc_S,
+                tSrQ,
+                tSrK,
+                tSsQ,
+                tSsK[None, None, None, 0],
+                smem_thr_copy_Q,
+                smem_thr_copy_K,
+                A_in_regs=self.Q_in_regs,
+            )
+            if const_expr(self.score_mod is not None):
+                self.apply_score_mod(
+                    thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
+                    softmax_scale=softmax.softmax_scale, seqlen=seqlen,
+                    aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                )
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            if nb - 1 >= n_block_min:
+                paged_kv_manager.load_page_table(nb - 1)
+                paged_kv_manager.load_KV(nb - 1, sK[None, None, 0], "K")
+            cute.arch.cp_async_commit_group()
+            mask.apply_mask(
+                acc_S, n_block=nb,
+                batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+                thr_mma=thr_mma_qk,
+                mask_causal=self.is_causal, mask_local=self.is_local,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+                mask_mod=self.mask_mod,
+                mask_seqlen=False,
+            )
+            row_scale = softmax.online_softmax(acc_S, is_first=False, check_inf=True)
+            softmax.rescale_O(acc_O, row_scale)
+            rP = cute.make_fragment_like(acc_S, self.dtype)
+            rP.store(acc_S.load().to(self.dtype))
+            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+            sm80_utils.gemm_rs(
+                thr_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+                tOsVt[None, None, None, 0],
+                smem_thr_copy_V,
+            )
+
+        # ---- Finalize + epilogue ----
+        # Drain any outstanding cp.async groups (e.g. trailing empty commits
+        # we emit when n_block_min < 0 in the last iteration's "next K"
+        # branch). Without this drain, later kernels reusing the same gmem
+        # slots can race with our completion fence.
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+        row_scale = softmax.finalize()
+        softmax.rescale_O(acc_O, row_scale)
+        sO = cute.make_tensor(sQ.iterator, sO_layout)
+        self.epilogue(
+            acc_O,
+            softmax.row_sum,
+            mO,
+            mLSE,
+            sO,
+            seqlen,
+            gmem_tiled_copy_O,
+            None,
+            tiled_mma_pv,
+            tidx,
+            m_block,
+            head_idx,
+            batch_idx,
         )
 
 

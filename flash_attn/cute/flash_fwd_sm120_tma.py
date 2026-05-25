@@ -20,7 +20,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Constexpr, Float32, Int32, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
 
@@ -34,14 +34,11 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileVarlenScheduler,
 )
-from cutlass.cute import FastDivmodDivisor
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 
@@ -166,6 +163,11 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             head_dim_v = head_dim
         if head_dim_v % 8 != 0:
             return False
+        # head_dim > head_dim_v hangs the GPU on SM120. Match the non-TMA
+        # SM120 kernel's gate so the dispatch produces an AssertionError
+        # rather than wedging the GPU.
+        if head_dim > head_dim_v:
+            return False
         # m_block_size must be divisible by MMA tile M (num_mma_warps * 16)
         if tile_m % (num_mma_warps * 16) != 0:
             return False
@@ -263,7 +265,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
@@ -563,7 +565,6 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         n_block_min, n_block_max = block_info.get_n_block_min_max(
             seqlen, m_block, split_idx, num_splits
         )
-        n_block = cutlass.max(n_block_max - 1, 0)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Allocate SMEM and create tensors
@@ -911,6 +912,9 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                 k_pipeline.producer_tail(k_producer_state)
                 v_pipeline.producer_tail(v_producer_state)
 
+    # Intentionally unused: this body is inlined into kernel() because
+    # passing k_pipeline / v_pipeline consumer states across a method
+    # boundary triggers a CuTe DSL compiler hang.
     @cute.jit
     def mma_one_n_block(
         self,

@@ -129,14 +129,30 @@ class PackGQA:
         threads_per_row: cutlass.Constexpr[int],
         num_threads: cutlass.Constexpr[int],
     ):
+        """Per-row gmem pointers into the packed-GQA tensor.
+
+        ``tensor`` must keep its composite mode 0 ``(qhead_per_kvhead,
+        seqlen_q)`` intact. We compute the flat element offset from
+        ``stride[0][0]`` and ``stride[0][1]`` directly rather than via
+        ``cute.crd2idx``: cuTeDSL 4.4-4.5 collapses the composite mode 0
+        through a trailing slice (e.g. ``mO[None, 0]``), which causes
+        ``crd2idx`` to reject the rank-1 composite coord at trace time.
+        """
+        head_stride = tensor.stride[0][0]
+        seqlen_stride = tensor.stride[0][1]
         num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
         tPrPtr = cute.make_fragment(num_ptr_per_thread, cutlass.Int64)
+        base_ptr = tensor.iterator
         for i in cutlass.range_constexpr(num_ptr_per_thread):
             row = i * num_threads + cRows[tidx % threads_per_row][0]
             idx = block * self.m_block_size + row
             m_idx = idx // self.qhead_per_kvhead
             h_idx = idx - m_idx * self.qhead_per_kvhead
-            tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
+            elem_offset = (
+                cutlass.Int64(h_idx) * cutlass.Int64(head_stride)
+                + cutlass.Int64(m_idx) * cutlass.Int64(seqlen_stride)
+            )
+            tPrPtr[i] = (base_ptr + elem_offset).toint()
         return tPrPtr
 
     @cute.jit
@@ -159,7 +175,8 @@ class PackGQA:
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
-        tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
+        # Pass the unsliced mQ — compute_ptr needs the composite mode 0 intact.
+        tPrQPtr = self.compute_ptr(mQ, tQcQ_row, tidx, block, threads_per_row, num_threads)
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             q_ptr_i64 = utils.shuffle_sync(
                 tPrQPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
@@ -238,7 +255,8 @@ class PackGQA:
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
-        tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
+        # Pass the unsliced mO — compute_ptr needs the composite mode 0 intact.
+        tPrOPtr = self.compute_ptr(mO, tOcO_row, tidx, block, threads_per_row, num_threads)
         for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
             o_ptr_i64 = utils.shuffle_sync(
                 tPrOPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
