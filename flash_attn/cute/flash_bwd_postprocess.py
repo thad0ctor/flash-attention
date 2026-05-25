@@ -148,7 +148,21 @@ class FlashAttentionBackwardPostprocess:
             cute.make_layout(self.num_threads),
             cute.make_layout(async_copy_elems_accum),
         )
-        num_s2r_copy_elems = 1 if const_expr(self.arch // 10 in [8, 12]) else 4
+        # SM80 keeps the original scalar (V=1) smem->register copy. SM120
+        # (Phase 17D-lite-v3) uses V=4 to match the main kernel's V=4 dQaccum
+        # gmem write pattern: the main kernel writes thread t's 4 contiguous
+        # MMA C-fragment registers (c0..c3) to gdQaccum positions {4t,4t+1,
+        # 4t+2,4t+3} per outer iter. To read back the SAME register ordering
+        # here, the s2r copy must also use V=4 so smem positions {4t..4t+3}
+        # land in registers {0..3} of thread t, which is what the MMA acc
+        # `((2,2),1,8):((1,2),0,4)` layout expects when reinterpreted as a
+        # flat compact run.
+        if const_expr(self.arch // 10 == 12):
+            num_s2r_copy_elems = 4
+        elif const_expr(self.arch // 10 in [8]):
+            num_s2r_copy_elems = 1
+        else:
+            num_s2r_copy_elems = 4
         if const_expr(self.arch // 10 in [8, 12]):
             self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
                 Float32, self.num_threads, num_s2r_copy_elems

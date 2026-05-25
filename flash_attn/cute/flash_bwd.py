@@ -291,13 +291,35 @@ class FlashAttentionBackwardSm80:
             cute.make_layout(self.num_threads),
             cute.make_layout(async_copy_elems_accum),
         )
-        self.gmem_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=cutlass.Float32.width
-            ),
-            cute.make_layout(self.num_threads),
-            cute.make_layout(1)
-        )
+        # SM120 (Phase 17D-lite-v3): switch the dQ accumulator gmem copy to a
+        # 128-bit (v4 fp32) atom with val_layout=4 so each thread owns 4
+        # contiguous fp32 in gdQaccum. This is the prerequisite for using
+        # red.global.add.v4.f32 atomics in the dQ accumulation loop, cutting
+        # the atomic-instruction count in dQ_mma by 4x. The corresponding
+        # postprocess s2r read must also use val_layout=4 (see flash_bwd_postprocess.py
+        # `_setup_attributes`) so the write/read register-to-gmem mapping stays
+        # consistent. For GQA (qhead_per_kvhead > 1), the dK/dV atomic-add
+        # path uses the same V=4 copy so the same v4 atomic optimization
+        # applies, and the dKV postprocess (which shares the postprocess
+        # kernel) reads back consistently.
+        if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+            self.gmem_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+                cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    cutlass.Float32,
+                    num_bits_per_copy=4 * cutlass.Float32.width,
+                ),
+                cute.make_layout(self.num_threads),
+                cute.make_layout(4),
+            )
+        else:
+            self.gmem_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+                cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=cutlass.Float32.width
+                ),
+                cute.make_layout(self.num_threads),
+                cute.make_layout(1)
+            )
         if cutlass.const_expr(self.qhead_per_kvhead > 1):
             self.gmem_tiled_copy_dK = self.gmem_tiled_copy_dQaccum
             self.gmem_tiled_copy_dV = self.gmem_tiled_copy_dQaccum
@@ -1025,9 +1047,32 @@ class FlashAttentionBackwardSm80:
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
             tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
             assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
-            for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
-                utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
-                # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
+            # SM120 (Phase 17D-lite-v3): use vectorized red.global.add.v4.f32
+            # atomics. The gmem_tiled_copy_dQaccum has val_layout=4, so each
+            # thread owns 4 contiguous fp32 in gdQaccum per outer iter; that
+            # matches red.global.add.v4.f32's address layout and cuts atomic
+            # instruction count by 4x. The retile above flattens the MMA acc
+            # `((2,2),1,8)` fragment to `((4,1),1,8)` which is a compact view
+            # of the same 4 physical registers (c0,c1,c2,c3 of the m16n8k16
+            # C-fragment); the postprocess s2r tiled copy must use val_layout=4
+            # so it reads back in the matching order.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                n_atomic = cute.size(acc_dQ_atomic)
+                assert n_atomic % 4 == 0, (
+                    f"v4 atomic requires count divisible by 4, got {n_atomic}"
+                )
+                for i in cutlass.range(0, n_atomic, 4, unroll_full=True):
+                    utils.atomic_add_fp32_v4(
+                        acc_dQ_atomic[i],
+                        acc_dQ_atomic[i + 1],
+                        acc_dQ_atomic[i + 2],
+                        acc_dQ_atomic[i + 3],
+                        utils.elem_pointer(tdQgdQaccum_atomic, i),
+                    )
+            else:
+                for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
+                    utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
+                    # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
             # if cute.arch.thread_idx()[0] == 64 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dQ)
 
         # If num_stages_Q == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
@@ -1177,10 +1222,36 @@ class FlashAttentionBackwardSm80:
             acc_dK_atomic = gmem_thr_copy_dK.retile(acc_dK)
             assert cute.size(acc_dV_atomic) == cute.size(tdVgdVaccum)
             assert cute.size(acc_dK_atomic) == cute.size(tdKgdKaccum)
-            for i in cutlass.range(cute.size(acc_dV_atomic), unroll_full=True):
-                utils.atomic_add_fp32(acc_dV_atomic[i], utils.elem_pointer(tdVgdVaccum, i))
-            for i in cutlass.range(cute.size(acc_dK_atomic), unroll_full=True):
-                utils.atomic_add_fp32(acc_dK_atomic[i], utils.elem_pointer(tdKgdKaccum, i))
+            # SM120 (Phase 17D-lite-v3): vectorized v4 atomics. The GQA dK/dV
+            # aliases gmem_tiled_copy_dQaccum (V=4) so each thread owns 4
+            # contiguous fp32 per outer iter, matching red.global.add.v4.f32.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                n_dv = cute.size(acc_dV_atomic)
+                n_dk = cute.size(acc_dK_atomic)
+                assert n_dv % 4 == 0 and n_dk % 4 == 0, (
+                    f"v4 atomic requires count divisible by 4, got n_dv={n_dv} n_dk={n_dk}"
+                )
+                for i in cutlass.range(0, n_dv, 4, unroll_full=True):
+                    utils.atomic_add_fp32_v4(
+                        acc_dV_atomic[i],
+                        acc_dV_atomic[i + 1],
+                        acc_dV_atomic[i + 2],
+                        acc_dV_atomic[i + 3],
+                        utils.elem_pointer(tdVgdVaccum, i),
+                    )
+                for i in cutlass.range(0, n_dk, 4, unroll_full=True):
+                    utils.atomic_add_fp32_v4(
+                        acc_dK_atomic[i],
+                        acc_dK_atomic[i + 1],
+                        acc_dK_atomic[i + 2],
+                        acc_dK_atomic[i + 3],
+                        utils.elem_pointer(tdKgdKaccum, i),
+                    )
+            else:
+                for i in cutlass.range(cute.size(acc_dV_atomic), unroll_full=True):
+                    utils.atomic_add_fp32(acc_dV_atomic[i], utils.elem_pointer(tdVgdVaccum, i))
+                for i in cutlass.range(cute.size(acc_dK_atomic), unroll_full=True):
+                    utils.atomic_add_fp32(acc_dK_atomic[i], utils.elem_pointer(tdKgdKaccum, i))
 
     @cute.jit
     def advance_pipeline(self, pipeline_index, num_stages: cutlass.Constexpr):
