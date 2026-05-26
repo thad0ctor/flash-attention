@@ -1714,20 +1714,38 @@ def _flash_attn_bwd(
         )
         dkv_accum_factory = torch.zeros if dkv_accum_needs_zero else torch.empty
         if cu_seqlens_k is None:
-            dk_accum = dkv_accum_factory(
-                batch_size,
-                num_head_kv,
-                seqlen_k_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=device,
-            )
-            dv_accum = dkv_accum_factory(
-                batch_size,
-                num_head_kv,
-                seqlen_k_rounded * head_dim_v_rounded,
-                dtype=torch.float32,
-                device=device,
-            )
+            if (
+                arch // 10 == 12
+                and pack_gqa
+                and pack_gqa_m_splits > 1
+            ):
+                dk_accum_numel = batch_size * num_head_kv * seqlen_k_rounded * head_dim_rounded
+                dv_accum_numel = batch_size * num_head_kv * seqlen_k_rounded * head_dim_v_rounded
+                assert dk_accum_numel % 4 == 0 and dv_accum_numel % 4 == 0
+                dkv_accum = torch.zeros(
+                    dk_accum_numel + dv_accum_numel, dtype=torch.float32, device=device
+                )
+                dk_accum = dkv_accum[:dk_accum_numel].view(
+                    batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded
+                )
+                dv_accum = dkv_accum[dk_accum_numel:].view(
+                    batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded
+                )
+            else:
+                dk_accum = dkv_accum_factory(
+                    batch_size,
+                    num_head_kv,
+                    seqlen_k_rounded * head_dim_rounded,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                dv_accum = dkv_accum_factory(
+                    batch_size,
+                    num_head_kv,
+                    seqlen_k_rounded * head_dim_v_rounded,
+                    dtype=torch.float32,
+                    device=device,
+                )
         else:
             cluster_tile_n = cluster_size * n_block_size
             total_k_rounded_padded = (
