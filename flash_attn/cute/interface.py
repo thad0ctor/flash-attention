@@ -290,6 +290,10 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _to_cute_int32_or_none(x: Optional[int]):
+    return cutlass.Int32(x) if x is not None else None
+
+
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
@@ -647,7 +651,15 @@ def _flash_attn_fwd(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
-    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
+    if local:
+        window_left_loaded = window_size_left if window_size_left is not None else max_seqlen_k
+        window_right_loaded = window_size_right if window_size_right is not None else max_seqlen_k
+        seqlen_k_loaded = max(
+            0,
+            min(max_seqlen_k, window_right_loaded + window_left_loaded + 1 + tile_m),
+        )
+    else:
+        seqlen_k_loaded = max_seqlen_k
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -922,6 +934,8 @@ def _flash_attn_fwd(
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
+        window_size_left_cute = _to_cute_int32_or_none(window_size_left)
+        window_size_right_cute = _to_cute_int32_or_none(window_size_right)
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -1143,8 +1157,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_cute,
+                window_size_right_cute,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1162,8 +1176,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_cute,
+                window_size_right_cute,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -1178,6 +1192,8 @@ def _flash_attn_fwd(
             )
 
     if not is_fake_mode():
+        window_size_left_cute = _to_cute_int32_or_none(window_size_left)
+        window_size_right_cute = _to_cute_int32_or_none(window_size_right)
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
         qv_call = qv.detach() if qv is not None else None
         if is_fp8:
@@ -1207,8 +1223,8 @@ def _flash_attn_fwd(
                 seqused_k,
                 gather_kv_indices,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_cute,
+                window_size_right_cute,
             )
         else:
             call_args = [
@@ -1223,8 +1239,8 @@ def _flash_attn_fwd(
                 seqused_q,
                 seqused_k,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_cute,
+                window_size_right_cute,
                 learnable_sink,
             ]
             if arch // 10 in [10, 11]:
@@ -1530,6 +1546,12 @@ def _flash_attn_bwd(
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
+        if head_dim == 256 and head_dim_v == 256:
+            raise NotImplementedError(
+                "SM120 FA4 backward with head_dim=head_dim_v=256 is not supported: "
+                "the SM80-base backward kernel exceeds the 99 KB shared-memory cap "
+                "on consumer Blackwell. Use FA2/SDPA for backward or forward-only FA4."
+            )
         # Not an SM120-specific SMEM issue: the SM80 base kernel itself uses
         # raw atomic_add_fp32 for dQ accumulation and asserts on mdQ_semaphore
         # being None (see flash_bwd.py:~395). The semaphore-based dQ scheduler
@@ -2120,6 +2142,8 @@ def _flash_attn_bwd(
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
+        window_size_left_cute = _to_cute_int32_or_none(window_size_left)
+        window_size_right_cute = _to_cute_int32_or_none(window_size_right)
 
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -2138,8 +2162,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            window_size_left,
-            window_size_right,
+            window_size_left_cute,
+            window_size_right_cute,
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
@@ -2149,6 +2173,8 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
+        window_size_left_cute = _to_cute_int32_or_none(window_size_left)
+        window_size_right_cute = _to_cute_int32_or_none(window_size_right)
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
         _flash_attn_bwd.compile_cache[compile_key](
             q.detach(),
@@ -2165,8 +2191,8 @@ def _flash_attn_bwd(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            window_size_left,
-            window_size_right,
+            window_size_left_cute,
+            window_size_right_cute,
             dQ_semaphore,
             dK_semaphore,
             dV_semaphore,

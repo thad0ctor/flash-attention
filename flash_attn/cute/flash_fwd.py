@@ -1252,10 +1252,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # Next couple of iterations with causal masking
+            unmasked_n_block_start = n_block
             if const_expr(self.is_causal or self.is_local):
                 n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                     seqlen, m_block, n_block_min
                 )
+                unmasked_n_block_start = n_block_min_causal_local_mask
                 for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 2 - n_tile
                     compute_one_n_block(
@@ -1268,15 +1270,34 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # The remaining iterations have no masking
-            for n_tile in cutlass.range(n_block, unroll=1):
+            unmasked_n_block_stop = n_block_min
+            if const_expr(self.is_local):
+                unmasked_n_block_stop = cutlass.min(
+                    unmasked_n_block_start,
+                    block_info.get_n_block_min_before_local_mask(
+                        seqlen, m_block, n_block_min
+                    ),
+                )
+            for n_tile in cutlass.range(unmasked_n_block_start - unmasked_n_block_stop, unroll=1):
                 compute_one_n_block(
-                    n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+                    unmasked_n_block_start - n_tile - 1, smem_pipe_read, smem_pipe_write,
                     seqlen=seqlen, is_first_n_block=False,
                     mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-            # TODO: local
+            if const_expr(self.is_local):
+                for n_tile in cutlass.range(unmasked_n_block_stop - n_block_min, unroll=1):
+                    compute_one_n_block(
+                        unmasked_n_block_stop - n_tile - 1,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        is_first_n_block=False,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                    )
+                    smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                    smem_pipe_write = self.advance_pipeline(smem_pipe_write)
 
             # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize()
