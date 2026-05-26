@@ -21,6 +21,7 @@ from quack import sm90_utils
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import ampere_helpers as sm80_utils
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from quack.cute_dsl_utils import ParamsBase
@@ -43,6 +44,8 @@ class FlashAttentionBackwardPostprocess:
         dQ_swapAB: bool = False,
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
+        pack_gqa: bool = False,
+        qhead_per_kvhead: int = 1,
     ):
         """
         :param head_dim: head dimension
@@ -65,6 +68,8 @@ class FlashAttentionBackwardPostprocess:
         self.dQ_swapAB = dQ_swapAB
         self.use_2cta_instrs = use_2cta_instrs and arch // 10 == 10 and head_dim != 64
         self.cluster_size = cluster_size
+        self.pack_gqa = pack_gqa
+        self.qhead_per_kvhead = qhead_per_kvhead
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -244,6 +249,23 @@ class FlashAttentionBackwardPostprocess:
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
 
+        if const_expr(self.arch // 10 == 12 and self.pack_gqa and mCuSeqlensQ is None):
+            qhead_per_kvhead = self.qhead_per_kvhead
+            nheads_kv = mdQ.shape[2] // qhead_per_kvhead
+            mdQ_t = cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1, 3, 2, 0]))
+            mdQ = pack_gqa_layout(mdQ_t, qhead_per_kvhead, nheads_kv, head_idx=2)
+            mdQaccum = cute.make_tensor(
+                mdQaccum.iterator,
+                cute.make_layout(
+                    (mdQaccum.shape[0], nheads_kv, mdQaccum.shape[2] * qhead_per_kvhead),
+                    stride=(
+                        mdQaccum.stride[0],
+                        mdQaccum.stride[1] * qhead_per_kvhead,
+                        mdQaccum.stride[2],
+                    ),
+                ),
+            )
+
         smem_size = max(
             cute.size_in_bytes(cutlass.Float32, self.sdQaccum_layout),
             cute.size_in_bytes(self.dtype, self.sdQ_layout),
@@ -254,6 +276,11 @@ class FlashAttentionBackwardPostprocess:
             num_head = mdQ.shape[1]
             num_batch = mCuSeqlensQ.shape[0] - 1
             num_block = cute.ceil_div(mdQ.shape[0], self.tile_m)
+        elif const_expr(self.arch // 10 == 12 and self.pack_gqa):
+            TileScheduler = SingleTileScheduler
+            num_head = mdQ.shape[2]
+            num_batch = mdQ.shape[3]
+            num_block = cute.ceil_div(mdQ.shape[0][0] * mdQ.shape[0][1], self.tile_m)
         else:
             TileScheduler = SingleTileScheduler
             num_head = mdQ.shape[2]
@@ -347,9 +374,13 @@ class FlashAttentionBackwardPostprocess:
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
 
+            if const_expr(self.arch // 10 == 12 and self.pack_gqa and mCuSeqlensQ is None):
+                seqlen_q_static = mdQ.shape[0][0] * mdQ.shape[0][1]
+            else:
+                seqlen_q_static = mdQ.shape[1]
             seqlen = SeqlenInfoQK.create(
                 batch_idx,
-                mdQ.shape[1],
+                seqlen_q_static,
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,
@@ -358,9 +389,13 @@ class FlashAttentionBackwardPostprocess:
                 tile_m=self.tile_m * self.cluster_size,
             )
             if const_expr(not seqlen.has_cu_seqlens_q):
-                mdQ_cur = mdQ[batch_idx, None, head_idx, None]
+                if const_expr(self.arch // 10 == 12 and self.pack_gqa):
+                    mdQ_cur = mdQ[None, None, head_idx, batch_idx]
+                    head_dim = mdQ.shape[1]
+                else:
+                    mdQ_cur = mdQ[batch_idx, None, head_idx, None]
+                    head_dim = mdQ.shape[3]
                 mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
-                head_dim = mdQ.shape[3]
             else:
                 padded_offset_q = seqlen.padded_offset_q
                 mdQ_cur = cute.domain_offset((seqlen.offset_q, 0), mdQ[None, head_idx, None])
@@ -382,7 +417,8 @@ class FlashAttentionBackwardPostprocess:
                 mdQaccum_cur = cute.make_tensor(mdQaccum_cur_ptr, mdQaccum_cur.layout)
 
             gdQaccum = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (m_block,))
-            gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+            if const_expr(not (self.arch // 10 == 12 and self.pack_gqa and mCuSeqlensQ is None)):
+                gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
 
             seqlen_q = seqlen.seqlen_q
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
@@ -587,20 +623,33 @@ class FlashAttentionBackwardPostprocess:
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
             cute.arch.barrier()  # make sure all smem stores are done
             gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
-            tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
             tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
             tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
             # TODO: check OOB when reading from smem if kBlockM isn't evenly tiled
             cute.autovec_copy(tdQsdQ, tdQrdQ)
 
             # Step 5: Copy dQ from register to gmem
-            tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
-            tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
-            for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
-                if tdQcdQ[0, rest_m, 0][0] < seqlen_q - m_block * self.tile_m:
-                    cute.copy(
-                        gmem_tiled_copy_dQ,
-                        tdQrdQ[None, rest_m, None],
-                        tdQgdQ[None, rest_m, None],
-                        pred=tdQpdQ[None, rest_m, None],
-                    )
+            if const_expr(self.arch // 10 == 12 and self.pack_gqa and mCuSeqlensQ is None):
+                pack_gqa_dq = PackGQA(
+                    self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+                )
+                pack_gqa_dq.store_O(
+                    mdQ_cur,
+                    tdQrdQ,
+                    gmem_tiled_copy_dQ,
+                    tidx,
+                    m_block,
+                    mdQ.shape[0][1],
+                )
+            else:
+                tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
+                tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
+                tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
+                for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
+                    if tdQcdQ[0, rest_m, 0][0] < seqlen_q - m_block * self.tile_m:
+                        cute.copy(
+                            gmem_tiled_copy_dQ,
+                            tdQrdQ[None, rest_m, None],
+                            tdQgdQ[None, rest_m, None],
+                            pred=tdQpdQ[None, rest_m, None],
+                        )

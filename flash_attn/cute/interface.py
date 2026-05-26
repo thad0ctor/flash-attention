@@ -1297,6 +1297,7 @@ def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
+    pack_gqa=False, qhead_per_kvhead=1,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
@@ -1310,6 +1311,8 @@ def _compile_bwd_postprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
+        pack_gqa=pack_gqa,
+        qhead_per_kvhead=qhead_per_kvhead,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -1324,12 +1327,14 @@ def _bwd_postprocess_convert(
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
     use_2cta_instrs=False, cluster_size=1,
+    pack_gqa=False, qhead_per_kvhead=1,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
+        pack_gqa, qhead_per_kvhead,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -1560,12 +1565,16 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    pack_gqa_requested = pack_gqa is True
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     # Phase 17B-v2: pack_gqa is now supported in the SM120 backward kernel
-    # (port of forward's pack_gqa_layout + PackGQA per-row helpers, see
-    # commit message). Other archs (SM80/SM90/SM100) retain the original
-    # "not yet supported" override.
+    # as an explicit opt-in.  Keep auto-selection disabled for SM120 backward
+    # until it is a measured win; the current packed Q/dO row-pointer path is
+    # slower than the non-pack GQA path on the Phase 13 matrix. Other archs
+    # (SM80/SM90/SM100) retain the original "not yet supported" override.
+    if arch // 10 == 12 and pack_gqa and not pack_gqa_requested:
+        pack_gqa = False
     if not (arch // 10 == 12):
         pack_gqa = False
 
@@ -2051,6 +2060,8 @@ def _flash_attn_bwd(
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+            pack_gqa=(arch // 10 == 12 and pack_gqa and cu_seqlens_q is None),
+            qhead_per_kvhead=qhead_per_kvhead,
         )
 
         if dKV_postprocess:

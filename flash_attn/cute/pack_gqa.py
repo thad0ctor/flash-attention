@@ -164,6 +164,7 @@ class PackGQA:
         tidx: cutlass.Int32,
         block: cutlass.Int32,
         seqlen: cutlass.Int32,
+        zero_oob_rows: cutlass.Constexpr[bool] = False,
     ):
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
         cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
@@ -184,22 +185,42 @@ class PackGQA:
             q_gmem_ptr = cute.make_ptr(
                 mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )
-            if (
+            row_valid = (
                 t0QcQ[0, m, 0][0]
                 < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]
-            ):
+            )
+            if cutlass.const_expr(not zero_oob_rows):
+                if row_valid:
+                    mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
+                    elems_per_load = cute.size(tQsQ.shape[0][0])
+                    mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
+                    for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
+                        ki = tQcQ[0, 0, k][1] // elems_per_load
+                        cute.copy(
+                            gmem_thr_copy,
+                            mQ_cur_copy[None, ki],
+                            tQsQ[None, m, k],
+                            pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        )
+            else:
                 mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tQsQ.shape[0][0])
                 mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
                 for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
                     ki = tQcQ[0, 0, k][1] // elems_per_load
+                    coord = tQcQ[None, m, k]
+                    predicate = cute.make_fragment_like(coord, cutlass.Boolean)
+                    for i in cutlass.range_constexpr(cute.size(predicate)):
+                        predicate[i] = (
+                            cute.elem_less(coord[i][1], mQ.shape[1])
+                            if cutlass.const_expr(self.check_hdim_oob) else True
+                        ) and row_valid
                     cute.copy(
                         gmem_thr_copy,
                         mQ_cur_copy[None, ki],
                         tQsQ[None, m, k],
-                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=predicate,
                     )
-            # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
 
     @cute.jit
     def store_LSE(
@@ -441,4 +462,3 @@ class PackGQA:
             )
             if m_actual < seqlen and mma_m < self.m_block_size:
                 utils.atomic_add_fp32(acc_dQ_atomic[i], dq_gmem_ptr)
-

@@ -448,13 +448,11 @@ class FlashAttentionBackwardSm80:
         # kernel's existing per-tensor slicing then sees the composite
         # (qhead, seqlen) mode 0, and the per-row PackGQA helpers walk the
         # composite mode correctly.
-        # Phase 17B-v3: under pack_gqa, mdQaccum stays in its ORIGINAL
-        # (un-transposed, un-packed) layout. The postprocess kernel reads
-        # dq_accum in this layout (B, H_q, S*D) interpreting per-thread
-        # MMA register layout. Under pack_gqa each MMA value belongs to a
-        # packed row -> (h_actual, m_actual), and atomic_add_dQaccum
-        # routes each element to the canonical gmem position in that
-        # (h_actual, m_actual, d) slot of the original tensor.
+        # For non-varlen SM120 pack_gqa, mdQaccum is re-viewed as
+        # (B, H_kv, qh * S_rounded * D) scratch.  The main kernel then writes
+        # packed rows contiguously with the same v4 atomic path as non-pack,
+        # and postprocess unpacks to the original dq layout.  Varlen keeps the
+        # older original-layout scatter path for now.
         if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
             if cutlass.const_expr(mCuSeqlensQ is None):
                 # Original Q/dO cute layout: (B, S, H, D). Transpose to
@@ -474,9 +472,17 @@ class FlashAttentionBackwardSm80:
                 mdO = pack_gqa_layout(mdO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
                 mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, nheads_kv, head_idx=1)
-                # mdQaccum stays in original (B, H_q, S*D) layout — sliced per
-                # batch in compute_one_m_block; per-MMA-element address
-                # routing happens in atomic_add_dQaccum.
+                mdQaccum = cute.make_tensor(
+                    mdQaccum.iterator,
+                    cute.make_layout(
+                        (mdQaccum.shape[0], nheads_kv, mdQaccum.shape[2] * self.qhead_per_kvhead),
+                        stride=(
+                            mdQaccum.stride[0],
+                            mdQaccum.stride[1] * self.qhead_per_kvhead,
+                            mdQaccum.stride[2],
+                        ),
+                    ),
+                )
             else:
                 # Varlen layout: Q/dO (total_q, H, D), LSE/dPsum (H,
                 # total_q_padded), dQaccum (H, total_q_padded * D).
@@ -690,14 +696,13 @@ class FlashAttentionBackwardSm80:
                     mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
                 else:
                     # After transpose+pack_gqa: mQ/mdO ((qh,S), D, Hkv, B);
-                    # mLSE/mdPsum ((qh,S), Hkv, B).
+                    # mLSE/mdPsum ((qh,S), Hkv, B); mdQaccum
+                    # (B, Hkv, qh*S_rounded*D).
                     mQ_cur = mQ[None, None, head_idx, batch_idx]
                     mLSE_cur = mLSE[None, head_idx, batch_idx]
                     mdO_cur = mdO[None, None, head_idx, batch_idx]
                     mdPsum_cur = mdPsum[None, head_idx, batch_idx]
-                    # mdQaccum stays in ORIGINAL (B, H_q, S*D) layout;
-                    # slice per batch to get (H_q, S*D) for the helper.
-                    mdQaccum_cur = mdQaccum[batch_idx, None, None]
+                    mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
             else:
                 padded_offset_q = seqlen.padded_offset_q
                 if cutlass.const_expr(not self.pack_gqa):
@@ -762,11 +767,16 @@ class FlashAttentionBackwardSm80:
                 )
                 gLSE = cute.make_tensor(mLSE_cur.iterator, flat_layout_lse)
                 gdPsum = cute.make_tensor(mdPsum_cur.iterator, flat_layout_lse)
-                flat_layout_dQa = cute.make_layout(
-                    (self.m_block_size * self.head_dim_padded, 1),
-                    stride=(1, 0),
-                )
-                gdQaccum = cute.make_tensor(mdQaccum_cur.iterator, flat_layout_dQa)
+                if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
+                    gdQaccum = cute.local_tile(
+                        mdQaccum_cur, (self.m_block_size * self.head_dim_padded,), (None,)
+                    )
+                else:
+                    flat_layout_dQa = cute.make_layout(
+                        (self.m_block_size * self.head_dim_padded, 1),
+                        stride=(1, 0),
+                    )
+                    gdQaccum = cute.make_tensor(mdQaccum_cur.iterator, flat_layout_dQa)
             # (n_block_size, head_dim)
             gK = cute.local_tile(mK_cur, blkK_shape, (n_block, 0))
             # (n_block_size, head_dim_v)
@@ -956,9 +966,15 @@ class FlashAttentionBackwardSm80:
             gmem_copy_params = SimpleNamespace(
                 gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum,
                 # Phase 17B-v3 pack_gqa atomic-add wiring: per-MMA-element
-                # routing into the ORIGINAL dq_accum layout.
+                # routing into the ORIGINAL dq_accum layout for varlen.  The
+                # non-varlen packed-dq_accum path uses tdQgdQaccum directly.
                 gmem_tiled_copy_dQaccum=gmem_tiled_copy_dQaccum,
                 mdQaccum_orig_per_batch=mdQaccum_cur, tidx=tidx,
+                dq_accum_is_packed=(
+                    self.pack_gqa
+                    and cutlass.const_expr(getattr(self, "arch", 80) == 120)
+                    and cutlass.const_expr(not seqlen.has_cu_seqlens_q)
+                ),
                 seqlen_q=seqlen.seqlen_q,
                 # Under pack_gqa, head_idx from the grid IS the KV head idx.
                 head_kv_idx=head_idx,
@@ -1219,7 +1235,7 @@ class FlashAttentionBackwardSm80:
             )
             # ((1, 1), num_elements)
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
-            if cutlass.const_expr(self.pack_gqa):
+            if cutlass.const_expr(self.pack_gqa and not gmem_copy_params.dq_accum_is_packed):
                 # Phase 17B-v3: under pack_gqa, each thread's MMA accumulator
                 # values span 2 different m_block rows (e.g., for SM80 m16n8 fp32,
                 # vals 0/1 are at (r, c)/(r, c+1) and vals 2/3 are at
@@ -1542,7 +1558,7 @@ class FlashAttentionBackwardSm80:
             )
             sQ_stage = sQ_full[None, None, stage]
             pack_gqa_q.load_Q(
-                mQ_packed, sQ_stage, gmem_tiled_copy_Q, tidx, block, seqlen
+                mQ_packed, sQ_stage, gmem_tiled_copy_Q, tidx, block, seqlen, zero_oob_rows=True
             )
             sLSE_stage = sLSE_full[None, stage]
             pack_gqa_q.load_scalar_per_row(
@@ -1606,7 +1622,7 @@ class FlashAttentionBackwardSm80:
             )
             sdO_stage = sdO_full[None, None, stage]
             pack_gqa_dO.load_Q(
-                mdO_packed, sdO_stage, gmem_tiled_copy_dO, tidx, block, seqlen
+                mdO_packed, sdO_stage, gmem_tiled_copy_dO, tidx, block, seqlen, zero_oob_rows=True
             )
             sdPsum_stage = sdPsum_full[None, stage]
             # dPsum uses head_dim_padded (same as Q) for sLSE-like layout

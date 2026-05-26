@@ -50,7 +50,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
-import flash_attn.cute  # noqa: E402
+import flash_attn.cute  # noqa: E402,F401
 from flash_attn.cute import interface as _iface  # noqa: E402
 
 
@@ -68,12 +68,15 @@ def _install_sm120_bwd_override_hook():
         "        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).\n"
         "        m_block_size = 64\n"
         "        n_block_size = 64\n"
-        "        if head_dim <= 64:\n"
-        "            num_stages_Q = 2\n"
-        "            num_stages_dO = 2\n"
-        "        else:\n"
-        "            num_stages_Q = 1\n"
-        "            num_stages_dO = 1\n"
+        "        # num_stages=1 across all head_dim on consumer Blackwell. At\n"
+        "        # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base\n"
+        "        # default was ns=2 but the async pipeline overhead exceeds the\n"
+        "        # latency-hiding benefit at small tile size. Phase 17C tightened\n"
+        "        # paired validation (RTX 5090, n_measure=30, interleaved trials)\n"
+        "        # confirms geomean speedup ~1.06x on 19 d=64 cells with 0\n"
+        "        # regressions >2%.\n"
+        "        num_stages_Q = 1\n"
+        "        num_stages_dO = 1\n"
     )
     replacement = (
         "    if arch // 10 == 12:\n"
@@ -87,12 +90,15 @@ def _install_sm120_bwd_override_hook():
         "        else:\n"
         "            m_block_size = 64\n"
         "            n_block_size = 64\n"
-        "            if head_dim <= 64:\n"
-        "                num_stages_Q = 2\n"
-        "                num_stages_dO = 2\n"
-        "            else:\n"
-        "                num_stages_Q = 1\n"
-        "                num_stages_dO = 1\n"
+        "            # num_stages=1 across all head_dim on consumer Blackwell. At\n"
+        "            # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base\n"
+        "            # default was ns=2 but the async pipeline overhead exceeds the\n"
+        "            # latency-hiding benefit at small tile size. Phase 17C tightened\n"
+        "            # paired validation (RTX 5090, n_measure=30, interleaved trials)\n"
+        "            # confirms geomean speedup ~1.06x on 19 d=64 cells with 0\n"
+        "            # regressions >2%.\n"
+        "            num_stages_Q = 1\n"
+        "            num_stages_dO = 1\n"
     )
     if needle not in src:
         raise RuntimeError(
