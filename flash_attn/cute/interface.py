@@ -648,6 +648,17 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    # Long qpkv5 causal D128 runs best with Q staged through registers on SM120:
+    # it cuts the non-TMA shared-memory footprint from Q+K+V to max(Q,V)+K.
+    sm120_q_in_regs = (
+        arch // 10 == 12
+        and causal
+        and not local
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 5
+        and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
+    )
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
@@ -888,6 +899,7 @@ def _flash_attn_fwd(
         # first-compiled kernel.
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
+        sm120_q_in_regs if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1142,7 +1154,7 @@ def _flash_attn_fwd(
                 assert FlashAttentionForwardSm120.can_implement(
                     dtype, head_dim, head_dim_v, tile_m, tile_n,
                     num_stages=sm120_num_stages, num_threads=num_threads, is_causal=causal,
-                    Q_in_regs=False,
+                    Q_in_regs=sm120_q_in_regs,
                 ), (
                     f"FlashAttentionForwardSm120 cannot implement "
                     f"(head_dim={head_dim}, head_dim_v={head_dim_v}, "
@@ -1163,7 +1175,7 @@ def _flash_attn_fwd(
                     tile_n=tile_n,
                     num_stages=sm120_num_stages,
                     num_threads=num_threads,
-                    Q_in_regs=False,
+                    Q_in_regs=sm120_q_in_regs,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
