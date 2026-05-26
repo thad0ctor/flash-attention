@@ -49,6 +49,7 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        pack_gqa_m_splits: int = 1,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -81,6 +82,7 @@ class FlashAttentionBackwardSm80:
         self.n_block_size = n_block_size
         self.num_threads = num_threads
         self.pack_gqa = pack_gqa
+        self.pack_gqa_m_splits = pack_gqa_m_splits
         self.is_causal = is_causal
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
@@ -508,12 +510,22 @@ class FlashAttentionBackwardSm80:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
 
+        pack_gqa_m_splits = (
+            self.pack_gqa_m_splits
+            if cutlass.const_expr(
+                getattr(self, "arch", 80) == 120
+                and self.pack_gqa
+                and mCuSeqlensK is None
+            )
+            else 1
+        )
+
         # Uses seqlen k, etc. since main bwd kernel's blocks are over n
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
             num_head=num_head,
             num_batch=num_batch,
-            num_splits=1,
+            num_splits=pack_gqa_m_splits,
             seqlen_k=0,
             headdim=mK.shape[2],
             headdim_v=mV.shape[2],
@@ -522,6 +534,7 @@ class FlashAttentionBackwardSm80:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
+            is_split_kv=pack_gqa_m_splits > 1,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -624,7 +637,7 @@ class FlashAttentionBackwardSm80:
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        n_block, head_idx, batch_idx, pack_gqa_m_split = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
             # Phase 17B-v3: under pack_gqa the transpose+pack leaves mQ as
@@ -669,6 +682,16 @@ class FlashAttentionBackwardSm80:
                         (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
                         m_block_min,
                     )
+            if cutlass.const_expr(
+                getattr(self, "arch", 80) == 120
+                and self.pack_gqa
+                and self.pack_gqa_m_splits > 1
+            ):
+                active_m_blocks = max(m_block_max - m_block_min, 0)
+                m_blocks_per_split = cute.ceil_div(active_m_blocks, self.pack_gqa_m_splits)
+                m_split_begin = m_block_min + pack_gqa_m_split * m_blocks_per_split
+                m_block_min = min(m_split_begin, m_block_max)
+                m_block_max = min(m_split_begin + m_blocks_per_split, m_block_max)
             # TODO: return early if m_block_max == 0
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1440,10 +1463,11 @@ class FlashAttentionBackwardSm80:
                 getattr(self, "arch", 80) == 120
                 and self.pack_gqa
                 and not seqlen.has_cu_seqlens_k
+                and self.pack_gqa_m_splits == 1
             ):
-                # Packed non-varlen GQA has exactly one CTA per
-                # (batch, kv_head, n_block); the CTA loops over every Q head in
-                # the KV group, so dK/dV no longer require inter-CTA atomics.
+                # Unsplit packed non-varlen GQA has exactly one CTA per
+                # (batch, kv_head, n_block); that CTA loops over every Q head
+                # in the KV group, so dK/dV no longer require inter-CTA atomics.
                 n_dv = cute.size(acc_dV_atomic)
                 n_dk = cute.size(acc_dK_atomic)
                 assert n_dv % 4 == 0 and n_dk % 4 == 0, (

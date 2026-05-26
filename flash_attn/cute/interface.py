@@ -88,6 +88,49 @@ def _get_device_arch():
     return major * 10 + int(minor)
 
 
+def _sm120_bwd_pack_gqa_m_splits(
+    *,
+    arch: int,
+    pack_gqa: bool,
+    qhead_per_kvhead: int,
+    causal: bool,
+    seqlen_q: int,
+    seqlen_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+) -> int:
+    """Internal SM120 explicit-PackGQA M-split policy for backward."""
+    if (
+        arch // 10 != 12
+        or not pack_gqa
+        or qhead_per_kvhead <= 1
+        or cu_seqlens_q is not None
+        or cu_seqlens_k is not None
+    ):
+        return 1
+
+    packed_m_blocks = max(1, math.ceil(seqlen_q * qhead_per_kvhead / m_block_size))
+    if causal:
+        # For self-attention, the final N tile has the fewest active packed-M
+        # blocks. Cap splits to keep every launched split CTA non-empty.
+        if seqlen_q != seqlen_k:
+            max_safe_splits = 1
+        else:
+            tail_k = seqlen_k % n_block_size or min(seqlen_k, n_block_size)
+            max_safe_splits = max(1, math.ceil(tail_k * qhead_per_kvhead / m_block_size))
+    else:
+        max_safe_splits = packed_m_blocks
+
+    auto_splits = min(qhead_per_kvhead, max_safe_splits, packed_m_blocks)
+    env_splits = os.environ.get("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS")
+    if env_splits is not None:
+        requested_splits = int(env_splits)
+        auto_splits = requested_splits if requested_splits > 0 else auto_splits
+    return max(1, min(auto_splits, max_safe_splits, packed_m_blocks))
+
+
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
@@ -1577,6 +1620,18 @@ def _flash_attn_bwd(
         pack_gqa = False
     if not (arch // 10 == 12):
         pack_gqa = False
+    pack_gqa_m_splits = _sm120_bwd_pack_gqa_m_splits(
+        arch=arch,
+        pack_gqa=pack_gqa,
+        qhead_per_kvhead=qhead_per_kvhead,
+        causal=causal,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -1651,7 +1706,12 @@ def _flash_attn_bwd(
     dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
-        dkv_accum_needs_zero = not (arch // 10 == 12 and pack_gqa and cu_seqlens_k is None)
+        dkv_accum_needs_zero = not (
+            arch // 10 == 12
+            and pack_gqa
+            and cu_seqlens_k is None
+            and pack_gqa_m_splits == 1
+        )
         dkv_accum_factory = torch.zeros if dkv_accum_needs_zero else torch.empty
         if cu_seqlens_k is None:
             dk_accum = dkv_accum_factory(
@@ -1777,6 +1837,7 @@ def _flash_attn_bwd(
             n_block_size,
             num_threads,
             pack_gqa,
+            pack_gqa_m_splits,
             num_stages_Q,
             num_stages_dO,
             SdP_swapAB,
@@ -1885,6 +1946,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                pack_gqa_m_splits=pack_gqa_m_splits,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
