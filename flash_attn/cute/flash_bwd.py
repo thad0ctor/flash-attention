@@ -50,6 +50,7 @@ class FlashAttentionBackwardSm80:
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
         pack_gqa_m_splits: int = 1,
+        pack_gqa_all_rows_valid: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -83,6 +84,7 @@ class FlashAttentionBackwardSm80:
         self.num_threads = num_threads
         self.pack_gqa = pack_gqa
         self.pack_gqa_m_splits = pack_gqa_m_splits
+        self.pack_gqa_all_rows_valid = pack_gqa_all_rows_valid
         self.is_causal = is_causal
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
@@ -1611,11 +1613,23 @@ class FlashAttentionBackwardSm80:
             )
             sQ_stage = sQ_full[None, None, stage]
             pack_gqa_q.load_Q(
-                mQ_packed, sQ_stage, gmem_tiled_copy_Q, tidx, block, seqlen, zero_oob_rows=True
+                mQ_packed,
+                sQ_stage,
+                gmem_tiled_copy_Q,
+                tidx,
+                block,
+                seqlen,
+                zero_oob_rows=True,
+                all_rows_valid=self.pack_gqa_all_rows_valid,
             )
             sLSE_stage = sLSE_full[None, stage]
             pack_gqa_q.load_scalar_per_row(
-                mLSE_packed, sLSE_stage, tidx, block, seqlen
+                mLSE_packed,
+                sLSE_stage,
+                tidx,
+                block,
+                seqlen,
+                all_rows_valid=self.pack_gqa_all_rows_valid,
             )
         else:
             for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
@@ -1675,7 +1689,14 @@ class FlashAttentionBackwardSm80:
             )
             sdO_stage = sdO_full[None, None, stage]
             pack_gqa_dO.load_Q(
-                mdO_packed, sdO_stage, gmem_tiled_copy_dO, tidx, block, seqlen, zero_oob_rows=True
+                mdO_packed,
+                sdO_stage,
+                gmem_tiled_copy_dO,
+                tidx,
+                block,
+                seqlen,
+                zero_oob_rows=True,
+                all_rows_valid=self.pack_gqa_all_rows_valid,
             )
             sdPsum_stage = sdPsum_full[None, stage]
             # dPsum uses head_dim_padded (same as Q) for sLSE-like layout
@@ -1683,7 +1704,12 @@ class FlashAttentionBackwardSm80:
                 self.m_block_size, self.head_dim_padded, self.check_hdim_oob, self.qhead_per_kvhead
             )
             pack_gqa_lse.load_scalar_per_row(
-                mdPsum_packed, sdPsum_stage, tidx, block, seqlen
+                mdPsum_packed,
+                sdPsum_stage,
+                tidx,
+                block,
+                seqlen,
+                all_rows_valid=self.pack_gqa_all_rows_valid,
             )
             return
         for m in cutlass.range_constexpr(cute.size(tdOsdO.shape[1])):

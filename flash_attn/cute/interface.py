@@ -1677,6 +1677,15 @@ def _flash_attn_bwd(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
     )
+    pack_gqa_all_rows_valid = (
+        arch // 10 == 12
+        and pack_gqa
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and (seqlen_q * qhead_per_kvhead) % m_block_size == 0
+    )
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -1901,6 +1910,7 @@ def _flash_attn_bwd(
             num_threads,
             pack_gqa,
             pack_gqa_m_splits,
+            pack_gqa_all_rows_valid,
             num_stages_Q,
             num_stages_dO,
             SdP_swapAB,
@@ -2010,6 +2020,7 @@ def _flash_attn_bwd(
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
                 pack_gqa_m_splits=pack_gqa_m_splits,
+                pack_gqa_all_rows_valid=pack_gqa_all_rows_valid,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
