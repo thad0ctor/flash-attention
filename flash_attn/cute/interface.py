@@ -1562,9 +1562,13 @@ def _flash_attn_bwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-    # pack_gqa backward not yet supported in bwd
-    pack_gqa = False
-    
+    # Phase 17B-v2: pack_gqa is now supported in the SM120 backward kernel
+    # (port of forward's pack_gqa_layout + PackGQA per-row helpers, see
+    # commit message). Other archs (SM80/SM90/SM100) retain the original
+    # "not yet supported" override.
+    if not (arch // 10 == 12):
+        pack_gqa = False
+
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
             "softcap and score_mod/score_mod_bwd cannot be used together"
@@ -2125,8 +2129,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
-        ctx.score_mod = score_mod 
-        ctx.score_mod_bwd = score_mod_bwd 
+        ctx.pack_gqa = pack_gqa
+        ctx.score_mod = score_mod
+        ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.set_materialize_grads(False)
@@ -2153,6 +2158,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            pack_gqa=ctx.pack_gqa,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
@@ -2243,6 +2249,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
+        ctx.pack_gqa = pack_gqa
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
         ctx.set_materialize_grads(False)
@@ -2275,6 +2282,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q=ctx.max_seqlen_q,
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
+            pack_gqa=ctx.pack_gqa,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             aux_tensors=aux_tensors,

@@ -279,3 +279,166 @@ class PackGQA:
                         mO_cur_copy[None, ki],
                         pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )
+
+    @cute.jit
+    def load_scalar_per_row(
+        self,
+        mLSE: cute.Tensor,  # composite mode 0: (qhead_per_kvhead, seqlen_q) — rank 1
+        sLSE: cute.Tensor,  # (m_block_size,)
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        """Load one scalar (fp32) per row from a packed-GQA tensor (LSE / dPsum).
+
+        Uses one thread per row (m_block_size threads). The remaining threads
+        do nothing. mLSE must keep its composite mode 0 intact so we can
+        compute per-row gmem pointers via stride[0][0]/stride[0][1].
+        """
+        head_stride = mLSE.stride[0][0]
+        seqlen_stride = mLSE.stride[0][1]
+        base_ptr = mLSE.iterator
+        if tidx < self.m_block_size:
+            row = tidx
+            idx = block * self.m_block_size + row
+            m_idx = idx // self.qhead_per_kvhead
+            h_idx = idx - m_idx * self.qhead_per_kvhead
+            elem_offset = (
+                cutlass.Int64(h_idx) * cutlass.Int64(head_stride)
+                + cutlass.Int64(m_idx) * cutlass.Int64(seqlen_stride)
+            )
+            lse_ptr_i64 = (base_ptr + elem_offset).toint()
+            lse_gmem_ptr = cute.make_ptr(
+                mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+            )
+            # OOB guard on the seqlen dim (qhead dim never overshoots since qhead is constexpr)
+            if m_idx < seqlen:
+                mLSE_cur = cute.make_tensor(lse_gmem_ptr, (1,))
+                sLSE[row] = mLSE_cur[0]
+            else:
+                sLSE[row] = cutlass.Float32(0.0)
+
+    @cute.jit
+    def atomic_add_dQaccum(
+        self,
+        mdQaccum: cute.Tensor,
+        acc_dQ_atomic: cute.Tensor,  # retiled fragment, same flat layout as MMA C
+        tiled_mma_dq: cute.TiledMma,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+        head_kv_idx: cutlass.Int32 = cutlass.Int32(0),
+    ):
+        """Atomic-add per-MMA-element dQ values into the ORIGINAL-layout
+        dq_accum, routing each element to the correct head_q slot and to
+        the canonical gmem position that the postprocess kernel will read
+        back as MMA (m_actual_in_unpacked, d) for that head_q.
+
+        Under pack_gqa, the MMA computes dQ for packed rows. Each MMA
+        element at (row=mma_m, col=mma_d) for thread t represents the
+        gradient for the packed row mma_m, which maps to original
+        (h_actual = mma_m % qh, m_actual = mma_m // qh, d=mma_d).
+
+        The postprocess kernel (which knows nothing about pack_gqa) reads
+        dq_accum[batch, head_q, gmem_position] and emits to dq[batch,
+        head_q, m_pp, d_pp] where (m_pp, d_pp) is determined by its own
+        partition_C of the same MMA layout — i.e., gmem_position k maps
+        deterministically to (m_pp, d_pp) via:
+
+            warp_id = k // 128   (assuming 32 threads * 4 vals = 128 per warp's flat block)
+            ...
+
+        Instead of inverting partition_C in formula, we use partition_C
+        directly: for each MMA element of thread t at index i:
+        1. Read (mma_m, d) from taccdQcdQ[i].
+        2. Decompose to (h_actual, m_actual).
+        3. Find the canonical gmem position k_target such that postprocess's
+           partition_C(thread_target)[i_target] = (m_actual, d), where
+           thread_target and i_target are determined by inverting the
+           partition_C mapping.
+        4. Atomic-add to gmem[batch, h_actual, k_target] in the original
+           mdQaccum layout (sliced per batch).
+
+        We hard-code the MMA layout pattern empirically observed:
+          - warp_m = (mma_m // 16) for warps in M dim (0..3)
+          - warp_n = (d // 8) % 2 for warps in N dim (0..1)
+          - 8 warps total = 4 in M × 2 in N, warp_id = warp_n * 4 + warp_m
+          - lane within warp: lane_row = (mma_m % 16) % 8 in [0..7], lane_col_pair_idx = (d % 8) // 2 in [0..3]
+            lane = lane_row * 4 + lane_col_pair_idx
+          - val_m = (mma_m % 16) // 8 in {0, 1}
+          - val_n = d % 2 in {0, 1}
+          - v = val_m * 2 + val_n in [0..3]
+          - outer_iter = (d // 8) // 2 in [0..3]
+          - i_flat = outer_iter * 4 + v
+          - thread_target = warp_id * 32 + lane
+          - k_target (within head_q's slot) = outer_iter * 1024 + thread_target * 4 + v
+
+        Assumes m_block_size <= 64, head_dim_padded <= 64, num_threads=256,
+        AtomLayoutMdQ=1, m16n8k16 atom, dQ_swapAB=False. For other
+        configurations a separate code path would be needed.
+        """
+        thr_mma = tiled_mma_dq.get_slice(tidx)
+        cdQ = cute.make_identity_tensor(
+            (self.m_block_size, self.head_dim_padded)
+        )
+        taccdQcdQ = thr_mma.partition_C(cdQ)
+        assert cute.size(taccdQcdQ) == cute.size(acc_dQ_atomic), (
+            "partition_C identity must have same size as acc_dQ_atomic"
+        )
+        # mdQaccum has the ORIGINAL layout sliced per batch. Non-varlen:
+        # rank-2 (H_q, S*D) with strides (S*D, 1). Varlen: rank-2
+        # (H_q, total_q_padded*D) with strides (total_q_padded*D, 1).
+        head_stride = mdQaccum.stride[0]
+        seqlen_stride = mdQaccum.stride[1]
+        base_ptr = mdQaccum.iterator
+        n_elems = cute.size(acc_dQ_atomic)
+        # Per-m_block stride in head_q's slot (between m_blocks).
+        mblock_size_flat = self.m_block_size * self.head_dim_padded
+        for i in cutlass.range_constexpr(n_elems):
+            mn_coord = taccdQcdQ[i]
+            mma_m = mn_coord[0]
+            d = mn_coord[1]
+            # Packed row → (h_in_kvgroup, m_actual). h_in_kvgroup is the
+            # offset within the current head_kv's group of qh head_q's.
+            # The absolute head_q index is head_kv_idx * qh + h_in_kvgroup.
+            packed_row = block * self.m_block_size + mma_m
+            m_actual = packed_row // self.qhead_per_kvhead
+            h_in_kvgroup = packed_row - m_actual * self.qhead_per_kvhead
+            h_actual = head_kv_idx * self.qhead_per_kvhead + h_in_kvgroup
+
+            # Canonical (warp_m, warp_n, lane, val, outer) for postprocess's
+            # interpretation of (m_actual, d) within head_q's slot, assuming
+            # m_actual fits in one m_block (i.e., m_actual < m_block_size).
+            # If m_actual >= m_block_size, we need m_block_in_unpacked > 0.
+            m_block_in_unpacked = m_actual // self.m_block_size
+            m_in_mblock = m_actual - m_block_in_unpacked * self.m_block_size
+
+            warp_m = m_in_mblock // 16
+            m_in_warp = m_in_mblock - warp_m * 16
+            val_m = m_in_warp // 8
+            lane_row = m_in_warp - val_m * 8
+
+            warp_n = (d // 8) - ((d // 8) // 2) * 2  # = (d // 8) % 2
+            outer_iter = (d // 8) // 2
+            d_in_atom = d - (d // 8) * 8  # = d % 8
+            lane_col_pair_idx = d_in_atom // 2  # 0..3
+            val_n = d_in_atom - lane_col_pair_idx * 2  # = d % 2
+
+            v = val_m * 2 + val_n
+            lane = lane_row * 4 + lane_col_pair_idx
+            warp_id = warp_n * 4 + warp_m
+            thread_target = warp_id * 32 + lane
+            k_within_mblock = outer_iter * 1024 + thread_target * 4 + v
+            position_in_head_slot = m_block_in_unpacked * mblock_size_flat + k_within_mblock
+
+            elem_offset = (
+                cutlass.Int64(h_actual) * cutlass.Int64(head_stride)
+                + cutlass.Int64(position_in_head_slot) * cutlass.Int64(seqlen_stride)
+            )
+            dq_ptr_i64 = (base_ptr + elem_offset).toint()
+            dq_gmem_ptr = cute.make_ptr(
+                cutlass.Float32, dq_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+            )
+            if m_actual < seqlen and mma_m < self.m_block_size:
+                utils.atomic_add_fp32(acc_dQ_atomic[i], dq_gmem_ptr)
+

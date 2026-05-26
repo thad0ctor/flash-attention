@@ -19,6 +19,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
@@ -428,7 +429,71 @@ class FlashAttentionBackwardSm80:
         SharedStorage = self._get_shared_storage_cls()
         tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
 
-        num_head = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[2]
+        # Phase 17B-v3: num_head must reflect KV head count under pack_gqa so the
+        # grid is (num_block, num_head_kv, num_batch); the scheduler multiplies
+        # by qhead_per_kvhead_packgqa internally when packing rows.
+        if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+            num_head = mK.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mK.shape[2]
+        else:
+            num_head = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[2]
+
+        # Phase 17B-v2 (SM120 only): pack qhead_per_kvhead into the seqlen mode
+        # of mQ/mdO/mLSE/mdPsum/mdQaccum so the mainloop iterates over KV heads
+        # with packed Q rows. Mirrors flash_fwd.py:701-706. Arch-gated to sm_120
+        # because other archs use SM90/SM100 backward kernels with their own
+        # pack_gqa wiring (or no pack_gqa support).
+        #
+        # pack_gqa_layout folds qhead_per_kvhead into mode 0, so we must first
+        # transpose the layout so that seqlen sits at mode 0. The backward
+        # kernel's existing per-tensor slicing then sees the composite
+        # (qhead, seqlen) mode 0, and the per-row PackGQA helpers walk the
+        # composite mode correctly.
+        # Phase 17B-v3: under pack_gqa, mdQaccum stays in its ORIGINAL
+        # (un-transposed, un-packed) layout. The postprocess kernel reads
+        # dq_accum in this layout (B, H_q, S*D) interpreting per-thread
+        # MMA register layout. Under pack_gqa each MMA value belongs to a
+        # packed row -> (h_actual, m_actual), and atomic_add_dQaccum
+        # routes each element to the canonical gmem position in that
+        # (h_actual, m_actual, d) slot of the original tensor.
+        if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+            if cutlass.const_expr(mCuSeqlensQ is None):
+                # Original Q/dO cute layout: (B, S, H, D). Transpose to
+                # (S, D, H, B) so seqlen is at mode 0.  Reindex order is
+                # [1, 3, 2, 0] (mirror of flash_fwd.py:685).
+                QO_layout_transpose = [1, 3, 2, 0]
+                mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=QO_layout_transpose))
+                mdO = cute.make_tensor(mdO.iterator, cute.select(mdO.layout, mode=QO_layout_transpose))
+                # Original LSE/dPsum layout: (B, H, S). Transpose to (S, H, B):
+                # mode=[2, 1, 0].
+                LSE_layout_transpose = [2, 1, 0]
+                mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+                mdPsum = cute.make_tensor(mdPsum.iterator, cute.select(mdPsum.layout, mode=LSE_layout_transpose))
+
+                nheads_kv = mK.shape[2]
+                mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+                mdO = pack_gqa_layout(mdO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                # mdQaccum stays in original (B, H_q, S*D) layout — sliced per
+                # batch in compute_one_m_block; per-MMA-element address
+                # routing happens in atomic_add_dQaccum.
+            else:
+                # Varlen layout: Q/dO (total_q, H, D), LSE/dPsum (H,
+                # total_q_padded), dQaccum (H, total_q_padded * D).
+                # Transpose Q/dO to (total_q, D, H) via mode=[0, 2, 1].
+                QO_layout_transpose = [0, 2, 1]
+                mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=QO_layout_transpose))
+                mdO = cute.make_tensor(mdO.iterator, cute.select(mdO.layout, mode=QO_layout_transpose))
+                LSE_layout_transpose = [1, 0]
+                mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+                mdPsum = cute.make_tensor(mdPsum.iterator, cute.select(mdPsum.layout, mode=LSE_layout_transpose))
+
+                nheads_kv = mK.shape[1]
+                mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                mdO = pack_gqa_layout(mdO, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=0)
+                mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, nheads_kv, head_idx=0)
+                # mdQaccum stays in original (H_q, total_q_padded*D) layout.
 
         if cutlass.const_expr(mCuSeqlensK is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -556,9 +621,17 @@ class FlashAttentionBackwardSm80:
         n_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
+            # Phase 17B-v3: under pack_gqa the transpose+pack leaves mQ as
+            # ((qh, S), D, Hkv, B) for non-varlen or ((qh, S), D, Hkv) for
+            # varlen, so mQ.shape[1] is head_dim, not seqlen_q.  Use the
+            # sub-mode 1 of the composite mode 0 to recover the actual S.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+                seqlen_q_static = mQ.shape[0][1]
+            else:
+                seqlen_q_static = mQ.shape[1]
             seqlen = SeqlenInfoQK.create(
                 batch_idx,
-                mQ.shape[1],
+                seqlen_q_static,
                 mK.shape[1],
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=mCuSeqlensK,
@@ -568,13 +641,28 @@ class FlashAttentionBackwardSm80:
                 tile_n=self.n_block_size,
             )
 
-            m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
+            # Phase 17B-v3: under pack_gqa, the per-block m_block iteration
+            # must cover qhead_per_kvhead * seqlen_q packed rows.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+                m_block_max = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
+            else:
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0
             if cutlass.const_expr(self.is_causal):
-                m_block_min = max(
-                    (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
-                    m_block_min,
-                )
+                # Under pack_gqa, packed row r corresponds to m_q = r//qh.
+                # Causal: r//qh >= n_block * n_block_size + seqlen_q - seqlen_k
+                # → r >= qh * (n_block * n_block_size + seqlen_q - seqlen_k)
+                # → m_block_min (packed) = qh * (...) // m_block_size.
+                if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+                    m_block_min = max(
+                        (self.qhead_per_kvhead * (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k)) // self.m_block_size,
+                        m_block_min,
+                    )
+                else:
+                    m_block_min = max(
+                        (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
+                        m_block_min,
+                    )
             # TODO: return early if m_block_max == 0
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -585,19 +673,53 @@ class FlashAttentionBackwardSm80:
             blkV_shape = (self.n_block_size, self.head_dim_v_padded)
             blkdO_shape = (self.m_block_size, self.head_dim_v_padded)
 
+            # Phase 17B-v2: under pack_gqa, head_idx from the tile scheduler
+            # is already the KV head index (grid is (num_block, num_head_kv,
+            # num_batch) when pack_gqa, see qhead_per_kvhead_packgqa wiring
+            # at tile_sched_args). The mQ/mdO/mLSE/mdPsum/mdQaccum tensors
+            # have already been remapped via pack_gqa_layout in __call__ so
+            # their mode 0 is a composite (qhead_per_kvhead, seqlen_q).
+            # The transpose in __call__ also changes the slicing pattern.
             if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
-                mQ_cur = mQ[batch_idx, None, head_idx, None]
-                mLSE_cur = mLSE[batch_idx, head_idx, None]
-                mdO_cur = mdO[batch_idx, None, head_idx, None]
-                mdPsum_cur = mdPsum[batch_idx, head_idx, None]
-                mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
+                if cutlass.const_expr(not self.pack_gqa):
+                    # Original layout: (B, S, H, D); LSE/dPsum (B, H, S); dQaccum (B, H, S*D)
+                    mQ_cur = mQ[batch_idx, None, head_idx, None]
+                    mLSE_cur = mLSE[batch_idx, head_idx, None]
+                    mdO_cur = mdO[batch_idx, None, head_idx, None]
+                    mdPsum_cur = mdPsum[batch_idx, head_idx, None]
+                    mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
+                else:
+                    # After transpose+pack_gqa: mQ/mdO ((qh,S), D, Hkv, B);
+                    # mLSE/mdPsum ((qh,S), Hkv, B).
+                    mQ_cur = mQ[None, None, head_idx, batch_idx]
+                    mLSE_cur = mLSE[None, head_idx, batch_idx]
+                    mdO_cur = mdO[None, None, head_idx, batch_idx]
+                    mdPsum_cur = mdPsum[None, head_idx, batch_idx]
+                    # mdQaccum stays in ORIGINAL (B, H_q, S*D) layout;
+                    # slice per batch to get (H_q, S*D) for the helper.
+                    mdQaccum_cur = mdQaccum[batch_idx, None, None]
             else:
                 padded_offset_q = seqlen.padded_offset_q
-                mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, head_idx, None])
-                mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[head_idx, None])
-                mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
-                mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[head_idx, None])
-                mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
+                if cutlass.const_expr(not self.pack_gqa):
+                    mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, head_idx, None])
+                    mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[head_idx, None])
+                    mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
+                    mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[head_idx, None])
+                    mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
+                else:
+                    # Varlen pack_gqa: transposed/packed for Q/dO/LSE/dPsum
+                    # only; mdQaccum stays in original (H_q, total_q_padded*D)
+                    # and is sliced per-(batch, head_q) inside the helper.
+                    mQ_cur = cute.domain_offset(((None, seqlen.offset_q), 0), mQ[None, None, head_idx])
+                    mLSE_cur = cute.domain_offset(((None, padded_offset_q),), mLSE[None, head_idx])
+                    mdO_cur = cute.domain_offset(((None, seqlen.offset_q), 0), mdO[None, None, head_idx])
+                    mdPsum_cur = cute.domain_offset(((None, padded_offset_q),), mdPsum[None, head_idx])
+                    # mdQaccum (H_q, total_q_padded*D); pass full and the
+                    # helper will apply per-head per-batch domain_offset.
+                    # For varlen, we'll need helper signature change; for
+                    # now use the per-element address routing with
+                    # per-(head_q) base address recomputed in helper.
+                    mdQaccum_cur = mdQaccum
             head_idx_kv = head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
@@ -606,16 +728,49 @@ class FlashAttentionBackwardSm80:
                 mK_cur, mV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mK, mV)]
 
             # (m_block_size, head_dim, m_block)
-            gQ = cute.local_tile(mQ_cur, blkQ_shape, (None, 0))
+            # Under pack_gqa, mQ_cur has composite mode 0 (qhead_per_kvhead,
+            # seqlen_q). cute.local_tile would collapse adjacent qhead rows
+            # which actually live at non-adjacent strides. The pack_gqa path
+            # uses PackGQA per-row pointer helpers instead, branching on
+            # self.pack_gqa at every load/atomic-add site. We still build
+            # gQ etc. so the existing partition_S calls trace, but their
+            # values are not consumed at runtime under pack_gqa.
+            if cutlass.const_expr(not self.pack_gqa):
+                gQ = cute.local_tile(mQ_cur, blkQ_shape, (None, 0))
+                gdO = cute.local_tile(mdO_cur, blkdO_shape, (None, 0))
+                gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (None,))
+                gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (None,))
+                gdQaccum = cute.local_tile(mdQaccum_cur, (self.m_block_size * self.head_dim_padded,), (None,))
+            else:
+                # Build dummy contiguous views with the right shape so the
+                # downstream partition_S / cute.copy tracing still works.
+                # The dummy uses mQ_cur.iterator but a 1-stride flat
+                # layout, so any unintended runtime access would simply
+                # read consecutive bytes (no out-of-bounds).
+                flat_layout_Q = cute.make_layout(
+                    (self.m_block_size, self.head_dim_padded, 1),
+                    stride=(self.head_dim_padded, 1, 0),
+                )
+                gQ = cute.make_tensor(mQ_cur.iterator, flat_layout_Q)
+                flat_layout_dO = cute.make_layout(
+                    (self.m_block_size, self.head_dim_v_padded, 1),
+                    stride=(self.head_dim_v_padded, 1, 0),
+                )
+                gdO = cute.make_tensor(mdO_cur.iterator, flat_layout_dO)
+                flat_layout_lse = cute.make_layout(
+                    (self.m_block_size, 1), stride=(1, 0),
+                )
+                gLSE = cute.make_tensor(mLSE_cur.iterator, flat_layout_lse)
+                gdPsum = cute.make_tensor(mdPsum_cur.iterator, flat_layout_lse)
+                flat_layout_dQa = cute.make_layout(
+                    (self.m_block_size * self.head_dim_padded, 1),
+                    stride=(1, 0),
+                )
+                gdQaccum = cute.make_tensor(mdQaccum_cur.iterator, flat_layout_dQa)
             # (n_block_size, head_dim)
             gK = cute.local_tile(mK_cur, blkK_shape, (n_block, 0))
             # (n_block_size, head_dim_v)
             gV = cute.local_tile(mV_cur, blkV_shape, (n_block, 0))
-            # (m_block_size, head_dim_v, m_block)
-            gdO = cute.local_tile(mdO_cur, blkdO_shape, (None, 0))
-            gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (None,))
-            gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (None,))
-            gdQaccum = cute.local_tile(mdQaccum_cur, (self.m_block_size * self.head_dim_padded,), (None,))
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
@@ -760,8 +915,14 @@ class FlashAttentionBackwardSm80:
             # use "if" on the mn dimension.
             # This is to reduce register pressure and gets 2-3% performance gain.
 
-            d_head = mQ.shape[cute.rank(mQ) - 1]
-            d_head_v = mdO.shape[cute.rank(mdO) - 1]
+            # Phase 17B-v3: under pack_gqa, mQ/mdO have layout ((qh,S), D, Hkv, B)
+            # so the last mode is batch, not head_dim.  head_dim sits at mode 1.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+                d_head = mQ.shape[1]
+                d_head_v = mdO.shape[1]
+            else:
+                d_head = mQ.shape[cute.rank(mQ) - 1]
+                d_head_v = mdO.shape[cute.rank(mdO) - 1]
 
             tQpQ = utils.predicate_k(tQcQ, limit=d_head)
             if cutlass.const_expr(self.same_hdim_kv):
@@ -772,6 +933,7 @@ class FlashAttentionBackwardSm80:
             # group parameters for compute_one_m_block
             mma_params = SimpleNamespace(
                 thr_mma_sdp=thr_mma_sdp, thr_mma_dkv=thr_mma_dkv, thr_mma_dq=thr_mma_dq,
+                tiled_mma_dq=tiled_mma_dq,
                 tSrQ=tSrQ, tSrK=tSrK, tdPrdO=tdPrdO, tdPrV=tdPrV,
                 tdVrP=tdVrP, tdVrdO=tdVrdO, tdKrdS=tdKrdS, tdKrQ=tdKrQ,
                 tdQrdS=tdQrdS, tdQrK=tdQrK,
@@ -792,17 +954,28 @@ class FlashAttentionBackwardSm80:
                 tdQsdS=tdQsdS, tdQsKt=tdQsKt,
             )
             gmem_copy_params = SimpleNamespace(
-                gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum
+                gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum,
+                # Phase 17B-v3 pack_gqa atomic-add wiring: per-MMA-element
+                # routing into the ORIGINAL dq_accum layout.
+                gmem_tiled_copy_dQaccum=gmem_tiled_copy_dQaccum,
+                mdQaccum_orig_per_batch=mdQaccum_cur, tidx=tidx,
+                seqlen_q=seqlen.seqlen_q,
+                # Under pack_gqa, head_idx from the grid IS the KV head idx.
+                head_kv_idx=head_idx,
             )
             load_Q_LSE = partial(
                 self.load_Q_LSE, gmem_tiled_copy_QK, gmem_tiled_copy_LSE,
                 tQgQ, tQsQ, tQcQ, t0QcQ, tQpQ,
-                tLSEgLSE, tLSEsLSE, tLSEcLSE, seqlen=seqlen.seqlen_q
+                tLSEgLSE, tLSEsLSE, tLSEcLSE,
+                mQ_cur, mLSE_cur, sQ, sLSE, tidx,
+                seqlen=seqlen.seqlen_q,
             )
             load_dO_dPsum = partial(
                 self.load_dO_dPsum, gmem_tiled_copy_VdO, gmem_tiled_copy_LSE,
                 tdOgdO, tdOsdO, tdOcdO, t0dOcdO, tdOpdO,
-                tLSEgdPsum, tLSEsdPsum, tLSEcLSE, seqlen=seqlen.seqlen_q
+                tLSEgdPsum, tLSEsdPsum, tLSEcLSE,
+                mdO_cur, mdPsum_cur, sdO, sdPsum, tidx,
+                seqlen=seqlen.seqlen_q,
             )
             compute_one_m_block = partial(
                 self.compute_one_m_block, mma_params=mma_params,
@@ -866,6 +1039,7 @@ class FlashAttentionBackwardSm80:
                 r2p_compatible = cutlass.const_expr(True)
             mask = AttentionMask(
                 self.m_block_size, self.n_block_size, seqlen,
+                qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa) else 1,
                 r2p_compatible=r2p_compatible,
             )
             mask_fn = partial(
@@ -1045,34 +1219,58 @@ class FlashAttentionBackwardSm80:
             )
             # ((1, 1), num_elements)
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
-            tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
-            assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
-            # SM120 (Phase 17D-lite-v3): use vectorized red.global.add.v4.f32
-            # atomics. The gmem_tiled_copy_dQaccum has val_layout=4, so each
-            # thread owns 4 contiguous fp32 in gdQaccum per outer iter; that
-            # matches red.global.add.v4.f32's address layout and cuts atomic
-            # instruction count by 4x. The retile above flattens the MMA acc
-            # `((2,2),1,8)` fragment to `((4,1),1,8)` which is a compact view
-            # of the same 4 physical registers (c0,c1,c2,c3 of the m16n8k16
-            # C-fragment); the postprocess s2r tiled copy must use val_layout=4
-            # so it reads back in the matching order.
-            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
-                n_atomic = cute.size(acc_dQ_atomic)
-                assert n_atomic % 4 == 0, (
-                    f"v4 atomic requires count divisible by 4, got {n_atomic}"
+            if cutlass.const_expr(self.pack_gqa):
+                # Phase 17B-v3: under pack_gqa, each thread's MMA accumulator
+                # values span 2 different m_block rows (e.g., for SM80 m16n8 fp32,
+                # vals 0/1 are at (r, c)/(r, c+1) and vals 2/3 are at
+                # (r+8, c)/(r+8, c+1)). Under pack_gqa, different rows correspond
+                # to different (h_idx, m_idx), so the v4 contig atomic from the
+                # non-pack path is not applicable.  We compute per-element gmem
+                # addresses via partition_C of an identity tensor and use
+                # per-element atomic_add_fp32. This is the safe correctness
+                # baseline; performance optimization can group same-row vals into
+                # 2-wide atomics in a follow-up.
+                pack_gqa_dQ = PackGQA(
+                    self.m_block_size, self.head_dim_padded, False, self.qhead_per_kvhead
                 )
-                for i in cutlass.range(0, n_atomic, 4, unroll_full=True):
-                    utils.atomic_add_fp32_v4(
-                        acc_dQ_atomic[i],
-                        acc_dQ_atomic[i + 1],
-                        acc_dQ_atomic[i + 2],
-                        acc_dQ_atomic[i + 3],
-                        utils.elem_pointer(tdQgdQaccum_atomic, i),
-                    )
+                pack_gqa_dQ.atomic_add_dQaccum(
+                    gmem_copy_params.mdQaccum_orig_per_batch,
+                    acc_dQ_atomic,
+                    mma_params.tiled_mma_dq,
+                    gmem_copy_params.tidx,
+                    m_block,
+                    gmem_copy_params.seqlen_q,
+                    gmem_copy_params.head_kv_idx,
+                )
             else:
-                for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
-                    utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
-                    # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
+                tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
+                assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
+                # SM120 (Phase 17D-lite-v3): use vectorized red.global.add.v4.f32
+                # atomics. The gmem_tiled_copy_dQaccum has val_layout=4, so each
+                # thread owns 4 contiguous fp32 in gdQaccum per outer iter; that
+                # matches red.global.add.v4.f32's address layout and cuts atomic
+                # instruction count by 4x. The retile above flattens the MMA acc
+                # `((2,2),1,8)` fragment to `((4,1),1,8)` which is a compact view
+                # of the same 4 physical registers (c0,c1,c2,c3 of the m16n8k16
+                # C-fragment); the postprocess s2r tiled copy must use val_layout=4
+                # so it reads back in the matching order.
+                if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                    n_atomic = cute.size(acc_dQ_atomic)
+                    assert n_atomic % 4 == 0, (
+                        f"v4 atomic requires count divisible by 4, got {n_atomic}"
+                    )
+                    for i in cutlass.range(0, n_atomic, 4, unroll_full=True):
+                        utils.atomic_add_fp32_v4(
+                            acc_dQ_atomic[i],
+                            acc_dQ_atomic[i + 1],
+                            acc_dQ_atomic[i + 2],
+                            acc_dQ_atomic[i + 3],
+                            utils.elem_pointer(tdQgdQaccum_atomic, i),
+                        )
+                else:
+                    for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
+                        utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
+                        # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
             # if cute.arch.thread_idx()[0] == 64 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dQ)
 
         # If num_stages_Q == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
@@ -1327,36 +1525,56 @@ class FlashAttentionBackwardSm80:
         tLSEgLSE: cute.Tensor,
         tLSEsLSE: cute.Tensor,
         tLSEcLSE: cute.Tensor,
+        # Phase 17B-v2 pack_gqa wiring (used only when self.pack_gqa).
+        mQ_packed: cute.Tensor,
+        mLSE_packed: cute.Tensor,
+        sQ_full: cute.Tensor,
+        sLSE_full: cute.Tensor,
+        tidx: cutlass.Int32,
         block: cutlass.Int32,
         smem_pipe_write_q: cutlass.Int32,
         seqlen: cutlass.Int32,
     ):
-        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
-            # If kBlockM doesn't evenly divide the tiled copy, only the last `m` needs to be checked
-            if self.is_even_m_smem_q or m < cute.size(tQsQ.shape[1]) - 1 or tQcQ[0, m, 0][0] < self.m_block_size:
-                # Instead of using tQcQ, we using t0QcQ and subtract the offset from the limit
-                # (seqlen - block * kBlockM). This is because the entries of t0QcQ are known at compile time.
-                predicate_m = t0QcQ[0, m, 0][0] < seqlen - block * self.m_block_size - tQcQ[0][0]
-                predicate = cute.make_fragment_like(tQpQ[None, 0, None])
-                for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
-                    for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
-                        predicate[i, k] = (tQpQ[i, m, k] if cutlass.const_expr(self.check_hdim_oob) else True) and predicate_m
-                cute.copy(
-                    gmem_tiled_copy_Q,
-                    tQgQ[None, m, None, block],
-                    tQsQ[None, m, None, smem_pipe_write_q if cutlass.const_expr(self.num_stages_Q) > 1 else 0],
-                    pred=predicate,
-                )
-            # We need to clear the sQ smem tiles since we'll use sQt for mma_dK
-        # We made sure LSE length is padded so we read `kBlockM` elements so that all
-        # elements in sLSE are filled. Without this we might have uninitialized sLSE values.
-        for m in cutlass.range_constexpr(cute.size(tLSEsLSE.shape[1])):
-            if tLSEcLSE[0, m][0] < self.m_block_size:
-                cute.copy(
-                    gmem_tiled_copy_LSE,
-                    tLSEgLSE[None, m, block],
-                    tLSEsLSE[None, m, smem_pipe_write_q if cutlass.const_expr(self.num_stages_Q > 1) else 0],
-                )
+        if cutlass.const_expr(self.pack_gqa):
+            stage = smem_pipe_write_q if cutlass.const_expr(self.num_stages_Q > 1) else 0
+            pack_gqa_q = PackGQA(
+                self.m_block_size, self.head_dim_padded, self.check_hdim_oob, self.qhead_per_kvhead
+            )
+            sQ_stage = sQ_full[None, None, stage]
+            pack_gqa_q.load_Q(
+                mQ_packed, sQ_stage, gmem_tiled_copy_Q, tidx, block, seqlen
+            )
+            sLSE_stage = sLSE_full[None, stage]
+            pack_gqa_q.load_scalar_per_row(
+                mLSE_packed, sLSE_stage, tidx, block, seqlen
+            )
+        else:
+            for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
+                # If kBlockM doesn't evenly divide the tiled copy, only the last `m` needs to be checked
+                if self.is_even_m_smem_q or m < cute.size(tQsQ.shape[1]) - 1 or tQcQ[0, m, 0][0] < self.m_block_size:
+                    # Instead of using tQcQ, we using t0QcQ and subtract the offset from the limit
+                    # (seqlen - block * kBlockM). This is because the entries of t0QcQ are known at compile time.
+                    predicate_m = t0QcQ[0, m, 0][0] < seqlen - block * self.m_block_size - tQcQ[0][0]
+                    predicate = cute.make_fragment_like(tQpQ[None, 0, None])
+                    for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
+                        for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
+                            predicate[i, k] = (tQpQ[i, m, k] if cutlass.const_expr(self.check_hdim_oob) else True) and predicate_m
+                    cute.copy(
+                        gmem_tiled_copy_Q,
+                        tQgQ[None, m, None, block],
+                        tQsQ[None, m, None, smem_pipe_write_q if cutlass.const_expr(self.num_stages_Q) > 1 else 0],
+                        pred=predicate,
+                    )
+                # We need to clear the sQ smem tiles since we'll use sQt for mma_dK
+            # We made sure LSE length is padded so we read `kBlockM` elements so that all
+            # elements in sLSE are filled. Without this we might have uninitialized sLSE values.
+            for m in cutlass.range_constexpr(cute.size(tLSEsLSE.shape[1])):
+                if tLSEcLSE[0, m][0] < self.m_block_size:
+                    cute.copy(
+                        gmem_tiled_copy_LSE,
+                        tLSEgLSE[None, m, block],
+                        tLSEsLSE[None, m, smem_pipe_write_q if cutlass.const_expr(self.num_stages_Q > 1) else 0],
+                    )
 
     @cute.jit
     def load_dO_dPsum(
@@ -1371,10 +1589,34 @@ class FlashAttentionBackwardSm80:
         tdPsumgdPsum: cute.Tensor,
         tdPsumsdPsum: cute.Tensor,
         tdPsumcdPsum: cute.Tensor,
+        # Phase 17B-v2 pack_gqa wiring
+        mdO_packed: cute.Tensor,
+        mdPsum_packed: cute.Tensor,
+        sdO_full: cute.Tensor,
+        sdPsum_full: cute.Tensor,
+        tidx: cutlass.Int32,
         block: cutlass.Int32,
         smem_pipe_write_q: cutlass.Int32,
         seqlen: cutlass.Int32,
     ):
+        if cutlass.const_expr(self.pack_gqa):
+            stage = smem_pipe_write_q if cutlass.const_expr(self.num_stages_dO > 1) else 0
+            pack_gqa_dO = PackGQA(
+                self.m_block_size, self.head_dim_v_padded, self.check_hdim_v_oob, self.qhead_per_kvhead
+            )
+            sdO_stage = sdO_full[None, None, stage]
+            pack_gqa_dO.load_Q(
+                mdO_packed, sdO_stage, gmem_tiled_copy_dO, tidx, block, seqlen
+            )
+            sdPsum_stage = sdPsum_full[None, stage]
+            # dPsum uses head_dim_padded (same as Q) for sLSE-like layout
+            pack_gqa_lse = PackGQA(
+                self.m_block_size, self.head_dim_padded, self.check_hdim_oob, self.qhead_per_kvhead
+            )
+            pack_gqa_lse.load_scalar_per_row(
+                mdPsum_packed, sdPsum_stage, tidx, block, seqlen
+            )
+            return
         for m in cutlass.range_constexpr(cute.size(tdOsdO.shape[1])):
             # If kBlockM doesn't evenly divide the tiled copy, only the last `m` needs to be checked
             if self.is_even_m_smem_do or m < cute.size(tdOsdO.shape[1]) - 1 or tdOcdO[0, m, 0][0] < self.m_block_size:
