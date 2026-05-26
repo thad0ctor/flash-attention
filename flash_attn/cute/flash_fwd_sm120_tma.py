@@ -113,6 +113,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         score_mod: Optional[cutlass.Constexpr] = None,
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
+        skip_dense_seqlen_mask: bool = False,
     ):
         # Initialize base class with num_threads = (num_mma_warps + 1) * 32
         # The +1 is for the dedicated DMA/producer warp.
@@ -142,6 +143,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         self.num_mma_warps = num_mma_warps
         self.kv_stages = kv_stages
         self.use_tma_O = False  # SM120 doesn't have WGMMA, so O store uses SMEM not TMA
+        self.skip_dense_seqlen_mask = skip_dense_seqlen_mask
 
     @staticmethod
     def can_implement(
@@ -777,6 +779,15 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                 )
+                dense_static_noncausal = const_expr(
+                    not self.is_causal
+                    and not self.is_local
+                    and self.mask_mod is None
+                    and mCuSeqlensK is None
+                    and mSeqUsedK is None
+                )
+                if const_expr(dense_static_noncausal and not self.skip_dense_seqlen_mask):
+                    has_seqlen_tail = seqlen.seqlen_k != n_block_max * self.tile_n
 
                 # Main attention loop: all pipeline operations inlined here
                 # (not delegated to a separate @cute.jit method) to avoid CuTe DSL
@@ -811,8 +822,15 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                             aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
                         )
 
-                    # Apply mask (always check seqlen; causal handled by AttentionMask)
-                    mask_fn(acc_S, n_block=cur_n_block, mask_mod=self.mask_mod, mask_seqlen=True)
+                    # Dense static noncausal full tiles do not need seqlen masking;
+                    # only the first high-K tile can be a tail tile.
+                    if const_expr(self.skip_dense_seqlen_mask):
+                        pass
+                    elif const_expr(dense_static_noncausal):
+                        if has_seqlen_tail and n_tile == 0:
+                            mask_fn(acc_S, n_block=cur_n_block, mask_mod=self.mask_mod, mask_seqlen=True)
+                    else:
+                        mask_fn(acc_S, n_block=cur_n_block, mask_mod=self.mask_mod, mask_seqlen=True)
 
                     # Online softmax (is_first=False: softmax.reset() pre-initialized
                     # row_max=-inf and row_sum=0, which gives correct results for the

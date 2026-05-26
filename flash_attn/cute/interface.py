@@ -9,9 +9,6 @@ from typing import Optional, Tuple, Callable
 
 import torch
 
-
-import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
@@ -59,7 +56,6 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
-    get_block_sparse_broadcast_pattern,
 )
 
 def _parse_arch_str(arch_str):
@@ -750,6 +746,22 @@ def _flash_attn_fwd(
         and seqused_k is None
         and (seqlen_q * qhead_per_kvhead) % tile_m == 0
     )
+    sm120_tma_skip_dense_seqlen_mask = (
+        arch // 10 == 12
+        and head_dim <= 128
+        and head_dim_v <= 128
+        and not causal
+        and not local
+        and mask_mod is None
+        and page_table is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and not pack_gqa
+        and seqlen_k % tile_n == 0
+    )
 
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
@@ -856,6 +868,7 @@ def _flash_attn_fwd(
         # num_stages would otherwise share a compile_key and silently reuse the
         # first-compiled kernel.
         sm120_num_stages if arch // 10 == 12 else None,
+        sm120_tma_skip_dense_seqlen_mask if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1099,6 +1112,7 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
+                    skip_dense_seqlen_mask=sm120_tma_skip_dense_seqlen_mask,
                 )
             else:
                 assert not is_split_kv, "SplitKV not supported on SM 12.0 (SM80-base kernel)"
