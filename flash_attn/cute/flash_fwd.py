@@ -1290,11 +1290,24 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     ),
                 )
             for n_tile in cutlass.range(unmasked_n_block_start - unmasked_n_block_stop, unroll=1):
-                compute_one_n_block(
-                    unmasked_n_block_start - n_tile - 1, smem_pipe_read, smem_pipe_write,
-                    seqlen=seqlen, is_first_n_block=False,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
-                )
+                if const_expr(self.mask_mod is None):
+                    compute_one_n_block(
+                        unmasked_n_block_start - n_tile - 1,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        is_first_n_block=False,
+                        check_inf=self.score_mod is not None,
+                    )
+                else:
+                    compute_one_n_block(
+                        unmasked_n_block_start - n_tile - 1,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        is_first_n_block=False,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                    )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             if const_expr(self.is_local):
