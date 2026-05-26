@@ -1436,10 +1436,39 @@ class FlashAttentionBackwardSm80:
             acc_dK_atomic = gmem_thr_copy_dK.retile(acc_dK)
             assert cute.size(acc_dV_atomic) == cute.size(tdVgdVaccum)
             assert cute.size(acc_dK_atomic) == cute.size(tdKgdKaccum)
-            # SM120 (Phase 17D-lite-v3): vectorized v4 atomics. The GQA dK/dV
-            # aliases gmem_tiled_copy_dQaccum (V=4) so each thread owns 4
-            # contiguous fp32 per outer iter, matching red.global.add.v4.f32.
-            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+            if cutlass.const_expr(
+                getattr(self, "arch", 80) == 120
+                and self.pack_gqa
+                and not seqlen.has_cu_seqlens_k
+            ):
+                # Packed non-varlen GQA has exactly one CTA per
+                # (batch, kv_head, n_block); the CTA loops over every Q head in
+                # the KV group, so dK/dV no longer require inter-CTA atomics.
+                n_dv = cute.size(acc_dV_atomic)
+                n_dk = cute.size(acc_dK_atomic)
+                assert n_dv % 4 == 0 and n_dk % 4 == 0, (
+                    f"v4 store requires count divisible by 4, got n_dv={n_dv} n_dk={n_dk}"
+                )
+                for i in cutlass.range(0, n_dv, 4, unroll_full=True):
+                    utils.store_fp32_v4(
+                        acc_dV_atomic[i],
+                        acc_dV_atomic[i + 1],
+                        acc_dV_atomic[i + 2],
+                        acc_dV_atomic[i + 3],
+                        utils.elem_pointer(tdVgdVaccum, i),
+                    )
+                for i in cutlass.range(0, n_dk, 4, unroll_full=True):
+                    utils.store_fp32_v4(
+                        acc_dK_atomic[i],
+                        acc_dK_atomic[i + 1],
+                        acc_dK_atomic[i + 2],
+                        acc_dK_atomic[i + 3],
+                        utils.elem_pointer(tdKgdKaccum, i),
+                    )
+            elif cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                # SM120 (Phase 17D-lite-v3): vectorized v4 atomics. The GQA dK/dV
+                # aliases gmem_tiled_copy_dQaccum (V=4) so each thread owns 4
+                # contiguous fp32 per outer iter, matching red.global.add.v4.f32.
                 n_dv = cute.size(acc_dV_atomic)
                 n_dk = cute.size(acc_dK_atomic)
                 assert n_dv % 4 == 0 and n_dk % 4 == 0, (

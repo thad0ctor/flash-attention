@@ -1651,15 +1651,17 @@ def _flash_attn_bwd(
     dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        dkv_accum_needs_zero = not (arch // 10 == 12 and pack_gqa and cu_seqlens_k is None)
+        dkv_accum_factory = torch.zeros if dkv_accum_needs_zero else torch.empty
         if cu_seqlens_k is None:
-            dk_accum = torch.zeros(
+            dk_accum = dkv_accum_factory(
                 batch_size,
                 num_head_kv,
                 seqlen_k_rounded * head_dim_rounded,
                 dtype=torch.float32,
                 device=device,
             )
-            dv_accum = torch.zeros(
+            dv_accum = dkv_accum_factory(
                 batch_size,
                 num_head_kv,
                 seqlen_k_rounded * head_dim_v_rounded,
