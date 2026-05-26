@@ -492,11 +492,9 @@ def _flash_attn_fwd(
     # (PagedKVManager's K/V indexing doesn't consume mQ's packed composite mode).
     if page_table is not None and pack_gqa:
         pack_gqa = False
-    # pack_gqa_layout makes mQ.shape[0] composite ((qhead_per_kvhead, seqlen_q));
-    # cute.local_tile by (tile_m, tile_hdim) needs tile_m % qhead_per_kvhead == 0
-    # at the qhead boundary. SM120's tile_m=128 covers 1/2/4/8/16-way GQA but
-    # not 7-way (qwen2.5-7b 28q/4kv). Other arches choose tile_m differently.
-    if arch // 10 == 12 and pack_gqa and qhead_per_kvhead > 1 and 128 % qhead_per_kvhead != 0:
+    # SM120 has a working non-packed/TMA forward path for GQA. Keep forward on
+    # that path; backward still receives the user pack_gqa hint separately.
+    if arch // 10 == 12 and pack_gqa and qhead_per_kvhead > 1:
         pack_gqa = False
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
