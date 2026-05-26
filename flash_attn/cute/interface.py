@@ -584,6 +584,8 @@ def _flash_attn_fwd(
                 (128, 4, 4096, 0): (64, 64, 1), (128, 4, 4096, 1): (64, 96, 1),
                 (128, 4, 8192, 0): (128, 64, 1),(128, 4, 8192, 1): (64, 64, 1),
                 (128, 4, 16384, 0): (128, 64, 1),(128, 4, 16384, 1): (64, 64, 1),
+                (128, 5, 1024, 1): (64, 128, 1),
+                (128, 5, 4096, 1): (64, 128, 1),
                 (128, 7, 512, 0): (128, 64, 1), (128, 7, 512, 1): (64, 64, 2),
                 (128, 7, 1024, 0): (64, 96, 1), (128, 7, 1024, 1): (64, 128, 1),
                 (128, 7, 2048, 0): (128, 64, 1),(128, 7, 2048, 1): (64, 128, 1),
@@ -601,6 +603,15 @@ def _flash_attn_fwd(
             if page_table is not None and head_dim <= 128 and head_dim_v <= 128:
                 fwd_cfg = FwdConfig(128, 128, True, True)
                 sm120_num_stages = 1
+            elif (
+                local
+                and head_dim == 256
+                and head_dim_v == 256
+                and qhead_per_kvhead == 8
+            ):
+                # Gemma e2b-style local attention only loads a narrow K window;
+                # smaller N tiles reduce wasted local-window work on SM120.
+                fwd_cfg = FwdConfig(64, 16, True, True)
             elif head_dim > 128:
                 # d=256: (128, 64) overflows the 99 KB SMEM cap; shrink to 64x64.
                 fwd_cfg = FwdConfig(64, 64, True, True)
