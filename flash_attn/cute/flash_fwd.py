@@ -63,6 +63,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        pack_gqa_all_rows_valid: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -97,6 +98,7 @@ class FlashAttentionForwardBase:
         self.is_causal = is_causal
         self.is_local = is_local
         self.pack_gqa = pack_gqa
+        self.pack_gqa_all_rows_valid = pack_gqa_all_rows_valid
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
@@ -398,7 +400,12 @@ class FlashAttentionForwardBase:
                         ):
                             taccOgLSE[m, 0] = lse[m]
             else:
-                pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+                if const_expr(self.pack_gqa_all_rows_valid):
+                    pack_gqa.store_LSE_all_rows_valid(
+                        mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q
+                    )
+                else:
+                    pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
         ragged = self.use_tma_O and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
         mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
@@ -457,7 +464,12 @@ class FlashAttentionForwardBase:
                             else None,
                         )
             else:
-                pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
+                if const_expr(self.pack_gqa_all_rows_valid):
+                    pack_gqa.store_O_all_rows_valid(
+                        mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q
+                    )
+                else:
+                    pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
 
     @cute.jit
     def advance_pipeline(self, pipeline_index):
@@ -1071,9 +1083,20 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     pack_gqa_helper = PackGQA(
                         self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
                     )
-                    pack_gqa_helper.load_Q(
-                        mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
-                    )
+                    if const_expr(self.pack_gqa_all_rows_valid):
+                        pack_gqa_helper.load_Q_all_rows_valid(
+                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                        )
+                    else:
+                        pack_gqa_helper.load_Q(
+                            mQ_cur,
+                            sQ,
+                            gmem_tiled_copy_Q,
+                            tidx,
+                            m_block,
+                            seqlen.seqlen_q,
+                            zero_oob_rows=True,
+                        )
                 else:
                     self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block,
                                 seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
@@ -1141,9 +1164,20 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 pack_gqa_helper = PackGQA(
                     self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
                 )
-                pack_gqa_helper.load_Q(
-                    mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
-                )
+                if const_expr(self.pack_gqa_all_rows_valid):
+                    pack_gqa_helper.load_Q_all_rows_valid(
+                        mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                    )
+                else:
+                    pack_gqa_helper.load_Q(
+                        mQ_cur,
+                        sQ,
+                        gmem_tiled_copy_Q,
+                        tidx,
+                        m_block,
+                        seqlen.seqlen_q,
+                        zero_oob_rows=True,
+                    )
             else:
                 self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
             cute.arch.cp_async_commit_group()
