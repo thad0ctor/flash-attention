@@ -7,17 +7,16 @@
 
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional, List
+from typing import Type, Callable, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Constexpr, Float32, Int32, const_expr, Boolean
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
@@ -64,6 +63,7 @@ class FlashAttentionForwardBase:
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
         pack_gqa_all_rows_valid: bool = False,
+        skip_dense_seqlen_mask: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -107,6 +107,7 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.skip_dense_seqlen_mask = skip_dense_seqlen_mask
         self.qk_acc_dtype = Float32
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -1238,17 +1239,27 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
             )
 
-            # First iteration with seqlen masking
+            # First iteration with seqlen masking, unless dense static noncausal
+            # dispatch proved there is no K tail tile.
             smem_pipe_read = Int32(0)
             smem_pipe_write = Int32(self.num_stages - 1)
-            compute_one_n_block(
-                n_block,
-                smem_pipe_read,
-                smem_pipe_write,
-                is_first_n_block=True,
-                seqlen=seqlen,
-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-            )
+            if const_expr(self.skip_dense_seqlen_mask):
+                compute_one_n_block(
+                    n_block,
+                    smem_pipe_read,
+                    smem_pipe_write,
+                    is_first_n_block=True,
+                    seqlen=seqlen,
+                )
+            else:
+                compute_one_n_block(
+                    n_block,
+                    smem_pipe_read,
+                    smem_pipe_write,
+                    is_first_n_block=True,
+                    seqlen=seqlen,
+                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # Next couple of iterations with causal masking

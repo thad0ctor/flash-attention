@@ -134,6 +134,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             score_mod=score_mod,
             mask_mod=mask_mod,
             has_aux_tensors=has_aux_tensors,
+            skip_dense_seqlen_mask=skip_dense_seqlen_mask,
         )
         # Override arch after parent __init__ which sets it to the runtime GPU arch.
         # SM120 uses SM80 mma.sync, so base class code paths must see arch=sm_80
@@ -143,7 +144,6 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         self.num_mma_warps = num_mma_warps
         self.kv_stages = kv_stages
         self.use_tma_O = False  # SM120 doesn't have WGMMA, so O store uses SMEM not TMA
-        self.skip_dense_seqlen_mask = skip_dense_seqlen_mask
 
     @staticmethod
     def can_implement(
