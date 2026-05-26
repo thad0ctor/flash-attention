@@ -556,6 +556,16 @@ def _flash_attn_fwd(
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
         num_threads = 128
+    if (
+        arch // 10 == 12
+        and causal
+        and not local
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 5
+        and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
+    ):
+        num_threads = 256
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     sm120_num_stages = 1
@@ -590,7 +600,7 @@ def _flash_attn_fwd(
                 (128, 5, 16384, 1): (64, 96, 1),
                 (128, 5, 32768, 1): (64, 128, 1),
                 (128, 5, 65536, 1): (64, 112, 1),
-                (128, 5, 131072, 1): (64, 128, 1),
+                (128, 5, 131072, 1): (128, 128, 1),
                 (128, 7, 512, 0): (128, 64, 1), (128, 7, 512, 1): (64, 64, 2),
                 (128, 7, 1024, 0): (64, 96, 1), (128, 7, 1024, 1): (64, 128, 1),
                 (128, 7, 2048, 0): (128, 64, 1),(128, 7, 2048, 1): (64, 128, 1),
