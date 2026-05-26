@@ -653,3 +653,238 @@ class FlashAttentionBackwardPostprocess:
                             tdQgdQ[None, rest_m, None],
                             pred=tdQpdQ[None, rest_m, None],
                         )
+
+
+class FlashAttentionBackwardDkvPostprocessSm120(FlashAttentionBackwardPostprocess):
+    """Fused fixed-length SM120 dK+dV accumulator conversion.
+
+    This intentionally handles only the common SM120 non-varlen dKV path where
+    dK and dV have the same head dimension and the same accumulator layout.
+    Unsupported cases keep using the generic one-tensor postprocess.
+    """
+
+    def __init__(
+        self,
+        dtype: Type[cutlass.Numeric],
+        head_dim: int,
+        tile_m: int = 64,
+        num_threads: int = 256,
+        AtomLayoutNdKV: int = 4,
+    ):
+        super().__init__(
+            dtype,
+            head_dim,
+            arch=120,
+            tile_m=tile_m,
+            num_threads=num_threads,
+            AtomLayoutMdQ=AtomLayoutNdKV,
+            dQ_swapAB=False,
+            use_2cta_instrs=False,
+            cluster_size=1,
+            pack_gqa=False,
+            qhead_per_kvhead=1,
+        )
+        assert self.arch // 10 == 12
+
+    @cute.jit
+    def __call__(
+        self,
+        mdKaccum: cute.Tensor,
+        mdVaccum: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        scale_dK: cutlass.Float32,
+        scale_dV: cutlass.Float32,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
+    ):
+        if const_expr(mdK.element_type not in [cutlass.Float16, cutlass.BFloat16]):
+            raise TypeError("Only Float16 or BFloat16 is supported")
+        if const_expr(mdV.element_type != mdK.element_type):
+            raise TypeError("dK and dV must have the same dtype")
+        if const_expr(mdKaccum.element_type not in [cutlass.Float32]):
+            raise TypeError("dKaccum tensor must be Float32")
+        if const_expr(mdVaccum.element_type not in [cutlass.Float32]):
+            raise TypeError("dVaccum tensor must be Float32")
+
+        mdKaccum, mdVaccum, mdK, mdV = [
+            assume_tensor_aligned(t) for t in (mdKaccum, mdVaccum, mdK, mdV)
+        ]
+
+        self.tiled_mma = self._get_tiled_mma()
+        self._setup_attributes()
+
+        smem_size = max(
+            cute.size_in_bytes(cutlass.Float32, self.sdQaccum_layout),
+            cute.size_in_bytes(self.dtype, self.sdQ_layout),
+        )
+
+        TileScheduler = SingleTileScheduler
+        tile_sched_args = TileSchedulerArguments(
+            num_block=cute.ceil_div(mdK.shape[1], self.tile_m),
+            num_head=mdK.shape[2],
+            num_batch=mdK.shape[0],
+            num_splits=1,
+            seqlen_k=0,
+            headdim=mdK.shape[3],
+            headdim_v=mdV.shape[3],
+            total_q=mdK.shape[0],
+            tile_shape_mn=(self.tile_m, 1),
+        )
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+
+        self.kernel(
+            mdKaccum,
+            mdVaccum,
+            mdK,
+            mdV,
+            scale_dK,
+            scale_dV,
+            self.tiled_mma,
+            self.sdQaccum_layout,
+            self.sdQ_layout,
+            self.g2s_tiled_copy_dQaccum,
+            self.s2r_tiled_copy_dQaccum,
+            self.gmem_tiled_copy_dQ,
+            tile_sched_params,
+            TileScheduler,
+        ).launch(
+            grid=grid_dim,
+            block=[self.num_threads, 1, 1],
+            smem=smem_size,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mdKaccum: cute.Tensor,
+        mdVaccum: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        scale_dK: cutlass.Float32,
+        scale_dV: cutlass.Float32,
+        tiled_mma: cute.TiledMma,
+        sdQaccum_layout: cute.Layout,
+        sdQ_layout: cute.ComposedLayout,
+        g2s_tiled_copy_dQaccum: cute.TiledCopy,
+        s2r_tiled_copy_dQaccum: cute.TiledCopy,
+        gmem_tiled_copy_dQ: cute.TiledCopy,
+        tile_sched_params: ParamsBase,
+        TileScheduler: cutlass.Constexpr[Callable],
+    ):
+        smem = cutlass.utils.SmemAllocator()
+        sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
+        sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
+        sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
+
+        tidx, _, _ = cute.arch.thread_idx()
+        tile_scheduler = TileScheduler.create(tile_sched_params)
+        work_tile = tile_scheduler.initial_work_tile_info()
+        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+
+        if work_tile.is_valid_tile:
+            self.convert_one(
+                mdKaccum,
+                mdK,
+                scale_dK,
+                n_block,
+                head_idx,
+                batch_idx,
+                tidx,
+                tiled_mma,
+                sdQaccum,
+                sdQaccum_flat,
+                sdQ,
+                g2s_tiled_copy_dQaccum,
+                s2r_tiled_copy_dQaccum,
+                gmem_tiled_copy_dQ,
+            )
+            cute.arch.barrier()
+            self.convert_one(
+                mdVaccum,
+                mdV,
+                scale_dV,
+                n_block,
+                head_idx,
+                batch_idx,
+                tidx,
+                tiled_mma,
+                sdQaccum,
+                sdQaccum_flat,
+                sdQ,
+                g2s_tiled_copy_dQaccum,
+                s2r_tiled_copy_dQaccum,
+                gmem_tiled_copy_dQ,
+            )
+
+    @cute.jit
+    def convert_one(
+        self,
+        mdAccum: cute.Tensor,
+        mdOut: cute.Tensor,
+        scale: cutlass.Float32,
+        m_block: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        batch_idx: cutlass.Int32,
+        tidx: cutlass.Int32,
+        tiled_mma: cute.TiledMma,
+        sdQaccum: cute.Tensor,
+        sdQaccum_flat: cute.Tensor,
+        sdQ: cute.Tensor,
+        g2s_tiled_copy_dQaccum: cute.TiledCopy,
+        s2r_tiled_copy_dQaccum: cute.TiledCopy,
+        gmem_tiled_copy_dQ: cute.TiledCopy,
+    ):
+        mdOut_cur = mdOut[batch_idx, None, head_idx, None]
+        mdAccum_cur = mdAccum[batch_idx, head_idx, None]
+        gdQaccum = cute.local_tile(mdAccum_cur, (self.tile_m * self.tile_hdim,), (m_block,))
+        gdQ = cute.local_tile(mdOut_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+        seqlen_q = mdOut.shape[1]
+        head_dim = mdOut.shape[3]
+
+        g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_slice(tidx)
+        tdQgdQaccum = g2s_thr_copy_dQaccum.partition_S(gdQaccum)
+        tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum_flat)
+        cute.copy(g2s_tiled_copy_dQaccum, tdQgdQaccum, tdQsdQaccumg2s)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        s2r_thr_copy_dQaccum = s2r_tiled_copy_dQaccum.get_slice(tidx)
+        tdQsdQaccum = s2r_thr_copy_dQaccum.partition_S(sdQaccum)
+        acc_shape = tiled_mma.partition_shape_C((self.tile_m, self.tile_hdim))
+        acc = cute.make_fragment(acc_shape, cutlass.Float32)
+        assert cute.size(acc) == cute.size(tdQsdQaccum)
+        tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
+        cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
+        rdQ = cute.make_fragment_like(acc, self.dtype)
+        rdQ.store((acc.load() * scale).to(self.dtype))
+
+        cute.arch.barrier()
+        copy_atom_r2s_dQ = utils.get_smem_store_atom(80, self.dtype, transpose=False)
+        tiled_copy_r2s_dQ = cute.make_tiled_copy_C(copy_atom_r2s_dQ, tiled_mma)
+        thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
+        cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
+        taccdQrdQ = thr_copy_r2s_dQ.retile(rdQ)
+        taccdQsdQ = thr_copy_r2s_dQ.partition_D(sdQ)
+        cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
+
+        cute.arch.barrier()
+        gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
+        tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
+        tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
+        cute.autovec_copy(tdQsdQ, tdQrdQ)
+
+        tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
+        tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
+        tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
+        for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
+            if tdQcdQ[0, rest_m, 0][0] < seqlen_q - m_block * self.tile_m:
+                cute.copy(
+                    gmem_tiled_copy_dQ,
+                    tdQrdQ[None, rest_m, None],
+                    tdQgdQ[None, rest_m, None],
+                    pred=tdQpdQ[None, rest_m, None],
+                )

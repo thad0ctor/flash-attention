@@ -42,7 +42,10 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn.cute.flash_bwd_postprocess import (
+    FlashAttentionBackwardDkvPostprocessSm120,
+    FlashAttentionBackwardPostprocess,
+)
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 
@@ -1390,6 +1393,48 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _compile_bwd_postprocess_dkv_sm120(
+    dtype, hdim, block_size, num_threads, atom_layout,
+):
+    """Compile fused fixed-length SM120 dK+dV postprocess kernel."""
+    _, _, _, _, _, _, mdK, mdV, _, _, _, _, mdKaccum, mdVaccum = make_fake_bwd_tensors(
+        dtype, has_gqa=True, varlen_q=False, varlen_k=False
+    )
+    fa_bwd_post_dkv = FlashAttentionBackwardDkvPostprocessSm120(
+        dtype, hdim, block_size, num_threads, atom_layout,
+    )
+    return cute.compile(
+        fa_bwd_post_dkv,
+        mdKaccum,
+        mdVaccum,
+        mdK,
+        mdV,
+        Float32(0.0),
+        Float32(0.0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _bwd_postprocess_dkv_sm120(
+    dk_accum, dv_accum, dk, dv, softmax_scale,
+    dtype, hdim, block_size, num_threads, atom_layout,
+):
+    """Fused fixed-length SM120 dK+dV postprocess."""
+    compile_key = (dtype, hdim, block_size, num_threads, atom_layout)
+    if compile_key not in _bwd_postprocess_dkv_sm120.compile_cache:
+        _bwd_postprocess_dkv_sm120.compile_cache[compile_key] = (
+            _compile_bwd_postprocess_dkv_sm120(*compile_key)
+        )
+    if not is_fake_mode():
+        _bwd_postprocess_dkv_sm120.compile_cache[compile_key](
+            dk_accum, dv_accum, dk, dv, softmax_scale, 1.0,
+        )
+
+
+_bwd_postprocess_dkv_sm120.compile_cache = get_jit_cache("bwd_post_dkv_sm120")
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2147,22 +2192,36 @@ def _flash_attn_bwd(
         )
 
         if dKV_postprocess:
-            # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
-            _bwd_postprocess_convert(
-                dk_accum, dk, softmax_scale,
-                cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
-                AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-            )
-            # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
-            _bwd_postprocess_convert(
-                dv_accum, dv, 1.0,
-                cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
-                AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-            )
+            if (
+                arch // 10 == 12
+                and pack_gqa
+                and pack_gqa_m_splits > 1
+                and cu_seqlens_k is None
+                and seqused_k is None
+                and head_dim == head_dim_v
+                and not dKV_swapAB
+            ):
+                _bwd_postprocess_dkv_sm120(
+                    dk_accum, dv_accum, dk, dv, softmax_scale,
+                    dtype, head_dim, n_block_size, num_threads_post_dKV, AtomLayoutNdKV,
+                )
+            else:
+                # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
+                _bwd_postprocess_convert(
+                    dk_accum, dk, softmax_scale,
+                    cu_seqlens_k, seqused_k,
+                    arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
+                    AtomLayoutNdKV, dKV_swapAB,
+                    cluster_size=cluster_size,
+                )
+                # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
+                _bwd_postprocess_convert(
+                    dv_accum, dv, 1.0,
+                    cu_seqlens_k, seqused_k,
+                    arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
+                    AtomLayoutNdKV, dKV_swapAB,
+                    cluster_size=cluster_size,
+                )
 
     return dq, dk, dv
 
