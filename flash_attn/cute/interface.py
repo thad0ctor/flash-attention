@@ -1504,7 +1504,7 @@ def _flash_attn_bwd(
     )
 
     if arch // 10 == 12:
-        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
+        # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).
         m_block_size = 64
         n_block_size = 64
         # num_stages=1 across all head_dim on consumer Blackwell. At

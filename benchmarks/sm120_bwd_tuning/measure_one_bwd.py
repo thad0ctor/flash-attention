@@ -65,7 +65,7 @@ def _install_sm120_bwd_override_hook():
     src = inspect.getsource(_orig_bwd)
     needle = (
         "    if arch // 10 == 12:\n"
-        "        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).\n"
+        "        # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).\n"
         "        m_block_size = 64\n"
         "        n_block_size = 64\n"
         "        # num_stages=1 across all head_dim on consumer Blackwell. At\n"
@@ -80,7 +80,7 @@ def _install_sm120_bwd_override_hook():
     )
     replacement = (
         "    if arch // 10 == 12:\n"
-        "        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).\n"
+        "        # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).\n"
         "        _ov = globals().get('_PHASE14_BWD_OVERRIDE')\n"
         "        if _ov is not None:\n"
         "            m_block_size = _ov['tile_m']\n"
