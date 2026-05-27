@@ -563,7 +563,10 @@ def _flash_attn_fwd(
         and head_dim == 128
         and head_dim_v == 128
         and qhead_per_kvhead == 5
-        and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
+        and (
+            (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 8192
+            or (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
+        )
     ):
         num_threads = 256
 
@@ -596,7 +599,7 @@ def _flash_attn_fwd(
                 (128, 4, 16384, 0): (128, 64, 1),(128, 4, 16384, 1): (64, 64, 1),
                 (128, 5, 1024, 1): (64, 128, 1),
                 (128, 5, 4096, 1): (64, 128, 1),
-                (128, 5, 8192, 1): (64, 112, 1),
+                (128, 5, 8192, 1): (128, 128, 1),
                 (128, 5, 16384, 1): (64, 96, 1),
                 (128, 5, 32768, 1): (128, 128, 1),
                 (128, 5, 65536, 1): (128, 128, 1),
@@ -667,7 +670,10 @@ def _flash_attn_fwd(
         and head_dim == 128
         and head_dim_v == 128
         and qhead_per_kvhead == 5
-        and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
+        and (
+            (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 8192
+            or (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
+        )
     )
 
     # TODO: fix GQA + SplitKV + non-varlen
