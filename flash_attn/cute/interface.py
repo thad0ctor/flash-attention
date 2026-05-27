@@ -628,9 +628,9 @@ def _flash_attn_fwd(
                 local
                 and head_dim == 256
                 and head_dim_v == 256
-                and qhead_per_kvhead == 8
+                and qhead_per_kvhead in (4, 8)
             ):
-                # Gemma e2b-style local attention only loads a narrow K window;
+                # Gemma local attention only loads a narrow K window;
                 # smaller N tiles reduce wasted local-window work on SM120.
                 fwd_cfg = FwdConfig(64, 16, True, True)
             elif head_dim > 128:
