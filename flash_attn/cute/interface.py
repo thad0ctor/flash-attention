@@ -807,18 +807,29 @@ def _flash_attn_fwd(
         1
         if (
             arch // 10 == 12
-            and head_dim == 256
-            and head_dim_v == 256
-            and qhead_per_kvhead == 6
             and not local
             and (
                 (
-                    causal
-                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 16384
+                    head_dim == 128
+                    and head_dim_v == 128
+                    and qhead_per_kvhead == 5
+                    and not causal
+                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
                 )
                 or (
-                    not causal
-                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
+                    head_dim == 256
+                    and head_dim_v == 256
+                    and qhead_per_kvhead == 6
+                    and (
+                        (
+                            causal
+                            and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 16384
+                        )
+                        or (
+                            not causal
+                            and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
+                        )
+                    )
                 )
             )
         )
