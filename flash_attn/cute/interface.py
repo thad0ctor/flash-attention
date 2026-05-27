@@ -814,7 +814,7 @@ def _flash_attn_fwd(
                     and head_dim_v == 128
                     and qhead_per_kvhead == 5
                     and not causal
-                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
+                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 32768
                 )
                 or (
                     head_dim == 256
