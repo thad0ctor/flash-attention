@@ -569,7 +569,6 @@ def _flash_attn_fwd(
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     sm120_num_stages = 1
-    sm120_tma_kv_stages = 2
     if tile_mn is None:
         if arch // 10 == 12:
             # SM120 forward tile lookup tuned on RTX 5090. See phase5c/REPORT.md
@@ -803,31 +802,6 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and seqlen_k % tile_n == 0
     )
-    sm120_tma_kv_stages = (
-        1
-        if (
-            arch // 10 == 12
-            and not local
-            and (
-                (
-                    head_dim == 128
-                    and head_dim_v == 128
-                    and qhead_per_kvhead == 5
-                    and not causal
-                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 32768
-                )
-                or (
-                    head_dim == 256
-                    and head_dim_v == 256
-                    and qhead_per_kvhead == 6
-                    and not causal
-                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
-                )
-            )
-        )
-        else sm120_tma_kv_stages
-    )
-
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -935,7 +909,6 @@ def _flash_attn_fwd(
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
-        sm120_tma_kv_stages if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1162,7 +1135,7 @@ def _flash_attn_fwd(
             )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n,
-                num_mma_warps=4, kv_stages=sm120_tma_kv_stages, is_causal=causal,
+                num_mma_warps=4, kv_stages=2, is_causal=causal,
             ):
                 fa_fwd = FlashAttentionForwardSm120Tma(
                     dtype,
@@ -1175,7 +1148,7 @@ def _flash_attn_fwd(
                     tile_m=tile_m,
                     tile_n=tile_n,
                     num_mma_warps=4,
-                    kv_stages=sm120_tma_kv_stages,
+                    kv_stages=2,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
