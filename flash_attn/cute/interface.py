@@ -820,16 +820,8 @@ def _flash_attn_fwd(
                     head_dim == 256
                     and head_dim_v == 256
                     and qhead_per_kvhead == 6
-                    and (
-                        (
-                            causal
-                            and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 16384
-                        )
-                        or (
-                            not causal
-                            and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
-                        )
-                    )
+                    and not causal
+                    and (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 131072
                 )
             )
         )
