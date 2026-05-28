@@ -45,6 +45,7 @@ or reverted paths.
 | qwen3-14B D128 qpkv5 causal S>=32768 | `48c7d4d`, `128x128`, 256 threads, `Q_in_regs=True` | PR repeat: S32768 1.0223, S65536 1.0048, S131072 1.0306; qpkv5 causal geomean 1.0173. Current `532331f` keeps this path and improves S=16384. | keeper |
 | qwen3-14B D128 qpkv5 causal S=8192 | `6b77ace`, `128x128`, 256 threads, `Q_in_regs=True` | Env-gated A/B: baseline 0.953/0.986 vs candidate 1.053/1.050. Dispatcher validation 1.055. Full 78-cell run after patch geomean 1.0526, touched row 1.019. | keeper, but rerun if broad noise changes |
 | qwen3.5/qwen3.6 27B D256 qpkv6 dense | `6459f7d`, narrow SM120 load-overlap hooks, `64x64`, `num_stages=1`, nonlocal, no score/mask mod | Focused PR rows: S4096 c 1.0495, S4096 nc 1.0546, S8192 c 1.0241, S8192 nc 1.0165, S16384 c 1.0402, S16384 nc 1.0141. NCU S4096 causal removed 2,082,240 spill inst and beat FA2. | keeper |
+| Broad Qwen/Gemma short-mid forward | `d6bdf7e`, `/tmp/sm120_model_variants_qpkv4_10x_d6bdf7e_20260528` | 78 cells, 10 repeats, geomean 1.061977, median 1.027039, wins 67/78. D128 1.050017, D256 1.067336, qwen 1.047141, gemma 1.096131. Versus prior 5-repeat rerun: ratio geomean 0.991577 with the same 67/78 win count. | current broad keeper |
 | Gemma D256 local qpkv4/qpkv8 | `3dc3f22`, local `64x16` narrow-N path | Local-only Gemma sweep geomean 1.0654, median 1.0793, wins 5/6. e4b S4096 1.108, S8192 1.147; e2b S4096 1.083, S8192 1.076. | keeper for local rows; broad aggregate noisy |
 | qwen3-30B D128 qpkv8 short/mid | post-`c6051aa` local retune: S8192 noncausal `128x32`, S8192 causal `128x64`; `4c0b291`/`6b77ace` remain historical comparison points | Patch validation: `/tmp/sm120_qwen_qpkv8_patch_128x64c_dispatch_20260528b` geomean 1.025994, wins 5/6; repeat `/tmp/sm120_qwen_qpkv8_patch_128x64c_dispatch_r2_20260528b` geomean 1.038794, wins 5/6. S8192 noncausal 1.024/1.039; S8192 causal 1.012/1.013. Old mixed compare: `4c0b291` 1.0107, `6b77ace` 1.0165, pre-patch current 0.9930. | keeper for S8192 qpkv8; S1024 noncausal remains tiny/noisy |
 | Qwen D128 qpkv4 short/mid | `ced523f`: S1024 noncausal/causal `64x64`; S8192 noncausal `128x32`; S8192 causal `128x64` | Subprocess public-API validation `/tmp/sm120_qpkv4_lookup_patch_narrow_validation_20260528`: 12 affected qwen3-embedding/qwen3-vl rows, geomean 1.081840 vs FA2, wins 12/12. FA4 time geomean vs saved post-qpkv artifact: 1.057589; correctness max_abs <= 0.00390625 on changed S1024/S8192 paths. Broad 78-cell 5-repeat rerun `/tmp/sm120_model_variants_qpkv4_5x_rerun_b9261e6_20260528`: qpkv4 D128 S1024/S8192 rows all mean wins; qwen3-vl S8192 causal 1.039250 and 4/5 wins. | keeper; S4096 was explicitly reverted to prior lookup |
@@ -106,3 +107,9 @@ should not lose track of them.
   `/tmp/sm120_qpkv6_ncu_after_qpkv8_20260528b`: FA4 2.328 ms / 419.4M SM
   instructions / 255 regs/thread, FA2 2.365 ms / 323.8M SM instructions /
   255 regs/thread.
+- Current 10-repeat short-mid sweep leaves only three mean-ratio rows below
+  0.98: qwen3.5/qwen3.6-27B S1024 causal D256 qpkv6 at 0.952360 but median
+  1.024283 and wins 6/10; gemma4-31B S4096 local D256 qpkv2 at 0.965963; and
+  qwen3.5-122B S8192 causal D256 qpkv16 at 0.978322. Treat the first as tiny
+  noise; profile the latter two only if they remain negative in a targeted
+  paired rerun.
