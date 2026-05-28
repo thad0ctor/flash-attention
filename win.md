@@ -61,6 +61,7 @@ or reverted paths.
 | Broad qpkv8 old-commit restore | Current strict qpkv8 causal remains positive, but noncausal/noisy rows do not justify a broad revert. Profile exact rows before changing dispatch. |
 | Backward tile sweep `a0dd865`/`47aa883` | Negative by design: d=128 only viable tile was already default `(64,64,1)`. No `_SM120_BWD_TILE_LOOKUP` shipped. |
 | Dense noncausal `check_inf` skip | Tried after `48c7d4d`; qpkv6 S131072 noncausal stayed around 0.966x, so patch was reverted. |
+| SM80-base qpkv6 hook-path `utils.cvt_f16(acc_S, rP)` conversion | Tried after `60354fd` and reverted locally. Focused dirty run `/tmp/sm120_qwen_focused_qpkv6_cvt_hook_dirty_20260528b` dropped D256 qpkv6 causal geomean to 1.015849 vs prior current reference 1.025739, mainly hurting S16384 causal. |
 
 ## Review Risks To Keep Separate From Perf Winners
 
@@ -87,4 +88,8 @@ should not lose track of them.
   extending to qpkv2 or dense Gemma shapes.
 - D256 qpkv6 long causal/noncausal: current load-overlap path is the best
   committed approach. Further wins likely require source/SASS-level instruction
-  pressure reduction, not tile lookup sweeps.
+  pressure reduction, not tile lookup sweeps. Current post-`60354fd` NCU for
+  qwen3.5/qwen3.6 D256 qpkv6 S4096 causal is under
+  `/tmp/sm120_qpkv6_ncu_after_qpkv8_20260528b`: FA4 2.328 ms / 419.4M SM
+  instructions / 255 regs/thread, FA2 2.365 ms / 323.8M SM instructions /
+  255 regs/thread.
