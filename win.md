@@ -62,6 +62,7 @@ or reverted paths.
 | Backward tile sweep `a0dd865`/`47aa883` | Negative by design: d=128 only viable tile was already default `(64,64,1)`. No `_SM120_BWD_TILE_LOOKUP` shipped. |
 | Dense noncausal `check_inf` skip | Tried after `48c7d4d`; qpkv6 S131072 noncausal stayed around 0.966x, so patch was reverted. |
 | SM80-base qpkv6 hook-path `utils.cvt_f16(acc_S, rP)` conversion | Tried after `60354fd` and reverted locally. Focused dirty run `/tmp/sm120_qwen_focused_qpkv6_cvt_hook_dirty_20260528b` dropped D256 qpkv6 causal geomean to 1.015849 vs prior current reference 1.025739, mainly hurting S16384 causal. |
+| D256 qpkv6 hook scheduling K-only / V-only / off | Profiling-only env selector tested then reverted. NCU at S4096 causal: V-only was fastest in one profile (2.312 ms vs both 2.327 ms), but focused timing rejected changing the default: D256 qpkv6 causal geomean both-hooks 1.079767, V-only 1.049291, K-only 1.036348, hooks-off 0.985875. Artifacts: `/tmp/sm120_qpkv6_hook_ab_ncu_20260528b`, `/tmp/sm120_qwen_focused_hook_{both,v,off,k}_dirty_20260528b`. |
 
 ## Review Risks To Keep Separate From Perf Winners
 
