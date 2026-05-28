@@ -556,6 +556,8 @@ def _flash_attn_fwd(
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
         num_threads = 128
+    sm120_seq_q = max_seqlen_q if max_seqlen_q is not None else seqlen_q
+    sm120_seq_k = max_seqlen_k if max_seqlen_k is not None else seqlen_k
     if (
         arch // 10 == 12
         and causal
@@ -563,13 +565,9 @@ def _flash_attn_fwd(
         and head_dim == 128
         and head_dim_v == 128
         and qhead_per_kvhead == 5
-        and (
-            (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 8192
-            or (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
-        )
+        and (sm120_seq_q == 8192 or sm120_seq_q >= 32768)
     ):
         num_threads = 256
-
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     sm120_num_stages = 1
     if tile_mn is None:
@@ -612,12 +610,13 @@ def _flash_attn_fwd(
                 (128, 7, 16384, 0): (128, 64, 1),(128, 7, 16384, 1): (64, 128, 1),
                 (128, 8, 1024, 1): (64, 64, 1),
                 (128, 8, 4096, 1): (64, 64, 1),
-                (128, 8, 8192, 1): (64, 64, 1),
+                (128, 8, 8192, 0): (128, 32, 1),
+                (128, 8, 8192, 1): (128, 64, 1),
                 (128, 8, 32768, 1): (128, 32, 1),
                 (128, 8, 65536, 1): (128, 32, 1),
                 (128, 8, 131072, 1): (128, 32, 1),
             }
-            sl = max_seqlen_k if max_seqlen_k is not None else seqlen_k
+            sl = sm120_seq_k
             lookup_key = (head_dim, qhead_per_kvhead, sl, int(bool(causal)))
             # Paged-KV needs tile_n >= num_threads (128) so PagedKVManager's
             # page_entry_per_thread = tile_n // num_threads >= 1. For
@@ -671,8 +670,8 @@ def _flash_attn_fwd(
         and head_dim_v == 128
         and qhead_per_kvhead == 5
         and (
-            (max_seqlen_q if max_seqlen_q is not None else seqlen_q) == 8192
-            or (max_seqlen_q if max_seqlen_q is not None else seqlen_q) >= 32768
+            sm120_seq_q == 8192
+            or sm120_seq_q >= 32768
         )
     )
 

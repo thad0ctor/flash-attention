@@ -44,7 +44,7 @@ or reverted paths.
 | qwen3-14B D128 qpkv5 causal S=8192 | `6b77ace`, `128x128`, 256 threads, `Q_in_regs=True` | Env-gated A/B: baseline 0.953/0.986 vs candidate 1.053/1.050. Dispatcher validation 1.055. Full 78-cell run after patch geomean 1.0526, touched row 1.019. | keeper, but rerun if broad noise changes |
 | qwen3.5/qwen3.6 27B D256 qpkv6 dense | `6459f7d`, narrow SM120 load-overlap hooks, `64x64`, `num_stages=1`, nonlocal, no score/mask mod | Focused PR rows: S4096 c 1.0495, S4096 nc 1.0546, S8192 c 1.0241, S8192 nc 1.0165, S16384 c 1.0402, S16384 nc 1.0141. NCU S4096 causal removed 2,082,240 spill inst and beat FA2. | keeper |
 | Gemma D256 local qpkv4/qpkv8 | `3dc3f22`, local `64x16` narrow-N path | Local-only Gemma sweep geomean 1.0654, median 1.0793, wins 5/6. e4b S4096 1.108, S8192 1.147; e2b S4096 1.083, S8192 1.076. | keeper for local rows; broad aggregate noisy |
-| qwen3-30B D128 qpkv8 short/mid causal | Current retained qpkv8 path, with `4c0b291`/`6b77ace` as historical comparison points | Old repeats: S1024 causal 1.288-1.301, S4096 causal 1.039-1.050, S8192 causal 1.010-1.029. Commit compare qpkv8-only was mixed: `4c0b291` 1.0107, `6b77ace` 1.0165, pre-patch current 0.9930. Later strict r41 current run was positive: geomean 1.026586, wins 5/6. | noisy candidate; do not change dispatch without strict paired repeat |
+| qwen3-30B D128 qpkv8 short/mid | post-`c6051aa` local retune: S8192 noncausal `128x32`, S8192 causal `128x64`; `4c0b291`/`6b77ace` remain historical comparison points | Patch validation: `/tmp/sm120_qwen_qpkv8_patch_128x64c_dispatch_20260528b` geomean 1.025994, wins 5/6; repeat `/tmp/sm120_qwen_qpkv8_patch_128x64c_dispatch_r2_20260528b` geomean 1.038794, wins 5/6. S8192 noncausal 1.024/1.039; S8192 causal 1.012/1.013. Old mixed compare: `4c0b291` 1.0107, `6b77ace` 1.0165, pre-patch current 0.9930. | keeper for S8192 qpkv8; S1024 noncausal remains tiny/noisy |
 | qwen2.5 D128 dense noncausal TMA mask skip | `0af9a4c`, static noncausal TMA seqlen-mask skip | NCU Qwen2.5 S8192 noncausal: 10.56 ms -> 10.18 ms, instructions 2.064B -> 1.866B. Repeats median 0.975, mean 0.987, range 0.971-1.031. | historical, partly superseded |
 | backward d<=64 | `4d59090`, SM120 backward default `num_stages` 2 -> 1 | Phase 17C reported +5.6% on d<=64 cells, arch-gated. | keeper |
 | backward broad Phase 17 | `362a65a` + `55ab672`, 8 warps/block and v4 atomic dQ/dK/dV | Phase 17 backward 40-cell FA4/FA2 geomean 1.017x, 29/40 wins, peak 180.8 TFLOPS; was 0.93x and 10/40 wins before. | keeper |
@@ -79,8 +79,8 @@ should not lose track of them.
 
 - Re-run a full 130-cell forward sweep after `532331f`; current broad table is useful
   but not fully current for qwen3-14B S=16384 causal.
-- qpkv8 D128: strict probe exists in `agent_space/sm120_qpkv8_probe.py`; test
-  exact noncausal rows plus S16384/S32768/S65536 causal before changing lookup.
+- qpkv8 D128: S8192 dispatch is retuned; if continuing this family, test
+  S16384/S32768/S65536 causal and avoid broad old-commit restores.
 - D128/qpkv5 small and mid noncausal rows: repeat before patching; several
   apparent misses have flipped with run order and FA2 variance.
 - Gemma local qpkv4/qpkv8: keep `64x16`, but rerun broader repeats before
