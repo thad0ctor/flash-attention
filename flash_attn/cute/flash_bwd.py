@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass import Float32, Int32
+from cutlass import Int32
 import cutlass.utils as utils_basic
 
 from quack import layout_utils
@@ -499,10 +499,10 @@ class FlashAttentionBackwardSm80:
                 mdPsum = cute.make_tensor(mdPsum.iterator, cute.select(mdPsum.layout, mode=LSE_layout_transpose))
 
                 nheads_kv = mK.shape[1]
-                mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=1)
-                mdO = pack_gqa_layout(mdO, self.qhead_per_kvhead, nheads_kv, head_idx=1)
-                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=0)
-                mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, nheads_kv, head_idx=0)
+                mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+                mdO = pack_gqa_layout(mdO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, nheads_kv, head_idx=1)
                 # mdQaccum stays in original (H_q, total_q_padded*D) layout.
 
         if cutlass.const_expr(mCuSeqlensK is not None):
@@ -745,10 +745,7 @@ class FlashAttentionBackwardSm80:
                     mdO_cur = cute.domain_offset(((None, seqlen.offset_q), 0), mdO[None, None, head_idx])
                     mdPsum_cur = cute.domain_offset(((None, padded_offset_q),), mdPsum[None, head_idx])
                     # mdQaccum (H_q, total_q_padded*D); pass full and the
-                    # helper will apply per-head per-batch domain_offset.
-                    # For varlen, we'll need helper signature change; for
-                    # now use the per-element address routing with
-                    # per-(head_q) base address recomputed in helper.
+                    # helper will apply per-head and per-batch offsets.
                     mdQaccum_cur = mdQaccum
             head_idx_kv = head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
@@ -1001,6 +998,11 @@ class FlashAttentionBackwardSm80:
                     and cutlass.const_expr(not seqlen.has_cu_seqlens_q)
                 ),
                 seqlen_q=seqlen.seqlen_q,
+                dq_accum_batch_offset=(
+                    seqlen.padded_offset_q * self.head_dim_padded
+                    if cutlass.const_expr(seqlen.has_cu_seqlens_q)
+                    else Int32(0)
+                ),
                 # Under pack_gqa, head_idx from the grid IS the KV head idx.
                 head_kv_idx=head_idx,
             )
@@ -1282,6 +1284,7 @@ class FlashAttentionBackwardSm80:
                     m_block,
                     gmem_copy_params.seqlen_q,
                     gmem_copy_params.head_kv_idx,
+                    gmem_copy_params.dq_accum_batch_offset,
                 )
             else:
                 tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]

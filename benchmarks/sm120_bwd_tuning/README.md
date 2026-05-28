@@ -60,7 +60,7 @@ python bench_master_bwd.py --phase validate --N 3
 
 ## Output JSON schema (`sweep_main.jsonl` etc.)
 
-```
+```json
 {
   "preset": "llama3-8b",
   "sl": 4096,

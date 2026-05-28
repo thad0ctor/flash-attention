@@ -793,20 +793,20 @@ def run_block_sparse_mainloop_sm80(
             if curr_mask_block_cnt == 0:
                 mma_one_n_block(
                     n_block=n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     is_first_n_block=True,
                 )
             else:
                 mma_one_n_block(
                     n_block=n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     is_first_n_block=False,
                 )
             for j in cutlass.range(1, curr_full_block_cnt):
                 n_block = curr_full_block_idx[curr_full_block_cnt - 1 - j]
                 mma_one_n_block(
                     n_block=n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
                     is_first_n_block=False,
                 )
 

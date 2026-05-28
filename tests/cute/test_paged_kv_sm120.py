@@ -99,8 +99,22 @@ def _sdpa_reference(
     k: torch.Tensor,  # (b, hk, sk, d)
     v: torch.Tensor,
     causal: bool,
+    window_size: Tuple[int | None, int | None] | None = None,
 ):
     """SDPA reference. Uses FlashAttention's right-aligned causal mask when sk!=sq."""
+    if window_size is not None:
+        sq, sk = q.shape[-2], k.shape[-2]
+        left, right = window_size
+        i = torch.arange(sq, device=q.device).unsqueeze(1) + (sk - sq)
+        j = torch.arange(sk, device=q.device).unsqueeze(0)
+        attn_mask = torch.ones(sq, sk, dtype=torch.bool, device=q.device)
+        if left is not None and left >= 0:
+            attn_mask &= j >= i - left
+        if right is not None and right >= 0:
+            attn_mask &= j <= i + right
+        if causal:
+            attn_mask &= ~(j > i)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
     if causal and q.shape[-2] != k.shape[-2]:
         sq, sk = q.shape[-2], k.shape[-2]
         i = torch.arange(sq, device=q.device).unsqueeze(1)
@@ -120,6 +134,7 @@ def _run_paged_case(
     page_size: int = 64,
     page_table_pattern: str = "permuted",
     causal: bool = False,
+    window_size: Tuple[int | None, int | None] | None = None,
     seed: int = 0,
     dtype: torch.dtype = torch.bfloat16,
 ) -> Tuple[float, float]:
@@ -182,6 +197,7 @@ def _run_paged_case(
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
         seqused_k=seqused_k, page_table=page_table, causal=causal,
+        window_size=window_size or (None, None),
     )
 
     # Reference: SDPA on the reconstructed (logical) K/V layout per batch.
@@ -202,7 +218,7 @@ def _run_paged_case(
         qb_ = qb.transpose(0, 1).unsqueeze(0).float()
         kb_ = kb.transpose(0, 1).unsqueeze(0).float()
         vb_ = vb.transpose(0, 1).unsqueeze(0).float()
-        out_b = _sdpa_reference(qb_, kb_, vb_, causal=causal)
+        out_b = _sdpa_reference(qb_, kb_, vb_, causal=causal, window_size=window_size)
         out_ref_list.append(out_b.squeeze(0).transpose(0, 1).to(dtype))
     out_ref = torch.cat(out_ref_list, dim=0)
 
@@ -239,6 +255,18 @@ def test_page_table_patterns(page_table_pattern):
 def test_causal():
     _sm120_only()
     md, _ = _run_paged_case(causal=True, seed=1)
+    assert md < TOL_BF16
+
+
+def test_local_left_window_page_bounds():
+    _sm120_only()
+    md, _ = _run_paged_case(
+        seqlen_q=384,
+        seqlen_k=384,
+        page_size=64,
+        window_size=(64, 0),
+        seed=17,
+    )
     assert md < TOL_BF16
 
 

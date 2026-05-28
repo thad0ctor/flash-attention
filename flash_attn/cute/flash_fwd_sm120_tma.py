@@ -418,6 +418,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         # TMA transfer sizes (bytes per load)
         q_copy_bytes = cute.size_in_bytes(self.dtype, sQ_layout_one_stage)
         kv_copy_bytes = cute.size_in_bytes(self.dtype, sK_layout_one_stage)
+        v_copy_bytes = cute.size_in_bytes(self.dtype, sV_layout_one_stage)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile scheduler
@@ -475,6 +476,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             window_size_right,
             q_copy_bytes,
             kv_copy_bytes,
+            v_copy_bytes,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -520,6 +522,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         window_size_right: Optional[Int32],
         q_copy_bytes: cutlass.Constexpr,
         kv_copy_bytes: cutlass.Constexpr,
+        v_copy_bytes: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -677,7 +680,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_mma_warps
             ),
-            tx_count=kv_copy_bytes,
+            tx_count=v_copy_bytes,
             barrier_storage=storage.v_mbar_ptr.data_ptr(),
         )
 

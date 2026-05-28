@@ -19,9 +19,9 @@ or reverted paths.
   are superseded.
 - For any GPU benchmark, pin the intended card first:
   - `CUDA_DEVICE_ORDER=PCI_BUS_ID`
-  - `CUDA_VISIBLE_DEVICES=GPU-f423fa54-c41a-719d-89ca-e09ae9c1826a`
+  - `CUDA_VISIBLE_DEVICES=<RTX_5090_GPU_UUID>`
   - verify Python sees exactly one GPU: RTX 5090, UUID
-    `GPU-f423fa54-c41a-719d-89ca-e09ae9c1826a`
+    `<RTX_5090_GPU_UUID>`
   - check `nvidia-smi pmon -c 1` and do not benchmark if active training is
     using the machine unless the user explicitly clears it.
 
@@ -30,6 +30,7 @@ or reverted paths.
 | Scope | Commit/artifact | Result | Notes |
 |---|---|---:|---|
 | 80-cell fwd+bwd broad snapshot | `9b46c42`, `/tmp/sm120_fa2_fa4_d2d0ec2_20260526_0800`, `AI/SM120_CURRENT_PERF_2026_05_26.md` | overall 1.0226x, fwd 1.0248x, bwd 1.0204x | Current winner marker after restoring packed GQA forward path. |
+| Post-qpkv-update model forward sweep | `3c34c6a`, `/tmp/sm120_model_variants_after_qpkv_updates_20260528b`, `/tmp/sm120_longseq_qwen_gemma_after_qpkv_updates_20260528b` | 130 pairs, geomean 1.041438, median 1.026890, wins/ties/losses 88/6/36 | Current clean combined Qwen/Gemma short-mid + long reference. Short/mid 78-cell geomean 1.061524; long 52-cell geomean 1.012019. |
 | Latest broad forward table in repo | `agent_space/sm120_full_sweep_20260528_fwd_table.md` | 130 pairs, geomean 1.025512, median 1.016456, wins 83/130 | Good trend table, but at least qwen3-14b S=16384 causal is superseded by `532331f` targeted data below. |
 | Focused Qwen current-vs-history check | `/tmp/sm120_qwen_commit_compare_focused_20260528` | current geomean 1.030644, median 1.029464, wins 6/7 | Compared `e65b67a`, `6b77ace`, and current. |
 | Short/mid Qwen current-vs-history check | `/tmp/sm120_qwen_commit_compare_shortmid_20260528` | current geomean 1.034586, median 1.020806, wins 41/54 | Current beat earlier candidate commits in aggregate. |
@@ -71,17 +72,22 @@ These are CodeRabbit/PR-trail risks noted during the performance pass. They are
 not evidence against the dense Qwen/Gemma forward winners above, but future work
 should not lose track of them.
 
-- SM120 TMA should avoid `learnable_sink` unless correctness is proven.
-- Varlen autograd is missing `mask_mod` coverage.
-- Varlen pack-GQA dQ atomics may need per-batch offset handling.
-- Paged-KV local masking has `n_block_min` / tail-loop concerns.
-- SM120 TMA reuses K copy byte count for V when `D != Dv`; keep this separate
-  from dense `D == Dv` tuning claims.
+- SM120 TMA `learnable_sink` dispatch is gated off in the CodeRabbit fix set
+  after `3c34c6a`.
+- Varlen autograd now propagates `mask_mod` in the CodeRabbit fix set after
+  `3c34c6a`.
+- Varlen pack-GQA dQ atomics now include the per-batch padded Q offset, and
+  SM120 backward varlen/seqused explicit pack falls back to the nonpacked GQA
+  path until the full packed varlen path is validated.
+- Paged-KV local masking now stops the paged unmasked loop at `n_block_min` in
+  the CodeRabbit fix set after `3c34c6a`.
+- SM120 TMA now tracks V copy byte count separately from K when `D != Dv`; keep
+  this separate from dense `D == Dv` tuning claims.
 
 ## Open Targets
 
-- Re-run a full 130-cell forward sweep after `532331f`; current broad table is useful
-  but not fully current for qwen3-14B S=16384 causal.
+- Current broad reference is the post-qpkv-update 130-cell sweep at `3c34c6a`.
+  Re-run it after any further dispatch/kernel changes, not before.
 - qpkv8 D128: S8192 dispatch is retuned; if continuing this family, test
   S16384/S32768/S65536 causal and avoid broad old-commit restores.
 - D128/qpkv5 small and mid noncausal rows: repeat before patching; several

@@ -1160,6 +1160,7 @@ def _flash_attn_fwd(
                 and not is_varlen
                 and not use_block_sparsity
                 and not pack_gqa
+                and learnable_sink is None
             )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n,
@@ -1534,6 +1535,10 @@ def _bwd_postprocess_dkv_sm120(
     dtype, hdim, block_size, num_threads, atom_layout,
 ):
     """Fused fixed-length SM120 dK+dV postprocess."""
+    if dk.shape[-1] != dv.shape[-1]:
+        raise NotImplementedError(
+            "SM120 fused dK+dV postprocess requires dK and dV to have the same head_dim"
+        )
     compile_key = (dtype, hdim, block_size, num_threads, atom_layout)
     if compile_key not in _bwd_postprocess_dkv_sm120.compile_cache:
         _bwd_postprocess_dkv_sm120.compile_cache[compile_key] = (
@@ -1781,6 +1786,19 @@ def _flash_attn_bwd(
     # slower than the non-pack GQA path on the Phase 13 matrix. Other archs
     # (SM80/SM90/SM100) retain the original "not yet supported" override.
     if arch // 10 == 12 and pack_gqa and not pack_gqa_requested:
+        pack_gqa = False
+    if (
+        arch // 10 == 12
+        and pack_gqa
+        and (
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        )
+    ):
+        # The explicit SM120 packed backward path is tuned for fixed-length
+        # dense GQA. Varlen/seqused keeps the correct nonpacked GQA fallback.
         pack_gqa = False
     if not (arch // 10 == 12):
         pack_gqa = False
@@ -2538,6 +2556,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.pack_gqa = pack_gqa
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
+        ctx.mask_mod = mask_mod
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2571,6 +2590,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=ctx.pack_gqa,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
+            mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
             dlse=dlse,
         )

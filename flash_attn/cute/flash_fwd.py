@@ -1913,7 +1913,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
 
         # ---- Unmasked iterations ----
-        for n_tile in cutlass.range(unmasked_n_block_start, unroll=1):
+        for n_tile in cutlass.range(unmasked_n_block_start - n_block_min, unroll=1):
             nb = unmasked_n_block_start - n_tile - 1
             acc_S = cute.make_fragment(
                 thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32

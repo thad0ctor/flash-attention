@@ -11,17 +11,17 @@ packed GQA forward path.
 
 ## Environment
 
-- GPU: RTX 5090, SM120, UUID `GPU-f423fa54-c41a-719d-89ca-e09ae9c1826a`
+- GPU: RTX 5090, SM120, UUID `<redacted>`
 - Torch: `2.11.0+cu130`
 - FA2 baseline: cached wheel `flash_attn-2.8.3+torch2.11.0.cu130-cp312-cp312-linux_x86_64.whl`
 - FA4: editable `flash-attn-4` from this worktree
-- Harness: `/home/rgilbreth/Desktop/AI-Software/sm120-overnight-logs/phase13_bench/bench_runner.py`
+- Harness: `<local bench_runner.py path>`
 - Matrix: 5 presets x 4 seqlens x 2 causal modes x forward/backward = 80 paired cells
 - Timing: fresh subprocess per cell, B=2, bf16, CUDA events, 3 warmup + 10 measured iterations
 
 ## FA4 vs FA2 2.8.3
 
-Output directory: `/tmp/sm120_fa2_fa4_d2d0ec2_20260526_0800`
+Output directory: `/tmp/<run_id>`
 
 | Slice | Cells | FA4 / FA2 geomean |
 |---|---:|---:|
@@ -41,7 +41,7 @@ Preset geomeans, forward and backward combined:
 
 ## Change vs Prior Non-Packed Fallback Matrix
 
-Prior output directory: `/tmp/sm120_fa2_fa4_current_20260526_0218`
+Prior output directory: `/tmp/<prior_run_id>`
 
 | Slice | Prior FA4 / FA2 | Current FA4 / FA2 | Ratio change |
 |---|---:|---:|---:|

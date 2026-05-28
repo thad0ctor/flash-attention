@@ -493,6 +493,7 @@ class PackGQA:
         block: cutlass.Int32,
         seqlen: cutlass.Int32,
         head_kv_idx: cutlass.Int32 = cutlass.Int32(0),
+        dq_accum_batch_offset: cutlass.Int32 = cutlass.Int32(0),
     ):
         """Atomic-add per-MMA-element dQ values into the ORIGINAL-layout
         dq_accum, routing each element to the correct head_q slot and to
@@ -598,7 +599,8 @@ class PackGQA:
 
             elem_offset = (
                 cutlass.Int64(h_actual) * cutlass.Int64(head_stride)
-                + cutlass.Int64(position_in_head_slot) * cutlass.Int64(seqlen_stride)
+                + cutlass.Int64(dq_accum_batch_offset + position_in_head_slot)
+                * cutlass.Int64(seqlen_stride)
             )
             dq_ptr_i64 = (base_ptr + elem_offset).toint()
             dq_gmem_ptr = cute.make_ptr(

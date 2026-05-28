@@ -184,6 +184,32 @@ def test_dgtdv_routes_to_non_tma(
     )
 
 
+@pytest.mark.timeout(30)
+def test_sm120_tma_d_lt_dv_uses_v_copy_bytes():
+    """TMA must size the V transfer from the V tile when head_dim_v > head_dim."""
+    _sm120_only()
+    torch.manual_seed(1201)
+    batch_size, seqlen, nheads, head_dim, head_dim_v = 2, 256, 8, 64, 128
+    dtype = torch.bfloat16
+    device = "cuda"
+    q = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, head_dim_v, device=device, dtype=dtype)
+
+    out = flash_attn_func(q, k, v, causal=False)
+    if isinstance(out, tuple):
+        out = out[0]
+
+    out_ref = _sdpa_reference(
+        q.transpose(1, 2).float(),
+        k.transpose(1, 2).float(),
+        v.transpose(1, 2).float(),
+        causal=False,
+    ).transpose(1, 2).to(dtype)
+    md = float((out.float() - out_ref.float()).abs().max())
+    assert md < TOL_BF16, f"d={head_dim} dv={head_dim_v}: max diff {md:.5f} >= {TOL_BF16}"
+
+
 def test_sm120_tma_can_implement_rejects_d_gt_dv():
     """Negative unit-level probe: the TMA gate must keep rejecting d > dv.
 

@@ -53,10 +53,7 @@ B = 2  # match phase13 bench batch size
 
 def sm120_baseline_for(head_dim: int):
     """Mirror interface.py SM120 backward hard-coded defaults."""
-    if head_dim <= 64:
-        return (64, 64, 2)
-    else:
-        return (64, 64, 1)
+    return (64, 64, 1)
 
 
 def smem_ok(d: int, tile_m: int, tile_n: int, num_stages: int,
@@ -196,7 +193,7 @@ def phase_main(args):
     os.makedirs(RAW_DIR, exist_ok=True)
     out_path = os.path.join(ROOT, "sweep_main.jsonl")
     if os.path.exists(out_path) and not args.force:
-        print(f"sweep_main.jsonl exists; resuming. Use --force to restart.")
+        print("sweep_main.jsonl exists; resuming. Use --force to restart.")
     elif args.force and os.path.exists(out_path):
         os.remove(out_path)
     existing = {(r["preset"], r["sl"], r["causal"], r["tile_m"], r["tile_n"], r["num_stages"])
@@ -406,8 +403,16 @@ def phase_validate(args):
     val_path = os.path.join(ROOT, "validate.jsonl")
     if args.force and os.path.exists(val_path):
         os.remove(val_path)
-    existing = {(r["preset"], r["sl"], r["causal"], r["mode"], r.get("repeat", 0))
-                for r in read_jsonl(val_path)}
+    existing = {
+        (
+            r["preset"],
+            r["sl"],
+            r["causal"],
+            r.get("mode_label") or r.get("mode"),
+            r.get("repeat", 0),
+        )
+        for r in read_jsonl(val_path)
+    }
 
     cells = list(cells_iter())
     t0 = time.time()
@@ -502,7 +507,7 @@ def _analyze_validation(val_path, lookup, args):
     rep_path = os.path.join(ROOT, "validation_report.json")
     with open(rep_path, "w") as f:
         json.dump(out, f, indent=2)
-    print(f"\nValidation summary:")
+    print("\nValidation summary:")
     print(f"  cells:           {out['n_cells_total']}")
     print(f"  in lookup:       {out['n_cells_in_lookup']}")
     print(f"  geomean (all):   {geomean:.4f}x")
