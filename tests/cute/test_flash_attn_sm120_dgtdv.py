@@ -216,12 +216,8 @@ def test_sm120_tma_can_implement_rejects_d_gt_dv():
     This is the *direct* guard against the "someone relaxed the TMA gate"
     failure mode. It runs without launching a kernel, so a regression here
     catches the bug at the unit level even on CI machines without an SM120
-    GPU available (the gate is a pure-Python staticmethod). We still pin to
-    SM120 for parity with the surrounding suite — the routing pattern is
-    only load-bearing on SM120, and skipping elsewhere matches the rest of
-    the file's behavior.
+    GPU available (the gate is a pure-Python staticmethod).
     """
-    _sm120_only()
     # Late import so the worktree overlay shim above has had a chance to run.
     import cutlass
     from flash_attn.cute.flash_fwd_sm120_tma import FlashAttentionForwardSm120Tma
@@ -273,7 +269,6 @@ def test_sm120_non_tma_can_implement_accepts_d_gt_dv():
     someone tightened this gate the runtime would AssertionError instead
     of routing correctly.
     """
-    _sm120_only()
     import cutlass
     from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 
@@ -307,7 +302,6 @@ def test_sm120_can_implement_smem_constraint_at_ns2():
     ``(tile_m=128, tile_n=128, ns=2, d=128)`` — i.e. that bumping the
     tile size up from here would push SMEM over the 99 KB cap.
     """
-    _sm120_only()
     import cutlass
     from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 

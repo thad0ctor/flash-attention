@@ -1781,8 +1781,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # We cannot factor this into a Python helper (closures over
         # paged_kv_manager are rejected in dynamic control flow), so the
         # body is open-coded per iteration site below.
-        smem_pipe_read = Int32(0)
-        smem_pipe_write = Int32(0)
         nb = n_block
 
         # ---- First (masked) iteration ----
@@ -1913,7 +1911,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
 
         # ---- Unmasked iterations ----
-        for n_tile in cutlass.range(unmasked_n_block_start - n_block_min, unroll=1):
+        unmasked_n_block_stop = n_block_min
+        if const_expr(self.is_local):
+            unmasked_n_block_stop = cutlass.min(
+                unmasked_n_block_start,
+                block_info.get_n_block_min_before_local_mask(
+                    seqlen, m_block, n_block_min
+                ),
+            )
+        for n_tile in cutlass.range(
+            unmasked_n_block_start - unmasked_n_block_stop, unroll=1
+        ):
             nb = unmasked_n_block_start - n_tile - 1
             acc_S = cute.make_fragment(
                 thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
@@ -1969,6 +1977,65 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tOsVt[None, None, None, 0],
                 smem_thr_copy_V,
             )
+
+        # ---- Local-attention tail iterations ----
+        if const_expr(self.is_local):
+            for n_tile in cutlass.range(unmasked_n_block_stop - n_block_min, unroll=1):
+                nb = unmasked_n_block_stop - n_tile - 1
+                acc_S = cute.make_fragment(
+                    thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
+                )
+                acc_S.fill(0.0)
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+                paged_kv_manager.load_KV(nb, sV[None, None, 0], "V")
+                cute.arch.cp_async_commit_group()
+                sm80_utils.gemm(
+                    thr_mma_qk,
+                    acc_S,
+                    tSrQ,
+                    tSrK,
+                    tSsQ,
+                    tSsK[None, None, None, 0],
+                    smem_thr_copy_Q,
+                    smem_thr_copy_K,
+                    A_in_regs=self.Q_in_regs,
+                )
+                if const_expr(self.score_mod is not None):
+                    self.apply_score_mod(
+                        thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
+                        softmax_scale=softmax.softmax_scale, seqlen=seqlen,
+                        aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                    )
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+                if nb - 1 >= n_block_min:
+                    paged_kv_manager.load_page_table(nb - 1)
+                    paged_kv_manager.load_KV(nb - 1, sK[None, None, 0], "K")
+                cute.arch.cp_async_commit_group()
+                mask.apply_mask(
+                    acc_S, n_block=nb,
+                    batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+                    thr_mma=thr_mma_qk,
+                    mask_causal=self.is_causal, mask_local=self.is_local,
+                    aux_tensors=aux_tensors,
+                    fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+                    mask_mod=self.mask_mod,
+                    mask_seqlen=True,
+                )
+                row_scale = softmax.online_softmax(acc_S, is_first=False, check_inf=True)
+                softmax.rescale_O(acc_O, row_scale)
+                rP = cute.make_fragment_like(acc_S, self.dtype)
+                rP.store(acc_S.load().to(self.dtype))
+                tOrP = layout_utils.reshape_acc_to_frgA(rP)
+                sm80_utils.gemm_rs(
+                    thr_mma_pv,
+                    acc_O,
+                    tOrP,
+                    tOrVt,
+                    tOsVt[None, None, None, 0],
+                    smem_thr_copy_V,
+                )
 
         # ---- Finalize + epilogue ----
         # Drain any outstanding cp.async groups (e.g. trailing empty commits

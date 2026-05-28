@@ -144,7 +144,6 @@ def test_sm120_postprocess_uses_universal_copy_for_dq_store(D):
     This is the actual bug source — even if the numerical impact on a given
     config is small, the wrong store atom is wrong.
     """
-    _sm120_only()
     import inspect
     import re
     from flash_attn.cute import flash_bwd_postprocess
