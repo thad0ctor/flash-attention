@@ -64,6 +64,8 @@ class FlashAttentionForwardBase:
         q_subtile_factor: int | None = None,
         pack_gqa_all_rows_valid: bool = False,
         skip_dense_seqlen_mask: bool = False,
+        hook_load_k: bool = False,
+        hook_load_v: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -108,6 +110,8 @@ class FlashAttentionForwardBase:
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.skip_dense_seqlen_mask = skip_dense_seqlen_mask
+        self.hook_load_k = hook_load_k
+        self.hook_load_v = hook_load_v
         self.qk_acc_dtype = Float32
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -1494,7 +1498,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
             cute.arch.cp_async_commit_group()
 
-        load_V_next()
+        if const_expr(not self.hook_load_v):
+            load_V_next()
         sm80_utils.gemm(
             mma_params.thr_mma_qk,
             acc_S,
@@ -1506,7 +1511,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             ],
             smem_copy_params.smem_thr_copy_Q,
             smem_copy_params.smem_thr_copy_K,
-            # hook_fn=load_V_next,
+            hook_fn=load_V_next if const_expr(self.hook_load_v) else None,
             A_in_regs=self.Q_in_regs,
         )
         if const_expr(score_mod is not None):
@@ -1533,7 +1538,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # wait for smem tile V for O
         if const_expr(self.num_stages == 1):
             sync()
-            load_K_next()
+            if const_expr(not self.hook_load_k):
+                load_K_next()
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
@@ -1553,7 +1559,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 None, None, None, smem_pipe_read if const_expr(self.num_stages > 1) else 0
             ],
             smem_copy_params.smem_thr_copy_V,
-            # hook_fn=load_K_next,
+            hook_fn=load_K_next if const_expr(self.num_stages == 1 and self.hook_load_k) else None,
         )
         # if const_expr(self.num_stages > 1):
         #     load_K_next()

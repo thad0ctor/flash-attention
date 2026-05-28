@@ -808,6 +808,28 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and seqlen_k % tile_n == 0
     )
+    # Keep this narrow: plain bf16 qpkv6 D256 dense kernels benefit from shorter K/V copy
+    # live ranges, while qpkv4 and local-window variants regressed in validation.
+    sm120_qpkv6_d256_load_hooks = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead == 6
+        and not local
+        and not pack_gqa
+        and score_mod is None
+        and mask_mod is None
+        and page_table is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and tile_m == 64
+        and tile_n == 64
+        and sm120_num_stages == 1
+    )
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -915,6 +937,7 @@ def _flash_attn_fwd(
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
+        sm120_qpkv6_d256_load_hooks if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1196,6 +1219,8 @@ def _flash_attn_fwd(
                     has_aux_tensors=aux_tensors is not None,
                     pack_gqa_all_rows_valid=pack_gqa_all_rows_valid,
                     skip_dense_seqlen_mask=sm120_skip_dense_seqlen_mask,
+                    hook_load_k=sm120_qpkv6_d256_load_hooks,
+                    hook_load_v=sm120_qpkv6_d256_load_hooks,
                 )
         else:
             raise ValueError(
