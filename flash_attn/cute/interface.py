@@ -712,7 +712,7 @@ def _flash_attn_fwd(
     sm120_qpkv6_d256_qregs_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
-        and batch_size == 1
+        and batch_size in (1, 2)
         and not local
         and head_dim == 256
         and head_dim_v == 256
@@ -738,7 +738,20 @@ def _flash_attn_fwd(
         sm120_qpkv6_d256_qregs_mode = sm120_qpkv6_d256_qregs_env
     elif sm120_qpkv6_d256_qregs_env in {"0", "false", "off", "no"}:
         sm120_qpkv6_d256_qregs_mode = ""
-    elif sm120_qpkv6_d256_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
+    elif (
+        sm120_qpkv6_d256_qregs_eligible
+        and batch_size == 1
+        and sm120_seq_q in (16384, 32768, 65536, 131072)
+    ):
+        sm120_qpkv6_d256_qregs_mode = "128x64_t256"
+    elif (
+        sm120_qpkv6_d256_qregs_eligible
+        and batch_size == 2
+        and (
+            (not causal and sm120_seq_q == 4096)
+            or (causal and sm120_seq_q == 8192)
+        )
+    ):
         sm120_qpkv6_d256_qregs_mode = "128x64_t256"
     else:
         sm120_qpkv6_d256_qregs_mode = ""
@@ -1201,6 +1214,15 @@ def _flash_attn_fwd(
             and causal
         ):
             sm120_qpkv6_d256_hook_mode = "v"
+    if (
+        sm120_qpkv6_d256_qregs_mode
+        and batch_size == 2
+        and (
+            (not causal and sm120_seq_q == 4096)
+            or (causal and sm120_seq_q == 8192)
+        )
+    ):
+        sm120_qpkv6_d256_hook_mode = "v"
     sm120_qpkv6_d256_hook_override = (
         os.environ.get("FLASH_ATTENTION_SM120_QPKV6_D256_HOOKS", "").lower()
         if arch // 10 == 12
