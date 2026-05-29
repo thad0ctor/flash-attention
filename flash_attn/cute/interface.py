@@ -1654,6 +1654,11 @@ def _sm120_use_fused_dkv_postprocess(
     dkv_postprocess: bool,
     pack_gqa: bool,
     pack_gqa_m_splits: int,
+    qhead_per_kvhead: int,
+    causal: bool,
+    local: bool,
+    seqlen_q: int,
+    seqlen_k: int,
     cu_seqlens_k,
     seqused_k,
     head_dim: int,
@@ -1675,7 +1680,19 @@ def _sm120_use_fused_dkv_postprocess(
         return False
     if override in ("1", "true", "on", "yes"):
         return eligible
-    return eligible and pack_gqa and pack_gqa_m_splits > 1
+    sm120_qpkv8_s1024_causal = (
+        qhead_per_kvhead == 8
+        and causal
+        and not local
+        and seqlen_q == seqlen_k
+        and seqlen_q == 1024
+        and head_dim == 256
+        and head_dim_v == 256
+    )
+    return eligible and (
+        (pack_gqa and pack_gqa_m_splits > 1)
+        or sm120_qpkv8_s1024_causal
+    )
 
 
 def _flash_attn_bwd(
@@ -2529,6 +2546,11 @@ def _flash_attn_bwd(
                 dkv_postprocess=dKV_postprocess,
                 pack_gqa=pack_gqa,
                 pack_gqa_m_splits=pack_gqa_m_splits,
+                qhead_per_kvhead=qhead_per_kvhead,
+                causal=causal,
+                local=local,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
                 cu_seqlens_k=cu_seqlens_k,
                 seqused_k=seqused_k,
                 head_dim=head_dim,

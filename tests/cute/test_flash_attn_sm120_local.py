@@ -133,6 +133,30 @@ def test_sm120_bwd_qpkv4_s1024_causal_pack_split_policy(monkeypatch):
     assert _sm120_bwd_pack_gqa_m_splits(seqlen_q=2048, **{**common, "seqlen_k": 2048}) == 4
 
 
+def test_sm120_bwd_qpkv8_s1024_causal_fused_dkv_policy(monkeypatch):
+    from flash_attn.cute import interface
+
+    monkeypatch.delenv("FLASH_ATTENTION_SM120_FUSED_DKV", raising=False)
+    common = dict(
+        arch=120,
+        dtype=interface.cutlass.BFloat16,
+        dkv_postprocess=True,
+        pack_gqa=False,
+        pack_gqa_m_splits=1,
+        qhead_per_kvhead=8,
+        causal=True,
+        local=False,
+        seqlen_k=1024,
+        cu_seqlens_k=None,
+        seqused_k=None,
+        head_dim=256,
+        head_dim_v=256,
+        dKV_swapAB=False,
+    )
+    assert interface._sm120_use_fused_dkv_postprocess(seqlen_q=1024, **common)
+    assert not interface._sm120_use_fused_dkv_postprocess(seqlen_q=2048, **{**common, "seqlen_k": 2048})
+
+
 @pytest.mark.timeout(60)
 def test_sm120_d128_fused_dkv_backward_matches_sdpa(monkeypatch):
     _sm120_only()
@@ -161,6 +185,40 @@ def test_sm120_d128_fused_dkv_backward_matches_sdpa(monkeypatch):
 
     dk_ref = k_ref.grad.view(1, 128, 4, 8, 128).sum(dim=3)
     dv_ref = v_ref.grad.view(1, 128, 4, 8, 128).sum(dim=3)
+    assert (q.grad.float() - q_ref.grad).abs().max().item() < 0.05
+    assert (k.grad.float() - dk_ref).abs().max().item() < 0.05
+    assert (v.grad.float() - dv_ref).abs().max().item() < 0.05
+
+
+@pytest.mark.timeout(60)
+def test_sm120_d256_fused_dkv_backward_matches_sdpa(monkeypatch):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_FUSED_DKV", "on")
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 8, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 128, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 128, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    out = flash_attn_func(q, k, v, causal=True)
+    out = out[0] if isinstance(out, tuple) else out
+    dout = torch.randn_like(out)
+    out.backward(dout)
+
+    q_ref = q.detach().float().requires_grad_(True)
+    k_ref = k.detach().float().repeat_interleave(8, dim=2).requires_grad_(True)
+    v_ref = v.detach().float().repeat_interleave(8, dim=2).requires_grad_(True)
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = F.scaled_dot_product_attention(
+            q_ref.transpose(1, 2),
+            k_ref.transpose(1, 2),
+            v_ref.transpose(1, 2),
+            is_causal=True,
+        ).transpose(1, 2)
+    ref.backward(dout.float())
+
+    dk_ref = k_ref.grad.view(1, 128, 1, 8, 256).sum(dim=3)
+    dv_ref = v_ref.grad.view(1, 128, 1, 8, 256).sum(dim=3)
     assert (q.grad.float() - q_ref.grad).abs().max().item() < 0.05
     assert (k.grad.float() - dk_ref).abs().max().item() < 0.05
     assert (v.grad.float() - dv_ref).abs().max().item() < 0.05
