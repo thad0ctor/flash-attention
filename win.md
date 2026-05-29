@@ -38,6 +38,7 @@ or reverted paths.
 | Current 5-repeat broad forward rerun | `b9261e6`, `/tmp/sm120_model_variants_qpkv4_5x_rerun_b9261e6_20260528` | 78 cells, geomean 1.070998, median 1.037421, wins 67/78 | Rerun after rejecting qpkv2 dense probe. Versus prior 5-repeat run: FA4-time geomean old/new 1.011005, FA4/FA2 ratio geomean new/old 1.016971. |
 | Current FA2/FA4/SDPA forward sweep | this commit, `/tmp/sm120_sdpa_fa2_fa4_forward_qpkv4_patch_20260528` | 60 cells, FA4/FA2 geomean 1.092207, wins 50/60; FA4/SDPA geomean 0.927178, wins 15/60 | D64 + qpkv4 lookup patches improved the old 60-cell reference from 1.080762 geomean and 41/60 wins. Peak FA4 189.82 TFLOPS in this run. |
 | SM120 paged-KV D192/D256 | this commit, `/tmp/sm120_paged_kv_hdgt128_bench_packoff_20260528` | New paged-KV coverage for head_dim 192/256. Full SM120 paged-KV suite: 51/51 pass. D256 B=2 qpkv4 paged/contiguous median ratio: S1024 noncausal 1.015x, S1024 causal 1.032x, S4096 noncausal 0.981x, S4096 causal 0.974x. | feature keeper; performance is near-contiguous without unpacking KV |
+| SM120 D256 backward functional baseline | current D256 alias path, `/tmp/sm120_bwd_d256_alias_overlap_3x_20260528`, `/tmp/sm120_bwd_d256_ncu_20260528` | Dense D256 backward now validates for qpkv2/qpkv4/qpkv8 causal and noncausal. 3-repeat S1024 causal smoke vs FA2: geomean 0.901647, wins 2/8. Qwen geomean 0.926900, Gemma geomean 0.861077. NCU qwen3.5-9B S1024 causal main kernel: FA4 479.5 us vs FA2 420.5 us; FA4 uses fewer instructions but launches half the CTA grid. | feature baseline, not a perf winner |
 
 ## Best Known Winners
 
@@ -54,6 +55,7 @@ or reverted paths.
 | D64 MHA old 60-cell misses | `e93f8ef`: `(64,1,S,causal)` lookup now S1024 nc `64x64`, S2048 nc `128x32`, S4096 nc `64x64`, S8192/S16384 nc `128x48`, S16384 c `128x48` | Fresh public 60-cell run `/tmp/sm120_sdpa_fa2_fa4_forward_d64_patch_20260528`: hd64 MHA old/new FA4/FA2 ratios S1024 nc 0.849 -> 0.998, S2048 nc 0.977 -> 1.020, S4096 nc 1.017 -> 1.047, S8192 nc 0.946 -> 0.973, S16384 nc 0.967 -> 0.991, S16384 c 0.937 -> 1.000. | keeper for old 60-cell matrix; D64 remains noisy in full public sweeps |
 | D128 qpkv4 old 60-cell long rows | this commit: S8192 causal B=1 `64x64`; S16384 noncausal `128x32`; S16384 causal B=1 `128x64`, B>1 `128x48` | Public 60-cell run `/tmp/sm120_sdpa_fa2_fa4_forward_qpkv4_patch_20260528`: FA4/FA2 geomean 1.092207, wins 50/60. Touched qpkv4 ratios from prior fresh D64 run: llama S8192 c 0.954 -> 1.021, llama S16384 c 0.996 -> 1.037, mistral S16384 nc 0.991 -> 1.006, mistral S16384 c 0.982 -> 1.016. B=2 qwen3-vl S16384 direct public checks stayed above FA2 for causal and noncausal. | keeper; qpkv7 rows were probed and left unchanged |
 | SM120 paged-KV head_dim > 128 | this commit: PagedKVManager uses `ceil(tile_n / num_threads)` page-table entries; SM120 D192/D256 use non-TMA `64x64` | Correctness: `tests/cute/test_paged_kv_sm120.py` 51/51 pass, including D192/D256 page sizes, causal, GQA, MQA. Bench: `/tmp/sm120_paged_kv_hdgt128_bench_packoff_20260528`, D192/D256 exact match vs unpacked nonpacked FA4 baseline; D256 S1024 paged slightly faster, S4096 within 2-3% of contiguous. | keeper |
+| SM120 D256 backward support | current D256 alias path: Q/dO and K/V shared-memory reuse with Q/K reload | Correctness: `tests/cute/test_flash_attn_sm120_local.py` validates D256 qpkv2/qpkv4/qpkv8 causal and noncausal against SDPA. Perf is below FA2 in the current S1024 smoke, so this is a coverage baseline rather than a winner. | feature baseline |
 | qwen2.5 D128 dense noncausal TMA mask skip | `0af9a4c`, static noncausal TMA seqlen-mask skip | NCU Qwen2.5 S8192 noncausal: 10.56 ms -> 10.18 ms, instructions 2.064B -> 1.866B. Repeats median 0.975, mean 0.987, range 0.971-1.031. | historical, partly superseded |
 | backward d<=64 | `4d59090`, SM120 backward default `num_stages` 2 -> 1 | Phase 17C reported +5.6% on d<=64 cells, arch-gated. | keeper |
 | backward broad Phase 17 | `362a65a` + `55ab672`, 8 warps/block and v4 atomic dQ/dK/dV | Phase 17 backward 40-cell FA4/FA2 geomean 1.017x, 29/40 wins, peak 180.8 TFLOPS; was 0.93x and 10/40 wins before. | keeper |
@@ -78,6 +80,8 @@ or reverted paths.
 | qwen3.5-9B S4096 noncausal D256 qpkv4 and gemma4-e2b S8192 noncausal D256 qpkv8 broad-repeat misses | No dispatch patch. A later public-API 10-repeat check flipped both apparent 5-repeat misses into wins: qwen3.5-9B S4096 noncausal mean 1.015043 / median 1.024537, wins 6/10; gemma4-e2b S8192 noncausal mean 1.020579 / median 1.029481, wins 8/10. The matching interleaved A/B run mostly favored the existing `64x64` path; qwen S4096 `64x48` was only a tiny distinct hint and would disable dense mask-skip divisibility. Artifacts: `/tmp/sm120_broad_miss_qpkv4_qpkv8_condition_ab_20260528`, `/tmp/sm120_broad_miss_public_repeat_20260528`. |
 | Gemma31 D256 qpkv2 local extension | No dispatch patch after `/tmp/sm120_gemma_qpkv2_local_ab_20260528`. Interleaved A/B had S4096 local auto already 1.066x vs FA2 and best explicit tile only +0.9%; S8192 local auto 1.004x and explicit `64x64` +3.3% but same logical tile as fallback, so the public miss did not reproduce cleanly. |
 | D128 qpkv7 old 60-cell rows | No dispatch patch after `/tmp/sm120_d128_old60_condition_ab_20260528`. The best qwen2.5 qpkv7 S8192/S16384 causal/noncausal candidates matched the current lookup or were too small/noisy to justify a change. |
+| SM120 D256 backward N=32 path | Rejected for now. NCU showed FA2 uses a D256 N=32 main kernel and launches twice the CTA grid, so this is the right future target. A quick FA4 N=32 probe required different dK/dV epilogue layout; after scalarizing the GQA dK/dV epilogue it compiled but produced wrong dK. Do not restore without a dedicated epilogue/layout rewrite. Artifacts: `/tmp/sm120_bwd_d256_ncu_20260528`. |
+| SM120 D256 backward qpkv2 no-overlap reload | Rejected. Disabling K-reload overlap for qpkv2 improved one noisy Gemma timing, but correctness failed for qpkv2 noncausal dK with max error around 2.3. Keep K-reload overlap enabled for all D256 GQA groups until a correct qpkv2-specific path exists. |
 
 ## Review Risks To Keep Separate From Perf Winners
 
@@ -118,6 +122,12 @@ should not lose track of them.
   `/tmp/sm120_qpkv6_ncu_after_qpkv8_20260528b`: FA4 2.328 ms / 419.4M SM
   instructions / 255 regs/thread, FA2 2.365 ms / 323.8M SM instructions /
   255 regs/thread.
+- D256 backward performance: the current Q/dO + K/V alias path fits SM120 and
+  is correct, but it is not yet faster than FA2. The main gap is structural:
+  FA2's D256 backward mainloop uses N=32 and twice the CTA grid, while FA4's
+  current safe path uses N=64. A future dedicated D256 variant should solve the
+  N=32 dK/dV epilogue/layout problem instead of adding another dispatcher-only
+  condition.
 - Current 10-repeat short-mid sweep leaves only three mean-ratio rows below
   0.98: qwen3.5/qwen3.6-27B S1024 causal D256 qpkv6 at 0.952360 but median
   1.024283 and wins 6/10; gemma4-31B S4096 local D256 qpkv2 at 0.965963; and

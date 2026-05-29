@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def _ensure_worktree_cute_loaded():
@@ -84,16 +86,37 @@ def test_sm120_hd256_local_forward_matches_reference(h_q, h_kv, window_left):
     assert max_diff < 0.05
 
 
-@pytest.mark.timeout(30)
-def test_sm120_hd256_backward_rejects_before_bad_launch():
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("h_q,h_kv", [(4, 2), (8, 2), (8, 1)])
+def test_sm120_hd256_backward_matches_sdpa(causal, h_q, h_kv):
     _sm120_only()
     from flash_attn.cute import flash_attn_func
 
     torch.manual_seed(0)
-    q = torch.randn(1, 128, 8, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(1, 128, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(1, 128, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    out = flash_attn_func(q, k, v, causal=True)
+    q = torch.randn(1, 128, h_q, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 128, h_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 128, h_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    out = flash_attn_func(q, k, v, causal=causal, pack_gqa=False)
     out = out[0] if isinstance(out, tuple) else out
-    with pytest.raises(NotImplementedError, match="SM120 FA4 backward.*head_dim=head_dim_v=256"):
-        out.backward(torch.randn_like(out))
+    dout = torch.randn_like(out)
+    out.backward(dout)
+
+    repeat = q.shape[2] // k.shape[2]
+    q_ref = q.detach().float().requires_grad_(True)
+    k_ref = k.detach().float().repeat_interleave(repeat, dim=2).requires_grad_(True)
+    v_ref = v.detach().float().repeat_interleave(repeat, dim=2).requires_grad_(True)
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = F.scaled_dot_product_attention(
+            q_ref.transpose(1, 2),
+            k_ref.transpose(1, 2),
+            v_ref.transpose(1, 2),
+            is_causal=causal,
+        ).transpose(1, 2)
+    ref.backward(dout.float())
+
+    dk_ref = k_ref.grad.view(1, 128, h_kv, repeat, 256).sum(dim=3)
+    dv_ref = v_ref.grad.view(1, 128, h_kv, repeat, 256).sum(dim=3)
+    assert (q.grad.float() - q_ref.grad).abs().max().item() < 0.05
+    assert (k.grad.float() - dk_ref).abs().max().item() < 0.05
+    assert (v.grad.float() - dv_ref).abs().max().item() < 0.05

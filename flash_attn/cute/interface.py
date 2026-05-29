@@ -1659,12 +1659,6 @@ def _flash_attn_bwd(
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
-        if head_dim == 256 and head_dim_v == 256:
-            raise NotImplementedError(
-                "SM120 FA4 backward with head_dim=head_dim_v=256 is not supported: "
-                "the SM80-base backward kernel exceeds the 99 KB shared-memory cap "
-                "on consumer Blackwell. Use FA2/SDPA for backward or forward-only FA4."
-            )
         # Not an SM120-specific SMEM issue: the SM80 base kernel itself uses
         # raw atomic_add_fp32 for dQ accumulation and asserts on mdQ_semaphore
         # being None (see flash_bwd.py:~395). The semaphore-based dQ scheduler

@@ -98,6 +98,11 @@ class FlashAttentionBackwardSm80:
         self.Mma_dKV_is_RS = AtomLayoutMSdP == 1 and AtomLayoutNdKV == num_mma_warps and SdP_swapAB and not dKV_swapAB
         self.V_in_regs = V_in_regs
         self.share_QV_smem = V_in_regs
+        self.reuse_qk_dov_smem = (
+            getattr(self, "arch", 80) == 120
+            and self.head_dim_padded == 256
+            and self.head_dim_v_padded == 256
+        )
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
 
@@ -172,13 +177,13 @@ class FlashAttentionBackwardSm80:
         else:
             if cutlass.const_expr(not (mdK_type == mdV_type == cutlass.Float32)):
                 raise TypeError("mdKaccum and mdVaccum tensors must have the data type Float32")
-        if cutlass.const_expr(not mQ_type in [cutlass.Float16, cutlass.BFloat16]):
+        if cutlass.const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
-        if cutlass.const_expr(not mLSE_type in [cutlass.Float32]):
+        if cutlass.const_expr(mLSE_type not in [cutlass.Float32]):
             raise TypeError("LSE tensor must be Float32")
-        if cutlass.const_expr(not mdPsum_type in [cutlass.Float32]):
+        if cutlass.const_expr(mdPsum_type not in [cutlass.Float32]):
             raise TypeError("dPsum tensor must be Float32")
-        if cutlass.const_expr(not mdQaccum_type in [cutlass.Float32]):
+        if cutlass.const_expr(mdQaccum_type not in [cutlass.Float32]):
             raise TypeError("dQaccum tensor must be Float32")
         if cutlass.const_expr(mCuSeqlensQ_type not in [None, cutlass.Int32]):
             raise TypeError("cuSeqlensQ tensor must be Int32")
@@ -390,6 +395,17 @@ class FlashAttentionBackwardSm80:
             sP: sP_struct
             sdS: sdS_struct
 
+        @cute.struct
+        class SharedStorageReuseQKdOV:
+            sK: sK_struct
+            sQ: sQ_struct
+            sLSE: sLSE_struct
+            sdPsum: sdPsum_struct
+            sP: sP_struct
+            sdS: sdS_struct
+
+        if cutlass.const_expr(self.reuse_qk_dov_smem):
+            return SharedStorageReuseQKdOV
         return SharedStorageSeparateQV if cutlass.const_expr(not self.share_QV_smem) else SharedStorageSharedQV
 
     @cute.jit
@@ -811,11 +827,15 @@ class FlashAttentionBackwardSm80:
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
-            if cutlass.const_expr(not self.share_QV_smem):
+            if cutlass.const_expr(self.reuse_qk_dov_smem):
+                sV = cute.make_tensor(cute.recast_ptr(sK.iterator, dtype=self.dtype), sV_layout)
+                sdO = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sdO_layout)
+            elif cutlass.const_expr(not self.share_QV_smem):
                 sV = storage.sV.get_tensor(sV_layout)
+                sdO = storage.sdO.get_tensor(sdO_layout)
             else:
                 sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
-            sdO = storage.sdO.get_tensor(sdO_layout)
+                sdO = storage.sdO.get_tensor(sdO_layout)
             sP = storage.sP.get_tensor(sPdS_layout)
             sdS = storage.sdS.get_tensor(sPdS_layout)
             sLSE = storage.sLSE.get_tensor(sLSE_layout)
@@ -1020,10 +1040,19 @@ class FlashAttentionBackwardSm80:
                 mdO_cur, mdPsum_cur, sdO, sdPsum, tidx,
                 seqlen=seqlen.seqlen_q,
             )
+            load_K_current = partial(
+                self.load_K, gmem_thr_copy_QK, tKgK, tKsK, n_block,
+                seqlen=seqlen.seqlen_k, headdim=d_head,
+            )
+            load_V_current = partial(
+                self.load_V, gmem_thr_copy_VdO, tVgV, tVsV, n_block,
+                seqlen=seqlen.seqlen_k, headdim=d_head_v,
+            )
             compute_one_m_block = partial(
                 self.compute_one_m_block, mma_params=mma_params,
                 smem_copy_params=smem_copy_params, gmem_copy_params=gmem_copy_params,
                 load_Q_LSE=load_Q_LSE, load_dO_dPsum=load_dO_dPsum,
+                load_K_current=load_K_current, load_V_current=load_V_current,
                 m_block_max=m_block_max,
                 softmax_scale=softmax_scale,
                 softmax_scale_log2=softmax_scale_log2,
@@ -1033,33 +1062,34 @@ class FlashAttentionBackwardSm80:
             # Prologue
             # ///////////////////////////////////////////////////////////////////////////////
             # Start async loads of the last mn-tile, where we take care of the mn residue
-            self.load_V(gmem_thr_copy_VdO, tVgV, tVsV, n_block, seqlen=seqlen.seqlen_k,
-                        headdim=d_head_v)
-            if cutlass.const_expr(self.V_in_regs):
+            if cutlass.const_expr(not self.reuse_qk_dov_smem):
+                self.load_V(gmem_thr_copy_VdO, tVgV, tVsV, n_block, seqlen=seqlen.seqlen_k,
+                            headdim=d_head_v)
+                if cutlass.const_expr(self.V_in_regs):
+                    cute.arch.cp_async_commit_group()
+                self.load_K(gmem_thr_copy_QK, tKgK, tKsK, n_block, seqlen=seqlen.seqlen_k,
+                            headdim=d_head)
                 cute.arch.cp_async_commit_group()
-            self.load_K(gmem_thr_copy_QK, tKgK, tKsK, n_block, seqlen=seqlen.seqlen_k,
-                        headdim=d_head)
-            cute.arch.cp_async_commit_group()
 
-            if cutlass.const_expr(self.V_in_regs):
-                cute.arch.cp_async_wait_group(1)
-                cute.arch.barrier()
-                tdPrV_copy_view = smem_thr_copy_KV.retile(tdPrV)
-                cute.copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view)
-                # Sync to avoid loading Q to smem_q, which overlaps with smem_v
-                cute.arch.barrier()
+                if cutlass.const_expr(self.V_in_regs):
+                    cute.arch.cp_async_wait_group(1)
+                    cute.arch.barrier()
+                    tdPrV_copy_view = smem_thr_copy_KV.retile(tdPrV)
+                    cute.copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view)
+                    # Sync to avoid loading Q to smem_q, which overlaps with smem_v
+                    cute.arch.barrier()
 
-            m_block = m_block_min
-            assert self.num_stages_Q >= self.num_stages_dO
-            for stage in cutlass.range_constexpr(self.num_stages_Q):
-                if cutlass.const_expr(self.num_stages_Q == 1 or stage < self.num_stages_Q - 1):
-                    if stage == 0 or m_block + stage < m_block_max:
-                        load_Q_LSE(m_block + stage, smem_pipe_write_q=stage)
-                    cute.arch.cp_async_commit_group()
-                if cutlass.const_expr(stage < self.num_stages_dO):
-                    if stage == 0 or m_block + stage < m_block_max:
-                        load_dO_dPsum(m_block + stage, smem_pipe_write_q=stage)
-                    cute.arch.cp_async_commit_group()
+                m_block = m_block_min
+                assert self.num_stages_Q >= self.num_stages_dO
+                for stage in cutlass.range_constexpr(self.num_stages_Q):
+                    if cutlass.const_expr(self.num_stages_Q == 1 or stage < self.num_stages_Q - 1):
+                        if stage == 0 or m_block + stage < m_block_max:
+                            load_Q_LSE(m_block + stage, smem_pipe_write_q=stage)
+                        cute.arch.cp_async_commit_group()
+                    if cutlass.const_expr(stage < self.num_stages_dO):
+                        if stage == 0 or m_block + stage < m_block_max:
+                            load_dO_dPsum(m_block + stage, smem_pipe_write_q=stage)
+                        cute.arch.cp_async_commit_group()
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Mainloop
@@ -1111,8 +1141,12 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(self.qhead_per_kvhead == 1):
                 acc_dK.store(acc_dK.load() * softmax_scale)
             # reuse sK and sV data iterator
-            sdK = cute.make_tensor(sK.iterator, sK_layout)
-            sdV = cute.make_tensor(sV.iterator, sV_layout)
+            if cutlass.const_expr(self.reuse_qk_dov_smem):
+                sdK = cute.make_tensor(sK.iterator, sK_layout)
+                sdV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
+            else:
+                sdK = cute.make_tensor(sK.iterator, sK_layout)
+                sdV = cute.make_tensor(sV.iterator, sV_layout)
             self.epilogue(
                 acc_dK, acc_dV, mdK, mdV, sdK, sdV,
                 gmem_tiled_copy_dK, gmem_tiled_copy_dV, tiled_mma_dkv,
@@ -1132,6 +1166,8 @@ class FlashAttentionBackwardSm80:
         gmem_copy_params: SimpleNamespace,
         load_Q_LSE: Callable,
         load_dO_dPsum: Callable,
+        load_K_current: Callable,
+        load_V_current: Callable,
         m_block_max: cutlass.Int32,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
@@ -1148,13 +1184,27 @@ class FlashAttentionBackwardSm80:
                 load_dO_dPsum(m_block + self.num_stages_dO, smem_pipe_write_do)
             cute.arch.cp_async_commit_group()
 
+        def load_K_for_dQ():
+            load_K_current()
+            cute.arch.cp_async_commit_group()
+
+        overlap_K_for_dQ = self.reuse_qk_dov_smem
+
         # MMA S
         acc_shape_SdP = mma_params.thr_mma_sdp.partition_shape_C(
             (self.m_block_size, self.n_block_size) if cutlass.const_expr(not self.SdP_swapAB) else (self.n_block_size, self.m_block_size)
         )
+        if cutlass.const_expr(self.reuse_qk_dov_smem):
+            load_Q_LSE(m_block, cutlass.Int32(0))
+            cute.arch.cp_async_commit_group()
+            load_K_current()
+            cute.arch.cp_async_commit_group()
         acc_S = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
         acc_S.fill(0.0)
-        cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_Q > 1) else 0)
+        cute.arch.cp_async_wait_group(
+            0 if cutlass.const_expr(self.reuse_qk_dov_smem)
+            else 1 if cutlass.const_expr(self.num_stages_Q > 1) else 0
+        )
         cute.arch.barrier()
         sm80_utils.gemm(
             mma_params.thr_mma_sdp, acc_S, mma_params.tSrQ, mma_params.tSrK,
@@ -1187,9 +1237,18 @@ class FlashAttentionBackwardSm80:
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
 
         # MMA dP
+        if cutlass.const_expr(self.reuse_qk_dov_smem):
+            cute.arch.barrier()
+            load_dO_dPsum(m_block, cutlass.Int32(0))
+            cute.arch.cp_async_commit_group()
+            load_V_current()
+            cute.arch.cp_async_commit_group()
         acc_dP = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
         acc_dP.fill(0.0)
-        cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_dO > 1) else 0)
+        cute.arch.cp_async_wait_group(
+            0 if cutlass.const_expr(self.reuse_qk_dov_smem)
+            else 1 if cutlass.const_expr(self.num_stages_dO > 1) else 0
+        )
         cute.arch.barrier()
         sm80_utils.gemm(
             mma_params.thr_mma_sdp, acc_dP, mma_params.tdPrdO, mma_params.tdPrV,
@@ -1244,7 +1303,12 @@ class FlashAttentionBackwardSm80:
             swap_AB=self.dKV_swapAB,
         )
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(mma_params.acc_dV)
-        cute.arch.barrier()  # Make sure dS is written
+        cute.arch.barrier()  # Make sure dV is done with aliased dO/V and dS is written
+        if cutlass.const_expr(self.reuse_qk_dov_smem):
+            load_Q_LSE(m_block, cutlass.Int32(0))
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
 
         # MMA dQ
         def dQ_mma(hook_fn):
@@ -1333,12 +1397,18 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.smem_thr_copy_PdSt, smem_copy_params.smem_thr_copy_QdOt,
             A_in_regs=self.Mma_dKV_is_RS,
             swap_AB=self.dKV_swapAB,
-            hook_fn=load_dO_next if cutlass.const_expr(self.num_stages_Q == 1) else None,
+            hook_fn=load_K_for_dQ if cutlass.const_expr(overlap_K_for_dQ)
+            else load_dO_next if cutlass.const_expr(self.num_stages_Q == 1) else None,
         )
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(mma_params.acc_dK)
         if cutlass.const_expr(self.num_stages_Q == 1):
+            if cutlass.const_expr(self.reuse_qk_dov_smem):
+                if cutlass.const_expr(not overlap_K_for_dQ):
+                    load_K_current()
+                    cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
-            dQ_mma(load_Q_next)
+            dQ_mma(None if cutlass.const_expr(self.reuse_qk_dov_smem) else load_Q_next)
 
     @cute.jit
     def epilogue(
