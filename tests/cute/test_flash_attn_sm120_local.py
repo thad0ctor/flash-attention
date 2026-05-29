@@ -87,6 +87,29 @@ def test_sm120_hd256_local_forward_matches_reference(h_q, h_kv, window_left):
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize("hook_mode", ["k", "v", "both"])
+def test_sm120_qpkv5_d128_hook_forward_matches_sdpa(monkeypatch, hook_mode):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_QPKV5_HOOKS", hook_mode)
+    torch.manual_seed(0)
+    q = torch.randn(1, 256, 40, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, 8, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 256, 8, 128, device="cuda", dtype=torch.bfloat16)
+
+    out = flash_attn_func(q, k, v, causal=True)
+    out = out[0] if isinstance(out, tuple) else out
+
+    q_ref = q.float().transpose(1, 2)
+    k_ref = k.float().repeat_interleave(5, dim=2).transpose(1, 2)
+    v_ref = v.float().repeat_interleave(5, dim=2).transpose(1, 2)
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, is_causal=True).transpose(1, 2)
+    assert (out.float() - ref).abs().max().item() < 0.05
+
+
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "h_q,h_kv,pack_gqa",

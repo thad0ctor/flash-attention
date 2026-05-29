@@ -860,6 +860,53 @@ def _flash_attn_fwd(
         and tile_n == 64
         and sm120_num_stages == 1
     )
+    sm120_qpkv5_d128_hook_eligible = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 5
+        and causal
+        and not local
+        and not pack_gqa
+        and score_mod is None
+        and mask_mod is None
+        and page_table is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and sm120_num_stages == 1
+    )
+    # qpkv5 causal rows are sensitive to both seqlen and batch. Keep this exact
+    # to the RTX 5090 paired A/B winners instead of applying a broad qpkv5 rule.
+    sm120_qpkv5_d128_default_hook_mode = ""
+    if sm120_qpkv5_d128_hook_eligible:
+        if sm120_seq_q == 8192:
+            sm120_qpkv5_d128_default_hook_mode = "both"
+        elif sm120_seq_q == 16384 and batch_size > 1:
+            sm120_qpkv5_d128_default_hook_mode = "v"
+        elif sm120_seq_q in (32768, 65536):
+            sm120_qpkv5_d128_default_hook_mode = "both"
+        elif sm120_seq_q >= 131072:
+            sm120_qpkv5_d128_default_hook_mode = "v"
+    sm120_qpkv5_d128_hook_mode = sm120_qpkv5_d128_default_hook_mode
+    sm120_qpkv5_d128_hook_override = (
+        os.environ.get("FLASH_ATTENTION_SM120_QPKV5_HOOKS", "").lower()
+        if arch // 10 == 12
+        else ""
+    )
+    if sm120_qpkv5_d128_hook_override in {"off", "k", "v", "both"}:
+        sm120_qpkv5_d128_hook_mode = (
+            "" if sm120_qpkv5_d128_hook_override == "off" else sm120_qpkv5_d128_hook_override
+        )
+    sm120_hook_load_k = sm120_qpkv6_d256_load_hooks or (
+        sm120_qpkv5_d128_hook_eligible and sm120_qpkv5_d128_hook_mode in {"k", "both"}
+    )
+    sm120_hook_load_v = sm120_qpkv6_d256_load_hooks or (
+        sm120_qpkv5_d128_hook_eligible and sm120_qpkv5_d128_hook_mode in {"v", "both"}
+    )
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -967,7 +1014,8 @@ def _flash_attn_fwd(
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
-        sm120_qpkv6_d256_load_hooks if arch // 10 == 12 else None,
+        sm120_hook_load_k if arch // 10 == 12 else None,
+        sm120_hook_load_v if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1242,8 +1290,8 @@ def _flash_attn_fwd(
                     has_aux_tensors=aux_tensors is not None,
                     pack_gqa_all_rows_valid=pack_gqa_all_rows_valid,
                     skip_dense_seqlen_mask=sm120_skip_dense_seqlen_mask,
-                    hook_load_k=sm120_qpkv6_d256_load_hooks,
-                    hook_load_v=sm120_qpkv6_d256_load_hooks,
+                    hook_load_k=sm120_hook_load_k,
+                    hook_load_v=sm120_hook_load_v,
                 )
         else:
             raise ValueError(
