@@ -759,6 +759,32 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 48, True, True)
             elif (
                 batch_size == 1
+                and not causal
+                and not local
+                and q.dtype == torch.bfloat16
+                and head_dim == 128
+                and head_dim_v == 128
+                and num_head == 32
+                and num_head_kv == 4
+                and qhead_per_kvhead == 8
+                and sm120_seq_q in (16384, 32768, 65536, 131072)
+                and sm120_seq_k == sm120_seq_q
+                and pack_gqa
+                and cu_seqlens_q is None
+                and cu_seqlens_k is None
+                and seqused_q is None
+                and seqused_k is None
+                and page_table is None
+                and qv is None
+                and mask_mod is None
+                and score_mod is None
+                and block_sparse_tensors is None
+            ):
+                # qwen3-30B-style long noncausal qpkv8 favors the narrower
+                # N tile already used by the S8192 lookup entry.
+                fwd_cfg = FwdConfig(128, 32, True, True)
+            elif (
+                batch_size == 1
                 and causal
                 and not local
                 and q.dtype == torch.bfloat16
