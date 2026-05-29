@@ -88,7 +88,10 @@ def test_sm120_hd256_local_forward_matches_reference(h_q, h_kv, window_left):
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("h_q,h_kv,pack_gqa", [(4, 2, False), (8, 2, False), (8, 1, False), (8, 1, None)])
+@pytest.mark.parametrize(
+    "h_q,h_kv,pack_gqa",
+    [(4, 2, False), (8, 2, False), (8, 2, True), (8, 1, False), (8, 1, None)],
+)
 def test_sm120_hd256_backward_matches_sdpa(causal, h_q, h_kv, pack_gqa):
     _sm120_only()
     from flash_attn.cute import flash_attn_func

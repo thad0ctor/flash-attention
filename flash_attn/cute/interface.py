@@ -1806,7 +1806,15 @@ def _flash_attn_bwd(
         and not local
         and head_dim == 256
         and head_dim_v == 256
-        and qhead_per_kvhead == 8
+        and (
+            qhead_per_kvhead == 8
+            or (
+                qhead_per_kvhead == 4
+                and num_head == 16
+                and seqlen_q == seqlen_k
+                and seqlen_q == 8192
+            )
+        )
         and cu_seqlens_q is None
         and cu_seqlens_k is None
         and seqused_q is None
@@ -1815,7 +1823,8 @@ def _flash_attn_bwd(
     # Phase 17B-v2: pack_gqa is now supported in the SM120 backward kernel
     # as an explicit opt-in.  Keep auto-selection disabled for most SM120
     # backward shapes; the packed Q/dO row-pointer path is only a measured
-    # win for fixed dense bf16 D256 qpkv8 noncausal. Other archs
+    # win for fixed dense bf16 D256 qpkv8 noncausal and the qpkv4/Hq16
+    # S8192 noncausal row. Other archs
     # (SM80/SM90/SM100) retain the original "not yet supported" override.
     if arch // 10 == 12 and pack_gqa and not (pack_gqa_requested or sm120_auto_pack_gqa_bwd):
         pack_gqa = False
