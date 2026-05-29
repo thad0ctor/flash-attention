@@ -81,6 +81,7 @@ or reverted paths.
 | qpkv6 D256 causal `64x48` and Q-in-reg variants | One run looked good, repeats rejected. Prior experiment had qpkv6 S4096 causal 0.929 despite a noisy 78-cell aggregate win. Do not restore without fresh paired evidence. |
 | qwen3-14B qpkv5 S8192 noncausal `64x128` / `64x112` candidates | Interleaved A/B rejected; current S8192 causal keeper is `6b77ace`, noncausal remains sensitive/noisy. |
 | qwen3-14B qpkv5 S16384 noncausal `128x32` lookup | Rejected. `/tmp/sm120_qpkv5_s16384_nc_tile_exact_20260529` showed `128x32` slower than current auto for both B=1 and B=2: B=1 auto 30.39 ms vs `128x32` 31.88 ms; B=2 auto 60.98 ms vs `128x32` 63.62 ms. Current auto/`128x64` is already the safe tile family for this row. |
+| qwen3-14B qpkv5 S16384 noncausal non-TMA fallback | Rejected. A dirty exact B=1 gate had only a small/non-repeatable edge over TMA: `/tmp/sm120_qpkv5_s16384_nc_notma_paired_20260529` non-TMA +0.69% vs forced TMA, repeat `/tmp/sm120_qpkv5_s16384_nc_notma_paired_r2_20260529` +0.20%. That is below the bar for switching kernel architecture on this row. |
 | D256 qpkv6 exact-shape TMA `kv_stages=1` | Ran around 341.1 ms on qwen3.5/qwen3.6 S65536 causal, slower than CpAsync and FA2. |
 | Stream-PV prototype avoiding full bf16 `rP` | Compiled and ran, but 3 paired reps geomean 0.958x. Reverted. |
 | TMA stage retune commits `4e895b5`, `ec6dd92`, `ca7f03e`, `08c184f` | Reverted by `6a8f9ab` after long-regression/noise. Do not restore wholesale. |
