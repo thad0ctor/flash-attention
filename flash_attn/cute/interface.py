@@ -149,11 +149,39 @@ def _sm120_bwd_pack_gqa_m_splits(
         else:
             max_safe_splits = max(max_safe_splits, 8)
             auto_splits = 8
+    elif (
+        causal
+        and not local
+        and qhead_per_kvhead == 4
+        and num_head in (8, 16)
+        and num_head_kv == num_head // qhead_per_kvhead
+        and seqlen_q == seqlen_k
+        and seqlen_q == 2048
+        and head_dim == 256
+        and head_dim_v == 256
+    ):
+        # S2048 qpkv4 is still CTA-limited with the causal-safe split4 cap.
+        # The exact B=2 Hq8/Hkv2 and Hq16/Hkv4 rows validate true split16.
+        max_safe_splits = max(max_safe_splits, 16)
+        auto_splits = 16
     else:
         auto_splits = min(qhead_per_kvhead, max_safe_splits, packed_m_blocks)
     env_splits = os.environ.get("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS")
+    sm120_qpkv4_s2048_causal = (
+        causal
+        and not local
+        and qhead_per_kvhead == 4
+        and num_head in (8, 16)
+        and num_head_kv == num_head // qhead_per_kvhead
+        and seqlen_q == seqlen_k
+        and seqlen_q == 2048
+        and head_dim == 256
+        and head_dim_v == 256
+    )
     if env_splits is not None:
         requested_splits = int(env_splits)
+        if sm120_qpkv4_s2048_causal and requested_splits > 0:
+            max_safe_splits = max(max_safe_splits, requested_splits)
         auto_splits = requested_splits if requested_splits > 0 else auto_splits
     return max(1, min(auto_splits, max_safe_splits, packed_m_blocks))
 
@@ -2352,7 +2380,15 @@ def _flash_attn_bwd(
                 causal
                 and qhead_per_kvhead == 4
                 and seqlen_q == seqlen_k
-                and seqlen_q == 1024
+                and (
+                    seqlen_q == 1024
+                    or (
+                        seqlen_q == 2048
+                        and batch_size == 2
+                        and num_head in (8, 16)
+                        and num_head_kv == num_head // qhead_per_kvhead
+                    )
+                )
             )
         )
         and cu_seqlens_q is None

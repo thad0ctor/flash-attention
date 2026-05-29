@@ -320,7 +320,7 @@ def test_sm120_bwd_qpkv4_s1024_causal_pack_split_policy(monkeypatch):
         seqlen_q=1024,
         **{**common, "num_head": 16, "num_head_kv": 4},
     ) == 8
-    assert _sm120_bwd_pack_gqa_m_splits(seqlen_q=2048, **{**common, "seqlen_k": 2048}) == 4
+    assert _sm120_bwd_pack_gqa_m_splits(seqlen_q=2048, **{**common, "seqlen_k": 2048}) == 16
 
 
 def test_sm120_bwd_qpkv8_s1024_causal_fused_dkv_policy(monkeypatch):
