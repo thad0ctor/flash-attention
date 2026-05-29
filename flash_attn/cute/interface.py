@@ -667,7 +667,7 @@ def _flash_attn_fwd(
         sm120_qpkv8_d256_causal_qregs_mode = sm120_qpkv8_d256_causal_qregs_env
     elif sm120_qpkv8_d256_causal_qregs_env in {"0", "false", "off", "no"}:
         sm120_qpkv8_d256_causal_qregs_mode = ""
-    elif sm120_qpkv8_d256_causal_qregs_eligible and sm120_seq_q == 16384:
+    elif sm120_qpkv8_d256_causal_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
         sm120_qpkv8_d256_causal_qregs_mode = "128x64_t256"
     else:
         sm120_qpkv8_d256_causal_qregs_mode = ""
