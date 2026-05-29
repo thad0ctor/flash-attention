@@ -2126,7 +2126,7 @@ def _flash_attn_bwd(
         and not local
         and head_dim == 256
         and head_dim_v == 256
-        and qhead_per_kvhead in (4, 6, 8)
+        and qhead_per_kvhead in (2, 4, 6, 8)
         and seqlen_q == seqlen_k
         and seqlen_q % m_block_size == 0
         and seqlen_k % n_block_size == 0
@@ -2155,6 +2155,12 @@ def _flash_attn_bwd(
                 qhead_per_kvhead == 6
                 and num_head == 24
                 and num_head_kv == 4
+                and seqlen_q == 1024
+            )
+            or (
+                qhead_per_kvhead == 2
+                and num_head == 32
+                and num_head_kv == 16
                 and seqlen_q == 1024
             )
         )
