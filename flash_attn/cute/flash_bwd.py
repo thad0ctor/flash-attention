@@ -532,7 +532,7 @@ class FlashAttentionBackwardSm80:
             self.pack_gqa_m_splits
             if cutlass.const_expr(
                 getattr(self, "arch", 80) == 120
-                and self.pack_gqa
+                and (self.pack_gqa or self.pack_gqa_m_splits > 1)
                 and mCuSeqlensK is None
             )
             else 1
@@ -702,7 +702,6 @@ class FlashAttentionBackwardSm80:
                     )
             if cutlass.const_expr(
                 getattr(self, "arch", 80) == 120
-                and self.pack_gqa
                 and self.pack_gqa_m_splits > 1
             ):
                 active_m_blocks = max(m_block_max - m_block_min, 0)

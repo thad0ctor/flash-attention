@@ -2011,6 +2011,34 @@ def _flash_attn_bwd(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
     )
+    sm120_nonpack_m_split_override = os.environ.get(
+        "FLASH_ATTENTION_SM120_BWD_NONPACK_M_SPLITS", ""
+    )
+    sm120_nonpack_m_split_eligible = (
+        arch // 10 == 12
+        and not pack_gqa
+        and q.dtype == torch.bfloat16
+        and causal
+        and not local
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead in (6, 8)
+        and seqlen_q == seqlen_k
+        and seqlen_q == 1024
+        and m_block_size == 64
+        and n_block_size == 64
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+    )
+    if sm120_nonpack_m_split_eligible:
+        # Short causal qpkv6/qpkv8 D256 underfills the main kernel with the safe
+        # N64 path. Splitting the nonpacked M loop doubles useful CTAs without
+        # the rejected N32/PackGQA changes.
+        pack_gqa_m_splits = 2
+        if sm120_nonpack_m_split_override:
+            pack_gqa_m_splits = max(1, int(sm120_nonpack_m_split_override))
     pack_gqa_all_rows_valid = (
         arch // 10 == 12
         and pack_gqa
