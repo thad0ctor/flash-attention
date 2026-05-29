@@ -586,6 +586,30 @@ def _flash_attn_fwd(
         num_threads = 128
     sm120_seq_q = max_seqlen_q if max_seqlen_q is not None else seqlen_q
     sm120_seq_k = max_seqlen_k if max_seqlen_k is not None else seqlen_k
+    sm120_qpkv5_s16384_qregs_env = os.environ.get("FLASH_ATTENTION_SM120_QPKV5_S16384_QREGS", "").lower()
+    sm120_qpkv5_s16384_qregs = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and batch_size == 1
+        and causal
+        and not local
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 5
+        and sm120_seq_q == 16384
+        and sm120_seq_k == 16384
+        and not pack_gqa
+        and score_mod is None
+        and mask_mod is None
+        and page_table is None
+        and qv is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and sm120_qpkv5_s16384_qregs_env not in {"0", "false", "off", "no"}
+    )
     if (
         arch // 10 == 12
         and causal
@@ -593,7 +617,7 @@ def _flash_attn_fwd(
         and head_dim == 128
         and head_dim_v == 128
         and qhead_per_kvhead == 5
-        and (sm120_seq_q == 8192 or sm120_seq_q >= 32768)
+        and (sm120_seq_q == 8192 or sm120_seq_q >= 32768 or sm120_qpkv5_s16384_qregs)
     ):
         num_threads = 256
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
@@ -652,6 +676,11 @@ def _flash_attn_fwd(
             # D192/D256 paged-KV falls through to the head_dim > 128 64x64
             # non-TMA path below.
             if page_table is not None and head_dim <= 128 and head_dim_v <= 128:
+                fwd_cfg = FwdConfig(128, 128, True, True)
+                sm120_num_stages = 1
+            elif sm120_qpkv5_s16384_qregs:
+                # Exact qwen3-14B B=1 S16384 causal row wins by staging Q in
+                # registers, which requires the 256-thread 128x128 shape.
                 fwd_cfg = FwdConfig(128, 128, True, True)
                 sm120_num_stages = 1
             elif (
@@ -758,6 +787,7 @@ def _flash_attn_fwd(
         and (
             sm120_seq_q == 8192
             or sm120_seq_q >= 32768
+            or sm120_qpkv5_s16384_qregs
         )
     )
 
