@@ -163,6 +163,8 @@ should not lose track of them.
   the CodeRabbit fix set after `3c34c6a`.
 - SM120 TMA now tracks V copy byte count separately from K when `D != Dv`; keep
   this separate from dense `D == Dv` tuning claims.
+- SM80/SM120 forward now rejects block-sparse `cu_seqlens` varlen explicitly;
+  the SM80-base block-sparse mainloop uses non-varlen block indices.
 
 ## Open Targets
 

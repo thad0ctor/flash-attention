@@ -866,6 +866,11 @@ def _flash_attn_fwd(
         head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[head_dim_idx] != 1:
             pack_gqa = False
+        if arch // 10 in [8, 12] and (cu_seqlens_q is not None or cu_seqlens_k is not None):
+            raise NotImplementedError(
+                "Varlen block sparsity is not supported on SM80/SM120 forward; "
+                "the SM80-base block-sparse mainloop uses non-varlen block indices."
+            )
         if cu_seqlens_q is not None:
             assert block_sparse_tensors.cu_total_m_blocks is not None, (
                 "Varlen block sparsity requires block_sparse_tensors.cu_total_m_blocks."
