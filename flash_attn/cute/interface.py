@@ -706,8 +706,8 @@ def _flash_attn_fwd(
                 and head_dim == 128
                 and head_dim_v == 128
                 and qhead_per_kvhead == 8
-                and sm120_seq_q == 32768
-                and sm120_seq_k == 32768
+                and sm120_seq_q in (32768, 65536)
+                and sm120_seq_k == sm120_seq_q
                 and cu_seqlens_q is None
                 and cu_seqlens_k is None
                 and seqused_q is None
@@ -719,10 +719,11 @@ def _flash_attn_fwd(
                 and block_sparse_tensors is None
             ):
                 # qwen3-30B-style long causal qpkv8 regains tensor throughput on
-                # RTX 5090 with a wider N tile and 8 warps; keep this exact to
-                # avoid disturbing the noisier qpkv8 short/noncausal cells.
+                # RTX 5090 with a wider N tile; keep this exact to avoid
+                # disturbing the noisier qpkv8 short/noncausal cells.
                 fwd_cfg = FwdConfig(128, 64, True, True)
-                num_threads = 256
+                if sm120_seq_q == 32768:
+                    num_threads = 256
             elif lookup_key in _SM120_TILE_LOOKUP:
                 tm, tn, ns = _SM120_TILE_LOOKUP[lookup_key]
                 fwd_cfg = FwdConfig(tm, tn, True, True)
