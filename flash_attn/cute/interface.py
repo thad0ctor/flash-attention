@@ -748,7 +748,7 @@ def _flash_attn_fwd(
         sm120_qpkv6_d256_qregs_eligible
         and batch_size == 2
         and (
-            (not causal and sm120_seq_q == 4096)
+            (not causal and sm120_seq_q in (4096, 8192))
             or (causal and sm120_seq_q == 8192)
         )
     ):

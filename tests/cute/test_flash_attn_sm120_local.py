@@ -275,6 +275,26 @@ def test_sm120_qpkv6_d256_b2_qregs_hook_matches_sdpa(monkeypatch, causal):
     assert (out.float() - ref).abs().max().item() < 0.05
 
 
+@pytest.mark.timeout(120)
+def test_sm120_qpkv6_d256_b2_s8192_noncausal_default_qregs(monkeypatch):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 8192, 24, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 8192, 4, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(2, 8192, 4, 256, device="cuda", dtype=torch.bfloat16)
+
+    out_default = flash_attn_func(q, k, v, causal=False, pack_gqa=False)
+    out_default = out_default[0] if isinstance(out_default, tuple) else out_default
+
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_D256_QPKV6_QREGS", "128x64_t256")
+    out_forced = flash_attn_func(q, k, v, causal=False, pack_gqa=False)
+    out_forced = out_forced[0] if isinstance(out_forced, tuple) else out_forced
+
+    assert (out_default.float() - out_forced.float()).abs().max().item() == 0.0
+
+
 def test_sm120_bwd_qpkv4_s1024_causal_pack_split_policy(monkeypatch):
     from flash_attn.cute.interface import _sm120_bwd_pack_gqa_m_splits
 
