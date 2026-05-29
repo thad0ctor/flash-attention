@@ -609,6 +609,31 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and sm120_qpkv5_s16384_qregs_env not in {"0", "false", "off", "no"}
     )
+    sm120_d256_qregs128_env = os.environ.get("FLASH_ATTENTION_SM120_D256_QREGS128", "").lower()
+    sm120_d256_qregs128 = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and batch_size == 1
+        and not causal
+        and not local
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead in (8, 16)
+        and num_head_kv == 2
+        and sm120_seq_q == sm120_seq_k
+        and sm120_seq_q in (16384, 32768, 65536, 131072)
+        and pack_gqa
+        and score_mod is None
+        and mask_mod is None
+        and page_table is None
+        and qv is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and sm120_d256_qregs128_env not in {"0", "false", "off", "no"}
+    )
     if (
         arch // 10 == 12
         and causal
@@ -691,6 +716,12 @@ def _flash_attn_fwd(
                 # Gemma local attention only loads a narrow K window;
                 # smaller N tiles reduce wasted local-window work on SM120.
                 fwd_cfg = FwdConfig(64, 16, True, True)
+            elif sm120_d256_qregs128:
+                # Qwen-style D256 qpkv8/qpkv16 noncausal rows fit a wider N
+                # tile on SM120 only when Q is staged through registers.
+                fwd_cfg = FwdConfig(128, 64, True, True)
+                if sm120_d256_qregs128_env != "t128":
+                    num_threads = 256
             elif head_dim > 128:
                 # d=256: (128, 64) overflows the 99 KB SMEM cap; shrink to 64x64.
                 fwd_cfg = FwdConfig(64, 64, True, True)
@@ -780,15 +811,21 @@ def _flash_attn_fwd(
     # it cuts the non-TMA shared-memory footprint from Q+K+V to max(Q,V)+K.
     sm120_q_in_regs = (
         arch // 10 == 12
-        and causal
+        and (causal or sm120_d256_qregs128)
         and not local
-        and head_dim == 128
-        and head_dim_v == 128
-        and qhead_per_kvhead == 5
+        and (
+            (
+                head_dim == 128
+                and head_dim_v == 128
+                and qhead_per_kvhead == 5
+            )
+            or sm120_d256_qregs128
+        )
         and (
             sm120_seq_q == 8192
             or sm120_seq_q >= 32768
             or sm120_qpkv5_s16384_qregs
+            or sm120_d256_qregs128
         )
     )
 
