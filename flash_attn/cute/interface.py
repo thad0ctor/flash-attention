@@ -1050,14 +1050,14 @@ def _flash_attn_fwd(
     if sm120_qpkv6_d256_load_hooks:
         # Qwen qpkv6 D256 rows prefer shortening only the V live range on the
         # reproduced long-shape wins. K-only loses, S16384 causal flipped in
-        # validation, and S131072 noncausal was too small and mixed to ship.
+        # validation, and S131072 did not hold up in the broad FA2/FA4 sweep.
         if (
             sm120_seq_q == sm120_seq_k
             and sm120_seq_q in (16384, 32768, 65536)
             and not causal
         ) or (
             sm120_seq_q == sm120_seq_k
-            and sm120_seq_q >= 32768
+            and sm120_seq_q in (32768, 65536)
             and causal
         ):
             sm120_qpkv6_d256_hook_mode = "v"
