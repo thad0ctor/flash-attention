@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import math
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,8 @@ import torch
 
 
 def _ensure_worktree_cute_loaded():
-    worktree_cute = Path(__file__).resolve().parents[2] / "flash_attn" / "cute"
+    worktree_root = Path(__file__).resolve().parents[2]
+    worktree_cute = worktree_root / "flash_attn" / "cute"
     try:
         finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
         if finder.MAPPING.get("flash_attn.cute") != str(worktree_cute):
@@ -21,7 +23,13 @@ def _ensure_worktree_cute_loaded():
                 if name == "flash_attn" or name.startswith("flash_attn."):
                     del sys.modules[name]
     except ModuleNotFoundError:
-        pass
+        for name in list(sys.modules):
+            if name == "flash_attn" or name.startswith("flash_attn."):
+                del sys.modules[name]
+        pkg = types.ModuleType("flash_attn")
+        pkg.__path__ = [str(worktree_root / "flash_attn")]
+        pkg.__package__ = "flash_attn"
+        sys.modules["flash_attn"] = pkg
 
 
 _ensure_worktree_cute_loaded()
