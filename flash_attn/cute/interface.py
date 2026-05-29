@@ -1046,6 +1046,30 @@ def _flash_attn_fwd(
         and tile_n == 64
         and sm120_num_stages == 1
     )
+    sm120_qpkv6_d256_hook_mode = ""
+    if sm120_qpkv6_d256_load_hooks:
+        # Qwen qpkv6 D256 rows prefer shortening only the V live range on the
+        # reproduced long-shape wins. K-only loses, S16384 causal flipped in
+        # validation, and S131072 noncausal was too small and mixed to ship.
+        if (
+            sm120_seq_q == sm120_seq_k
+            and sm120_seq_q in (16384, 32768, 65536)
+            and not causal
+        ) or (
+            sm120_seq_q == sm120_seq_k
+            and sm120_seq_q >= 32768
+            and causal
+        ):
+            sm120_qpkv6_d256_hook_mode = "v"
+    sm120_qpkv6_d256_hook_override = (
+        os.environ.get("FLASH_ATTENTION_SM120_QPKV6_D256_HOOKS", "").lower()
+        if arch // 10 == 12
+        else ""
+    )
+    if sm120_qpkv6_d256_hook_override in {"off", "k", "v", "both"}:
+        sm120_qpkv6_d256_hook_mode = (
+            "" if sm120_qpkv6_d256_hook_override == "off" else sm120_qpkv6_d256_hook_override
+        )
     sm120_qpkv5_d128_hook_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -1087,10 +1111,10 @@ def _flash_attn_fwd(
         sm120_qpkv5_d128_hook_mode = (
             "" if sm120_qpkv5_d128_hook_override == "off" else sm120_qpkv5_d128_hook_override
         )
-    sm120_hook_load_k = sm120_qpkv6_d256_load_hooks or (
+    sm120_hook_load_k = sm120_qpkv6_d256_hook_mode in {"k", "both"} or (
         sm120_qpkv5_d128_hook_eligible and sm120_qpkv5_d128_hook_mode in {"k", "both"}
     )
-    sm120_hook_load_v = sm120_qpkv6_d256_load_hooks or (
+    sm120_hook_load_v = sm120_qpkv6_d256_hook_mode in {"v", "both"} or (
         sm120_qpkv5_d128_hook_eligible and sm120_qpkv5_d128_hook_mode in {"v", "both"}
     )
     # See get_broadcast_dims for why this is needed in compile key
