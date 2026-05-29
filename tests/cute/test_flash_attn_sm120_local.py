@@ -88,8 +88,8 @@ def test_sm120_hd256_local_forward_matches_reference(h_q, h_kv, window_left):
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("h_q,h_kv", [(4, 2), (8, 2), (8, 1)])
-def test_sm120_hd256_backward_matches_sdpa(causal, h_q, h_kv):
+@pytest.mark.parametrize("h_q,h_kv,pack_gqa", [(4, 2, False), (8, 2, False), (8, 1, False), (8, 1, None)])
+def test_sm120_hd256_backward_matches_sdpa(causal, h_q, h_kv, pack_gqa):
     _sm120_only()
     from flash_attn.cute import flash_attn_func
 
@@ -97,7 +97,7 @@ def test_sm120_hd256_backward_matches_sdpa(causal, h_q, h_kv):
     q = torch.randn(1, 128, h_q, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(1, 128, h_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn(1, 128, h_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    out = flash_attn_func(q, k, v, causal=causal, pack_gqa=False)
+    out = flash_attn_func(q, k, v, causal=causal, pack_gqa=pack_gqa)
     out = out[0] if isinstance(out, tuple) else out
     dout = torch.randn_like(out)
     out.backward(dout)

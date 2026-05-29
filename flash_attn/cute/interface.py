@@ -1795,14 +1795,29 @@ def _flash_attn_bwd(
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
     pack_gqa_requested = pack_gqa is True
+    pack_gqa_auto = pack_gqa is None
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    sm120_auto_pack_gqa_bwd = (
+        arch // 10 == 12
+        and pack_gqa_auto
+        and q.dtype == torch.bfloat16
+        and not causal
+        and not local
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead == 8
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+    )
     # Phase 17B-v2: pack_gqa is now supported in the SM120 backward kernel
-    # as an explicit opt-in.  Keep auto-selection disabled for SM120 backward
-    # until it is a measured win; the current packed Q/dO row-pointer path is
-    # slower than the non-pack GQA path on the Phase 13 matrix. Other archs
+    # as an explicit opt-in.  Keep auto-selection disabled for most SM120
+    # backward shapes; the packed Q/dO row-pointer path is only a measured
+    # win for fixed dense bf16 D256 qpkv8 noncausal. Other archs
     # (SM80/SM90/SM100) retain the original "not yet supported" override.
-    if arch // 10 == 12 and pack_gqa and not pack_gqa_requested:
+    if arch // 10 == 12 and pack_gqa and not (pack_gqa_requested or sm120_auto_pack_gqa_bwd):
         pack_gqa = False
     if (
         arch // 10 == 12
