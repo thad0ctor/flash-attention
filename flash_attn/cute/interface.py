@@ -590,10 +590,6 @@ def _flash_attn_fwd(
     sm120_qpkv5_s16384_qregs = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
-        and (
-            batch_size in (1, 2)
-            or sm120_qpkv5_s16384_qregs_env in {"1", "true", "on", "yes"}
-        )
         and causal
         and not local
         and head_dim == 128
@@ -682,7 +678,7 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 128, True, True)
                 sm120_num_stages = 1
             elif sm120_qpkv5_s16384_qregs:
-                # Exact qwen3-14B B<=2 S16384 causal row wins by staging Q in
+                # Exact qwen3-14B S16384 causal row wins by staging Q in
                 # registers, which requires the 256-thread 128x128 shape.
                 fwd_cfg = FwdConfig(128, 128, True, True)
                 sm120_num_stages = 1
