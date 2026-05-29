@@ -671,6 +671,40 @@ def _flash_attn_fwd(
         sm120_qpkv8_d256_causal_qregs_mode = "128x64_t256"
     else:
         sm120_qpkv8_d256_causal_qregs_mode = ""
+    sm120_qpkv6_d256_qregs_env = os.environ.get("FLASH_ATTENTION_SM120_D256_QPKV6_QREGS", "").lower()
+    sm120_qpkv6_d256_qregs_eligible = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and batch_size == 1
+        and not local
+        and head_dim == 256
+        and head_dim_v == 256
+        and num_head == 24
+        and num_head_kv == 4
+        and qhead_per_kvhead == 6
+        and sm120_seq_q == sm120_seq_k
+        and not pack_gqa
+        and score_mod is None
+        and mask_mod is None
+        and page_table is None
+        and qv is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+    )
+    if (
+        sm120_qpkv6_d256_qregs_eligible
+        and sm120_qpkv6_d256_qregs_env in {"64x64", "128x64_t256"}
+    ):
+        sm120_qpkv6_d256_qregs_mode = sm120_qpkv6_d256_qregs_env
+    elif sm120_qpkv6_d256_qregs_env in {"0", "false", "off", "no"}:
+        sm120_qpkv6_d256_qregs_mode = ""
+    elif sm120_qpkv6_d256_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
+        sm120_qpkv6_d256_qregs_mode = "128x64_t256"
+    else:
+        sm120_qpkv6_d256_qregs_mode = ""
     if (
         arch // 10 == 12
         and causal
@@ -764,6 +798,15 @@ def _flash_attn_fwd(
                 # staging Q in registers; env modes keep alternate schedules
                 # available for validation and profiling.
                 if sm120_qpkv8_d256_causal_qregs_mode == "128x64_t256":
+                    fwd_cfg = FwdConfig(128, 64, True, True)
+                    num_threads = 256
+                else:
+                    fwd_cfg = FwdConfig(64, 64, True, True)
+            elif sm120_qpkv6_d256_qregs_mode:
+                # Exact Qwen qpkv6 D256 long rows benefit from staging Q in
+                # registers; env modes keep alternate schedules available for
+                # validation and profiling.
+                if sm120_qpkv6_d256_qregs_mode == "128x64_t256":
                     fwd_cfg = FwdConfig(128, 64, True, True)
                     num_threads = 256
                 else:
@@ -883,7 +926,7 @@ def _flash_attn_fwd(
     # it cuts the non-TMA shared-memory footprint from Q+K+V to max(Q,V)+K.
     sm120_q_in_regs = (
         arch // 10 == 12
-        and (causal or sm120_d256_qregs128)
+        and (causal or sm120_d256_qregs128 or sm120_qpkv6_d256_qregs_mode)
         and not local
         and (
             (
@@ -893,6 +936,7 @@ def _flash_attn_fwd(
             )
             or sm120_d256_qregs128
             or sm120_qpkv8_d256_causal_qregs_mode
+            or sm120_qpkv6_d256_qregs_mode
         )
         and (
             sm120_seq_q == 8192
@@ -900,6 +944,7 @@ def _flash_attn_fwd(
             or sm120_qpkv5_s16384_qregs
             or sm120_d256_qregs128
             or sm120_qpkv8_d256_causal_qregs_mode
+            or sm120_qpkv6_d256_qregs_mode
         )
     )
 
