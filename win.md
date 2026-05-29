@@ -85,6 +85,8 @@ or reverted paths.
 | qwen3-14B qpkv5 S16384 noncausal `128x32` lookup | Rejected. `/tmp/sm120_qpkv5_s16384_nc_tile_exact_20260529` showed `128x32` slower than current auto for both B=1 and B=2: B=1 auto 30.39 ms vs `128x32` 31.88 ms; B=2 auto 60.98 ms vs `128x32` 63.62 ms. Current auto/`128x64` is already the safe tile family for this row. |
 | qwen3-14B qpkv5 S16384 noncausal non-TMA fallback | Rejected. A dirty exact B=1 gate had only a small/non-repeatable edge over TMA: `/tmp/sm120_qpkv5_s16384_nc_notma_paired_20260529` non-TMA +0.69% vs forced TMA, repeat `/tmp/sm120_qpkv5_s16384_nc_notma_paired_r2_20260529` +0.20%. That is below the bar for switching kernel architecture on this row. |
 | qwen3-14B qpkv5 S32768 noncausal tile alternatives | Rejected/no patch. `/tmp/sm120_qpkv5_s32768_nc_tile_probe_20260529` did not reproduce the broad-sweep miss: current auto was 1.0045x vs FA2, `128x32` regressed badly, `64x128` regressed, and explicit `128x64` was only a tiny same-family/noise improvement over auto. |
+| qwen3-14B qpkv5 S4096 noncausal tile alternatives | Rejected/no patch. `/tmp/sm120_qpkv5_s4096_nc_tile_ab_20260529` did not reproduce the post-qpkv8 broad miss: current auto was already 1.007x by mean-geomean and 1.016x by median-geomean vs FA2 across three rounds. `64x96` was the closest alternate but still slower than auto by mean; `64x128`, `128x32`, `128x48`, and `64x64` regressed. |
+| qwen3-30B qpkv8 S4096 noncausal `128x32` lookup | Rejected/no patch. A first exact probe `/tmp/sm120_qpkv8_s4096_nc_tile_ab_20260529` favored `128x32`, but stricter validation after a temporary lookup change rejected it: `/tmp/sm120_qpkv8_s4096_nc_patch_validate_r2_20260529` had current auto/`128x32` at 1.021x mean-geomean vs FA2, while old `64x64` was slightly better at 1.024x and won 5/8 mean rounds versus auto. Keep the existing `64x64` lookup. |
 | qwen3-30B qpkv8 S131072 causal long tile alternatives | Rejected/no patch. `/tmp/sm120_qpkv8_s131072_probe_20260529` showed auto already above FA2 at 1.0093x; best explicit `128x64_t256` was only 1.0132x vs FA2, about +0.4% over auto. Keep the current S131072 lookup until a larger repeatable gap appears. |
 | qwen3.6 D256 qpkv8 long causal pack/tile alternatives | Rejected/no patch. `/tmp/sm120_d256_qpkv8_long_causal_pack_tile_probe_20260529` did not reproduce the long-sweep causal misses: focused auto beat FA2 at both S32768 and S65536. Pack-off, `64x48`, and `64x32` all regressed versus auto. |
 | qwen3.5/qwen3.6 D256 qpkv6 S16384 noncausal tile alternatives | Rejected/no patch. `/tmp/sm120_qpkv6_s16384_nc_tile_probe_20260529` did not reproduce the long-sweep miss: focused auto was 1.042x vs FA2. `64x48`, `64x32`, `64x16`, `128x32`, and `128x16` all regressed versus auto/current `64x64`. |
@@ -161,9 +163,11 @@ should not lose track of them.
   S16384/S32768/S65536 causal and avoid broad old-commit restores.
 - D128/qpkv5 small and mid noncausal rows: repeat before patching; several
   apparent misses have flipped with run order and FA2 variance. The current
-  post-qpkv8-long 5-repeat broad sweep makes qwen3-14B S4096 noncausal the
-  only stable short/mid qpkv5 miss so far: 0.967620x, 0/5 wins, repeat range
-  0.931524-0.986940. Treat that exact row as the next forward probe target.
+  post-qpkv8-long 5-repeat broad sweep made qwen3-14B S4096 noncausal look
+  stable, but the exact tile probe under
+  `/tmp/sm120_qpkv5_s4096_nc_tile_ab_20260529` flipped it back into a current
+  auto win. Do not add a qpkv5 S4096 noncausal dispatch rule without a new
+  paired artifact that reproduces the miss.
 - Gemma local qpkv4/qpkv8: keep `64x16`, but rerun broader repeats before
   extending to qpkv2 or dense Gemma shapes.
 - D64 MHA after the current lookup patch: S8192 noncausal and S16384
