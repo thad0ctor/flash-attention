@@ -66,6 +66,7 @@ class FlashAttentionForwardBase:
         skip_dense_seqlen_mask: bool = False,
         hook_load_k: bool = False,
         hook_load_v: bool = False,
+        static_causal_blocks: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -112,6 +113,7 @@ class FlashAttentionForwardBase:
         self.skip_dense_seqlen_mask = skip_dense_seqlen_mask
         self.hook_load_k = hook_load_k
         self.hook_load_v = hook_load_v
+        self.static_causal_blocks = static_causal_blocks
         self.qk_acc_dtype = Float32
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -872,7 +874,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        if const_expr(self.static_causal_blocks):
+            n_block_min, n_block_max = Int32(0), m_block + 1
+        else:
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
         # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
         # negative block index for K/V loads; the load/store predicates already
@@ -1269,9 +1274,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # Next couple of iterations with causal masking
             unmasked_n_block_start = n_block
             if const_expr(self.is_causal or self.is_local):
-                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                    seqlen, m_block, n_block_min
-                )
+                if const_expr(self.static_causal_blocks):
+                    n_block_min_causal_local_mask = m_block
+                else:
+                    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                        seqlen, m_block, n_block_min
+                    )
                 unmasked_n_block_start = n_block_min_causal_local_mask
                 for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 2 - n_tile

@@ -1070,6 +1070,23 @@ def _flash_attn_fwd(
         sm120_qpkv6_d256_hook_mode = (
             "" if sm120_qpkv6_d256_hook_override == "off" else sm120_qpkv6_d256_hook_override
         )
+    sm120_qpkv6_d256_static_causal_env = os.environ.get(
+        "FLASH_ATTENTION_SM120_QPKV6_D256_STATIC_CAUSAL_BLOCKS", ""
+    ).lower()
+    sm120_qpkv6_d256_static_causal_default = (
+        sm120_qpkv6_d256_load_hooks
+        and causal
+        and sm120_seq_q == sm120_seq_k
+        and sm120_seq_q in (32768, 65536)
+    )
+    if sm120_qpkv6_d256_static_causal_env in {"1", "true", "on", "yes"}:
+        sm120_qpkv6_d256_static_causal_blocks = (
+            sm120_qpkv6_d256_load_hooks and causal and sm120_seq_q == sm120_seq_k
+        )
+    elif sm120_qpkv6_d256_static_causal_env in {"0", "false", "off", "no"}:
+        sm120_qpkv6_d256_static_causal_blocks = False
+    else:
+        sm120_qpkv6_d256_static_causal_blocks = sm120_qpkv6_d256_static_causal_default
     sm120_qpkv5_d128_hook_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -1229,6 +1246,7 @@ def _flash_attn_fwd(
         sm120_q_in_regs if arch // 10 == 12 else None,
         sm120_hook_load_k if arch // 10 == 12 else None,
         sm120_hook_load_v if arch // 10 == 12 else None,
+        sm120_qpkv6_d256_static_causal_blocks if arch // 10 == 12 else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1506,6 +1524,7 @@ def _flash_attn_fwd(
                     skip_dense_seqlen_mask=sm120_skip_dense_seqlen_mask,
                     hook_load_k=sm120_hook_load_k,
                     hook_load_v=sm120_hook_load_v,
+                    static_causal_blocks=sm120_qpkv6_d256_static_causal_blocks,
                 )
         else:
             raise ValueError(

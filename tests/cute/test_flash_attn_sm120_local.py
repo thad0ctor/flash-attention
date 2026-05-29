@@ -132,6 +132,28 @@ def test_sm120_qpkv6_d256_hook_forward_matches_sdpa(monkeypatch, hook_mode):
     assert (out.float() - ref).abs().max().item() < 0.05
 
 
+@pytest.mark.timeout(90)
+def test_sm120_qpkv6_d256_static_causal_blocks_matches_sdpa(monkeypatch):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_QPKV6_D256_STATIC_CAUSAL_BLOCKS", "on")
+    torch.manual_seed(0)
+    q = torch.randn(1, 256, 24, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, 4, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 256, 4, 256, device="cuda", dtype=torch.bfloat16)
+
+    out = flash_attn_func(q, k, v, causal=True)
+    out = out[0] if isinstance(out, tuple) else out
+
+    q_ref = q.float().transpose(1, 2)
+    k_ref = k.float().repeat_interleave(6, dim=2).transpose(1, 2)
+    v_ref = v.float().repeat_interleave(6, dim=2).transpose(1, 2)
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, is_causal=True).transpose(1, 2)
+    assert (out.float() - ref).abs().max().item() < 0.05
+
+
 def test_sm120_bwd_qpkv4_s1024_causal_pack_split_policy(monkeypatch):
     from flash_attn.cute.interface import _sm120_bwd_pack_gqa_m_splits
 
