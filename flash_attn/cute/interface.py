@@ -1681,7 +1681,8 @@ def _sm120_use_fused_dkv_postprocess(
     if override in ("1", "true", "on", "yes"):
         return eligible
     sm120_qpkv8_s1024_causal = (
-        qhead_per_kvhead == 8
+        dtype == cutlass.BFloat16
+        and qhead_per_kvhead == 8
         and causal
         and not local
         and seqlen_q == seqlen_k

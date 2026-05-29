@@ -155,6 +155,9 @@ def test_sm120_bwd_qpkv8_s1024_causal_fused_dkv_policy(monkeypatch):
     )
     assert interface._sm120_use_fused_dkv_postprocess(seqlen_q=1024, **common)
     assert not interface._sm120_use_fused_dkv_postprocess(seqlen_q=2048, **{**common, "seqlen_k": 2048})
+    assert not interface._sm120_use_fused_dkv_postprocess(
+        seqlen_q=1024, **{**common, "dtype": interface.cutlass.Float16}
+    )
 
 
 @pytest.mark.timeout(60)
