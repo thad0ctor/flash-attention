@@ -139,10 +139,16 @@ def _sm120_bwd_pack_gqa_m_splits(
     )
     if sm120_qpkv4_s1024_causal:
         # The nominal causal cap avoids empty split CTAs. For this exact short
-        # qpkv4 D256 shape, launching eight split CTAs raises occupancy toward
-        # FA2's CTA count and wins even with the empty-tail overhead.
-        max_safe_splits = max(max_safe_splits, 8)
-        auto_splits = 8
+        # qpkv4 D256 Hq8/Hkv2 shape, launching extra split CTAs raises occupancy
+        # toward FA2's CTA count and wins even with the empty-tail overhead.
+        # Wider qpkv4 rows showed mean/outlier regressions with split16, so they
+        # stay on the previous split8 policy.
+        if num_head == 8 and num_head_kv == 2:
+            max_safe_splits = max(max_safe_splits, 16)
+            auto_splits = 16
+        else:
+            max_safe_splits = max(max_safe_splits, 8)
+            auto_splits = 8
     else:
         auto_splits = min(qhead_per_kvhead, max_safe_splits, packed_m_blocks)
     env_splits = os.environ.get("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS")
