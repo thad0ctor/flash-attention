@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 from pathlib import Path
 from typing import Tuple
 
@@ -66,13 +67,25 @@ def _route_flash_attn_cute_to_this_worktree():
     except ModuleNotFoundError:
         if str(worktree_root) not in sys.path:
             sys.path.insert(0, str(worktree_root))
+        pkg = types.ModuleType("flash_attn")
+        pkg.__path__ = [str(worktree_root / "flash_attn")]
+        pkg.__package__ = "flash_attn"
+        sys.modules["flash_attn"] = pkg
         return
     if finder.MAPPING.get("flash_attn.cute") == str(cute_dir):
+        pkg = types.ModuleType("flash_attn")
+        pkg.__path__ = [str(worktree_root / "flash_attn")]
+        pkg.__package__ = "flash_attn"
+        sys.modules["flash_attn"] = pkg
         return
     finder.MAPPING["flash_attn.cute"] = str(cute_dir)
     for name in list(sys.modules):
         if name == "flash_attn" or name.startswith("flash_attn."):
             del sys.modules[name]
+    pkg = types.ModuleType("flash_attn")
+    pkg.__path__ = [str(worktree_root / "flash_attn")]
+    pkg.__package__ = "flash_attn"
+    sys.modules["flash_attn"] = pkg
 
 
 _route_flash_attn_cute_to_this_worktree()

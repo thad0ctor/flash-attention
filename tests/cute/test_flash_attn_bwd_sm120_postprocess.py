@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 # Repoint `flash_attn.cute` to this worktree if there's an editable FA4 install
 # whose MAPPING hardcodes another checkout (e.g. the integration repo).
 def _ensure_worktree_cute_loaded():
+    worktree_root = Path(__file__).resolve().parents[2]
     worktree_cute = Path(__file__).resolve().parents[2] / "flash_attn" / "cute"
     try:
         finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
@@ -42,6 +44,10 @@ def _ensure_worktree_cute_loaded():
                     del sys.modules[name]
     except ModuleNotFoundError:
         pass
+    pkg = types.ModuleType("flash_attn")
+    pkg.__path__ = [str(worktree_root / "flash_attn")]
+    pkg.__package__ = "flash_attn"
+    sys.modules["flash_attn"] = pkg
 
 
 _ensure_worktree_cute_loaded()
@@ -144,11 +150,14 @@ def test_sm120_postprocess_uses_universal_copy_for_dq_store(D):
     This is the actual bug source — even if the numerical impact on a given
     config is small, the wrong store atom is wrong.
     """
-    import inspect
     import re
-    from flash_attn.cute import flash_bwd_postprocess
 
-    src = inspect.getsource(flash_bwd_postprocess.FlashAttentionBackwardPostprocess)
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "flash_attn"
+        / "cute"
+        / "flash_bwd_postprocess.py"
+    ).read_text()
     # The fix introduces a `store_atom_arch` variable that picks 80 for
     # arch in [8, 12] before calling get_smem_store_atom. Concretely, the
     # bare `self.arch` must not be the first positional argument anymore.
