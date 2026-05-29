@@ -2034,9 +2034,12 @@ def _flash_attn_bwd(
     )
     if sm120_nonpack_m_split_eligible:
         # Short causal qpkv6/qpkv8 D256 underfills the main kernel with the safe
-        # N64 path. Splitting the nonpacked M loop doubles useful CTAs without
-        # the rejected N32/PackGQA changes.
-        pack_gqa_m_splits = 2
+        # N64 path. Splitting the nonpacked M loop adds useful CTAs without the
+        # rejected N32/PackGQA changes. The small-H qpkv8 Gemma row benefits
+        # from one extra split; wider qpkv6/qpkv8 rows keep the stabler split2.
+        pack_gqa_m_splits = (
+            3 if qhead_per_kvhead == 8 and num_head == 8 and num_head_kv == 1 else 2
+        )
         if sm120_nonpack_m_split_override:
             pack_gqa_m_splits = max(1, int(sm120_nonpack_m_split_override))
     pack_gqa_all_rows_valid = (
