@@ -594,7 +594,7 @@ def _flash_attn_fwd(
                 (128, 4, 2048, 0): (64, 64, 1), (128, 4, 2048, 1): (64, 96, 1),
                 (128, 4, 4096, 0): (64, 64, 1), (128, 4, 4096, 1): (64, 96, 1),
                 (128, 4, 8192, 0): (128, 32, 1),(128, 4, 8192, 1): (128, 64, 1),
-                (128, 4, 16384, 0): (128, 64, 1),(128, 4, 16384, 1): (64, 64, 1),
+                (128, 4, 16384, 0): (128, 32, 1),(128, 4, 16384, 1): (128, 64, 1),
                 (128, 5, 1024, 1): (64, 128, 1),
                 (128, 5, 4096, 1): (64, 128, 1),
                 (128, 5, 8192, 1): (128, 128, 1),
@@ -638,6 +638,38 @@ def _flash_attn_fwd(
             elif head_dim > 128:
                 # d=256: (128, 64) overflows the 99 KB SMEM cap; shrink to 64x64.
                 fwd_cfg = FwdConfig(64, 64, True, True)
+            elif (
+                batch_size == 1
+                and causal
+                and not local
+                and head_dim == 128
+                and head_dim_v == 128
+                and qhead_per_kvhead == 4
+                and sl == 8192
+                and cu_seqlens_q is None
+                and cu_seqlens_k is None
+                and seqused_q is None
+                and seqused_k is None
+            ):
+                # B=1 qpkv4 S8192 causal favors a smaller M tile on RTX 5090,
+                # while the B=2 Qwen/Gemma sweep keeps the lookup path above.
+                fwd_cfg = FwdConfig(64, 64, True, True)
+            elif (
+                batch_size > 1
+                and causal
+                and not local
+                and head_dim == 128
+                and head_dim_v == 128
+                and qhead_per_kvhead == 4
+                and sl == 16384
+                and cu_seqlens_q is None
+                and cu_seqlens_k is None
+                and seqused_q is None
+                and seqused_k is None
+            ):
+                # B>1 qpkv4 S16384 causal validates better with 128x48; B=1
+                # keeps the 128x64 lookup entry.
+                fwd_cfg = FwdConfig(128, 48, True, True)
             elif lookup_key in _SM120_TILE_LOOKUP:
                 tm, tn, ns = _SM120_TILE_LOOKUP[lookup_key]
                 fwd_cfg = FwdConfig(tm, tn, True, True)
