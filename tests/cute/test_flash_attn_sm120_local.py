@@ -177,6 +177,28 @@ def test_sm120_qpkv8_d256_causal_qregs_matches_sdpa(monkeypatch):
 
 
 @pytest.mark.timeout(90)
+def test_sm120_qpkv16_d256_causal_qregs_matches_sdpa(monkeypatch):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_D256_QPKV16_CAUSAL_QREGS", "128x64_t256")
+    torch.manual_seed(0)
+    q = torch.randn(1, 256, 32, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, 2, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 256, 2, 256, device="cuda", dtype=torch.bfloat16)
+
+    out = flash_attn_func(q, k, v, causal=True, pack_gqa=True)
+    out = out[0] if isinstance(out, tuple) else out
+
+    q_ref = q.float().transpose(1, 2)
+    k_ref = k.float().repeat_interleave(16, dim=2).transpose(1, 2)
+    v_ref = v.float().repeat_interleave(16, dim=2).transpose(1, 2)
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, is_causal=True).transpose(1, 2)
+    assert (out.float() - ref).abs().max().item() < 0.05
+
+
+@pytest.mark.timeout(90)
 @pytest.mark.parametrize("causal", [False, True])
 def test_sm120_qpkv6_d256_qregs_matches_sdpa(monkeypatch, causal):
     _sm120_only()
