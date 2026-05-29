@@ -54,6 +54,7 @@ or reverted paths.
 | qwen3-14B D128 qpkv5 causal S>=32768 | `48c7d4d`, `128x128`, 256 threads, `Q_in_regs=True` | PR repeat: S32768 1.0223, S65536 1.0048, S131072 1.0306; qpkv5 causal geomean 1.0173. Current `532331f` keeps this path and improves S=16384. | keeper |
 | qwen3-14B D128 qpkv5 causal S=8192 | `6b77ace`, `128x128`, 256 threads, `Q_in_regs=True` | Env-gated A/B: baseline 0.953/0.986 vs candidate 1.053/1.050. Dispatcher validation 1.055. Full 78-cell run after patch geomean 1.0526, touched row 1.019. | keeper, but rerun if broad noise changes |
 | qwen3-14B D128 qpkv5 causal load-overlap hooks | current patch: exact SM120 bf16 fixed dense qpkv5 D128 causal hook policy, S8192 both hooks, B>1 S16384 V-only, S32768/S65536 both hooks, S>=131072 V-only | Paired auto-vs-forced-off timing on RTX 5090: `/tmp/sm120_qpkv5_hook_ab_20260529` showed forced hook wins up to +3.8% on B=2 rows; `/tmp/sm120_qpkv5_hook_policy_b1_long_20260529` and two-label repeat showed shipped auto/off geomean +1.0113 across B=1/B=2 S8192-S131072. Public long qpkv5 old/new run `/tmp/sm120_qwen_qpkv5_hooks_long_compare_20260529`: new FA4/FA2 geomean 1.0252 vs old 1.0113, 3/4 wins. Correctness: forced K/V/both hook test passes against SDPA. | keeper, narrow |
+| qwen3-14B D128 qpkv5 S4096 noncausal non-TMA | current patch: exact fixed dense bf16 B=2 S4096 noncausal qpkv5 routes to SM80-base non-TMA; `FLASH_ATTENTION_SM120_QPKV5_S4096_NC_TMA=stage2` forces old TMA for profiling | Dirty A/B `/tmp/sm120_qpkv5_s4096_nc_tma_ab_20260529`: non-TMA vs TMA +1.05% median and +3.02% mean, FA4/FA2 1.019x median. Repeat `/tmp/sm120_qpkv5_s4096_nc_tma_ab_r2_20260529`: +1.36% median and +4.82% mean, FA4/FA2 1.026x median. Default validation `/tmp/sm120_qpkv5_s4096_nc_default_notma_validate_20260529`: default non-TMA vs forced old TMA +2.62% median and +2.66% mean; public subprocess repeat `/tmp/sm120_qpkv5_s4096_nc_public_default_notma_20260529` is parity vs FA2, 0.9999x geomean. | keeper, exact row; fixes the broad 0.968x qpkv5 S4096 miss without changing qpkv5 tiles |
 | qwen3.5/qwen3.6 27B D256 qpkv6 dense | `6459f7d`, narrow SM120 load-overlap hooks, `64x64`, `num_stages=1`, nonlocal, no score/mask mod | Focused PR rows: S4096 c 1.0495, S4096 nc 1.0546, S8192 c 1.0241, S8192 nc 1.0165, S16384 c 1.0402, S16384 nc 1.0141. NCU S4096 causal removed 2,082,240 spill inst and beat FA2. | keeper |
 | Broad Qwen/Gemma short-mid forward | `d6bdf7e`, `/tmp/sm120_model_variants_qpkv4_10x_d6bdf7e_20260528` | 78 cells, 10 repeats, geomean 1.061977, median 1.027039, wins 67/78. D128 1.050017, D256 1.067336, qwen 1.047141, gemma 1.096131. Versus prior 5-repeat rerun: ratio geomean 0.991577 with the same 67/78 win count. | current broad keeper |
 | Gemma D256 local qpkv4/qpkv8 | `3dc3f22`, local `64x16` narrow-N path | Local-only Gemma sweep geomean 1.0654, median 1.0793, wins 5/6. e4b S4096 1.108, S8192 1.147; e2b S4096 1.083, S8192 1.076. | keeper for local rows; broad aggregate noisy |
@@ -166,8 +167,9 @@ should not lose track of them.
   post-qpkv8-long 5-repeat broad sweep made qwen3-14B S4096 noncausal look
   stable, but the exact tile probe under
   `/tmp/sm120_qpkv5_s4096_nc_tile_ab_20260529` flipped it back into a current
-  auto win. Do not add a qpkv5 S4096 noncausal dispatch rule without a new
-  paired artifact that reproduces the miss.
+  auto win. The exact non-TMA gate now addresses this row; do not add a
+  qpkv5 S4096 noncausal tile rule without a new paired artifact that
+  reproduces a tile-specific win.
 - Gemma local qpkv4/qpkv8: keep `64x16`, but rerun broader repeats before
   extending to qpkv2 or dense Gemma shapes.
 - D64 MHA after the current lookup patch: S8192 noncausal and S16384

@@ -893,6 +893,38 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and seqlen_k % tile_n == 0
     )
+    # Exact qpkv5 S4096 noncausal runs faster on the SM80-base path than on
+    # the SM120 TMA path; keep a narrow env override for validation/profiling.
+    sm120_qpkv5_s4096_nc_exact = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and batch_size == 2
+        and not causal
+        and not local
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 5
+        and sm120_seq_q == 4096
+        and sm120_seq_k == 4096
+        and not pack_gqa
+        and score_mod is None
+        and mask_mod is None
+        and page_table is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+    )
+    sm120_qpkv5_s4096_nc_tma_exp = (
+        os.environ.get("FLASH_ATTENTION_SM120_QPKV5_S4096_NC_TMA", "").lower()
+        if sm120_qpkv5_s4096_nc_exact else ""
+    )
+    sm120_tma_kv_stages = 1 if sm120_qpkv5_s4096_nc_tma_exp == "stage1" else 2
+    sm120_qpkv5_s4096_nc_notma = (
+        sm120_qpkv5_s4096_nc_exact
+        and sm120_qpkv5_s4096_nc_tma_exp not in {"stage1", "stage2", "tma"}
+    )
     # Keep this narrow: plain bf16 qpkv6 D256 dense kernels benefit from shorter K/V copy
     # live ranges, while qpkv4 and local-window variants regressed in validation.
     sm120_qpkv6_d256_load_hooks = (
@@ -1068,6 +1100,9 @@ def _flash_attn_fwd(
         # first-compiled kernel.
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
+        (
+            sm120_qpkv5_s4096_nc_tma_exp or ("notma" if sm120_qpkv5_s4096_nc_notma else "")
+        ) if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
         sm120_hook_load_k if arch // 10 == 12 else None,
         sm120_hook_load_v if arch // 10 == 12 else None,
@@ -1287,10 +1322,11 @@ def _flash_attn_fwd(
                 and not use_block_sparsity
                 and not pack_gqa
                 and learnable_sink is None
+                and not sm120_qpkv5_s4096_nc_notma
             )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n,
-                num_mma_warps=4, kv_stages=2, is_causal=causal,
+                num_mma_warps=4, kv_stages=sm120_tma_kv_stages, is_causal=causal,
             ):
                 fa_fwd = FlashAttentionForwardSm120Tma(
                     dtype,
@@ -1303,7 +1339,7 @@ def _flash_attn_fwd(
                     tile_m=tile_m,
                     tile_n=tile_n,
                     num_mma_warps=4,
-                    kv_stages=2,
+                    kv_stages=sm120_tma_kv_stages,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
