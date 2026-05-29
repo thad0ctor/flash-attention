@@ -109,6 +109,30 @@ def test_sm120_qpkv5_d128_hook_forward_matches_sdpa(monkeypatch, hook_mode):
     assert (out.float() - ref).abs().max().item() < 0.05
 
 
+def test_sm120_bwd_qpkv4_s1024_causal_pack_split_policy(monkeypatch):
+    from flash_attn.cute.interface import _sm120_bwd_pack_gqa_m_splits
+
+    monkeypatch.delenv("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS", raising=False)
+    common = dict(
+        arch=120,
+        pack_gqa=True,
+        qhead_per_kvhead=4,
+        num_head=8,
+        num_head_kv=2,
+        causal=True,
+        local=False,
+        seqlen_k=1024,
+        head_dim=256,
+        head_dim_v=256,
+        m_block_size=64,
+        n_block_size=64,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+    )
+    assert _sm120_bwd_pack_gqa_m_splits(seqlen_q=1024, **common) == 8
+    assert _sm120_bwd_pack_gqa_m_splits(seqlen_q=2048, **{**common, "seqlen_k": 2048}) == 4
+
+
 @pytest.mark.timeout(60)
 def test_sm120_d128_fused_dkv_backward_matches_sdpa(monkeypatch):
     _sm120_only()

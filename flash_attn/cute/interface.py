@@ -92,9 +92,14 @@ def _sm120_bwd_pack_gqa_m_splits(
     arch: int,
     pack_gqa: bool,
     qhead_per_kvhead: int,
+    num_head: int,
+    num_head_kv: int,
     causal: bool,
+    local: bool,
     seqlen_q: int,
     seqlen_k: int,
+    head_dim: int,
+    head_dim_v: int,
     m_block_size: int,
     n_block_size: int,
     cu_seqlens_q: Optional[torch.Tensor],
@@ -122,7 +127,24 @@ def _sm120_bwd_pack_gqa_m_splits(
     else:
         max_safe_splits = packed_m_blocks
 
-    auto_splits = min(qhead_per_kvhead, max_safe_splits, packed_m_blocks)
+    sm120_qpkv4_s1024_causal = (
+        causal
+        and not local
+        and qhead_per_kvhead == 4
+        and num_head % num_head_kv == 0
+        and seqlen_q == seqlen_k
+        and seqlen_q == 1024
+        and head_dim == 256
+        and head_dim_v == 256
+    )
+    if sm120_qpkv4_s1024_causal:
+        # The nominal causal cap avoids empty split CTAs. For this exact short
+        # qpkv4 D256 shape, launching eight split CTAs raises occupancy toward
+        # FA2's CTA count and wins even with the empty-tail overhead.
+        max_safe_splits = max(max_safe_splits, 8)
+        auto_splits = 8
+    else:
+        auto_splits = min(qhead_per_kvhead, max_safe_splits, packed_m_blocks)
     env_splits = os.environ.get("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS")
     if env_splits is not None:
         requested_splits = int(env_splits)
@@ -1882,37 +1904,49 @@ def _flash_attn_bwd(
         arch // 10 == 12
         and pack_gqa_auto
         and q.dtype == torch.bfloat16
-        and not causal
         and not local
         and head_dim == 256
         and head_dim_v == 256
         and (
-            qhead_per_kvhead == 8
+            (
+                not causal
+                and qhead_per_kvhead == 8
+            )
             or (
-                qhead_per_kvhead == 4
+                not causal
+                and qhead_per_kvhead == 4
                 and seqlen_q == seqlen_k
                 and seqlen_q == 8192
             )
             or (
-                qhead_per_kvhead == 2
+                not causal
+                and qhead_per_kvhead == 2
                 and num_head == 32
                 and num_head_kv == 16
                 and seqlen_q == seqlen_k
                 and seqlen_q in (4096, 8192, 16384)
             )
             or (
-                qhead_per_kvhead == 6
+                not causal
+                and qhead_per_kvhead == 6
                 and num_head == 24
                 and num_head_kv == 4
                 and seqlen_q == seqlen_k
                 and seqlen_q == 4096
             )
             or (
-                qhead_per_kvhead == 16
+                not causal
+                and qhead_per_kvhead == 16
                 and num_head == 32
                 and num_head_kv == 2
                 and seqlen_q == seqlen_k
                 and seqlen_q in (4096, 8192)
+            )
+            or (
+                causal
+                and qhead_per_kvhead == 4
+                and seqlen_q == seqlen_k
+                and seqlen_q == 1024
             )
         )
         and cu_seqlens_q is None
@@ -1923,8 +1957,8 @@ def _flash_attn_bwd(
     # Phase 17B-v2: pack_gqa is now supported in the SM120 backward kernel
     # as an explicit opt-in.  Keep auto-selection disabled for most SM120
     # backward shapes; the packed Q/dO row-pointer path is only a measured
-    # win for narrow fixed dense bf16 D256 noncausal rows. Other archs
-    # (SM80/SM90/SM100) retain the original "not yet supported" override.
+    # win for narrow fixed dense bf16 D256 rows. Other archs (SM80/SM90/SM100)
+    # retain the original "not yet supported" override.
     if arch // 10 == 12 and pack_gqa and not (pack_gqa_requested or sm120_auto_pack_gqa_bwd):
         pack_gqa = False
     if (
@@ -1946,9 +1980,14 @@ def _flash_attn_bwd(
         arch=arch,
         pack_gqa=pack_gqa,
         qhead_per_kvhead=qhead_per_kvhead,
+        num_head=num_head,
+        num_head_kv=num_head_kv,
         causal=causal,
+        local=local,
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
         cu_seqlens_q=cu_seqlens_q,
