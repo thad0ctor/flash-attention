@@ -82,7 +82,7 @@ or reverted paths.
 | qwen3.5-9B S4096 noncausal D256 qpkv4 and gemma4-e2b S8192 noncausal D256 qpkv8 broad-repeat misses | No dispatch patch. A later public-API 10-repeat check flipped both apparent 5-repeat misses into wins: qwen3.5-9B S4096 noncausal mean 1.015043 / median 1.024537, wins 6/10; gemma4-e2b S8192 noncausal mean 1.020579 / median 1.029481, wins 8/10. The matching interleaved A/B run mostly favored the existing `64x64` path; qwen S4096 `64x48` was only a tiny distinct hint and would disable dense mask-skip divisibility. Artifacts: `/tmp/sm120_broad_miss_qpkv4_qpkv8_condition_ab_20260528`, `/tmp/sm120_broad_miss_public_repeat_20260528`. |
 | Gemma31 D256 qpkv2 local extension | No dispatch patch after `/tmp/sm120_gemma_qpkv2_local_ab_20260528`. Interleaved A/B had S4096 local auto already 1.066x vs FA2 and best explicit tile only +0.9%; S8192 local auto 1.004x and explicit `64x64` +3.3% but same logical tile as fallback, so the public miss did not reproduce cleanly. |
 | D128 qpkv7 old 60-cell rows | No dispatch patch after `/tmp/sm120_d128_old60_condition_ab_20260528`. The best qwen2.5 qpkv7 S8192/S16384 causal/noncausal candidates matched the current lookup or were too small/noisy to justify a change. |
-| SM120 D256 backward N=32 path | Rejected for now. NCU showed FA2 uses a D256 N=32 main kernel and launches twice the CTA grid, so this is the right future target. A quick FA4 N=32 probe required different dK/dV epilogue layout; after scalarizing the GQA dK/dV epilogue it compiled but produced wrong dK. Do not restore without a dedicated epilogue/layout rewrite. Artifacts: `/tmp/sm120_bwd_d256_ncu_20260528`. |
+| SM120 D256 backward N=32 path | Rejected for now. NCU showed FA2 uses a D256 N=32 main kernel and launches twice the CTA grid, so this is the right future target. The later N32/AtomLayoutNdKV=1 and N32/AtomLayoutNdKV=2 probes both passed local correctness, but timing rejected them as defaults. N32/Atom1 single-smoke geomean was 1.008885 with only 2/8 wins; interleaved rerun of its winning rows regressed qwen3.5-9B qpkv4 (default/n32 1.058x) and Gemma31 qpkv2 (default/n32 1.097x). N32/Atom2 was broadly negative. Do not restore without a dedicated epilogue/layout rewrite or a row-specific paired artifact. Artifacts: `/tmp/sm120_bwd_d256_ncu_20260528`, `/tmp/sm120_bwd_d256_n32_atom1_smoke_20260528`, `/tmp/sm120_bwd_d256_n32_atom2_smoke_20260528`. |
 | SM120 D256 backward qpkv2 no-overlap reload | Rejected. Disabling K-reload overlap for qpkv2 improved one noisy Gemma timing, but correctness failed for qpkv2 noncausal dK with max error around 2.3. Keep K-reload overlap enabled for all D256 GQA groups until a correct qpkv2-specific path exists. |
 
 ## Review Risks To Keep Separate From Perf Winners
@@ -127,9 +127,10 @@ should not lose track of them.
 - D256 backward performance: the current Q/dO + K/V alias path fits SM120 and
   is correct, but it is not yet faster than FA2. The main gap is structural:
   FA2's D256 backward mainloop uses N=32 and twice the CTA grid, while FA4's
-  current safe path uses N=64. A future dedicated D256 variant should solve the
-  N=32 dK/dV epilogue/layout problem instead of adding another dispatcher-only
-  condition.
+  current safe path uses N=64. Plain N32 AtomLayoutNdKV=1/2 dispatch probes
+  are not enough; a future dedicated D256 variant should solve the dK/dV
+  epilogue/layout and row-mapping problem instead of adding another
+  dispatcher-only condition.
 - Current 10-repeat short-mid sweep's three mean-ratio rows below 0.98 were
   rechecked and are not actionable. qwen3.5/qwen3.6-27B S1024 causal D256
   qpkv6 is tiny/noisy; gemma4-31B S4096 local D256 qpkv2 and qwen3.5-122B
