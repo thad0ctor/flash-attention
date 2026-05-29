@@ -1625,6 +1625,37 @@ def _bwd_postprocess_dkv_sm120(
 _bwd_postprocess_dkv_sm120.compile_cache = get_jit_cache("bwd_post_dkv_sm120")
 
 
+def _sm120_use_fused_dkv_postprocess(
+    *,
+    arch: int,
+    dtype,
+    dkv_postprocess: bool,
+    pack_gqa: bool,
+    pack_gqa_m_splits: int,
+    cu_seqlens_k,
+    seqused_k,
+    head_dim: int,
+    head_dim_v: int,
+    dKV_swapAB: bool,
+) -> bool:
+    """Select the fused fixed-length SM120 dK+dV postprocess kernel."""
+    eligible = (
+        arch // 10 == 12
+        and dtype in (cutlass.BFloat16, cutlass.Float16)
+        and dkv_postprocess
+        and cu_seqlens_k is None
+        and seqused_k is None
+        and head_dim == head_dim_v
+        and not dKV_swapAB
+    )
+    override = os.environ.get("FLASH_ATTENTION_SM120_FUSED_DKV", "").lower()
+    if override in ("0", "false", "off", "no"):
+        return False
+    if override in ("1", "true", "on", "yes"):
+        return eligible
+    return eligible and pack_gqa and pack_gqa_m_splits > 1
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2453,14 +2484,17 @@ def _flash_attn_bwd(
         )
 
         if dKV_postprocess:
-            if (
-                arch // 10 == 12
-                and pack_gqa
-                and pack_gqa_m_splits > 1
-                and cu_seqlens_k is None
-                and seqused_k is None
-                and head_dim == head_dim_v
-                and not dKV_swapAB
+            if _sm120_use_fused_dkv_postprocess(
+                arch=arch,
+                dtype=dtype,
+                dkv_postprocess=dKV_postprocess,
+                pack_gqa=pack_gqa,
+                pack_gqa_m_splits=pack_gqa_m_splits,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_k=seqused_k,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                dKV_swapAB=dKV_swapAB,
             ):
                 _bwd_postprocess_dkv_sm120(
                     dk_accum, dv_accum, dk, dv, softmax_scale,
