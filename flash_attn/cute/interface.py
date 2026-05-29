@@ -977,7 +977,7 @@ def _flash_attn_fwd(
     if sm120_qpkv5_d128_hook_eligible:
         if sm120_seq_q == 8192:
             sm120_qpkv5_d128_default_hook_mode = "both"
-        elif sm120_seq_q == 16384 and batch_size > 1:
+        elif sm120_seq_q == 16384:
             sm120_qpkv5_d128_default_hook_mode = "v"
         elif sm120_seq_q in (32768, 65536):
             sm120_qpkv5_d128_default_hook_mode = "both"
