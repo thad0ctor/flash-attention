@@ -38,6 +38,7 @@ or reverted paths.
 | Current 5-repeat broad forward rerun | `b9261e6`, `/tmp/sm120_model_variants_qpkv4_5x_rerun_b9261e6_20260528` | 78 cells, geomean 1.070998, median 1.037421, wins 67/78 | Rerun after rejecting qpkv2 dense probe. Versus prior 5-repeat run: FA4-time geomean old/new 1.011005, FA4/FA2 ratio geomean new/old 1.016971. |
 | Post-qpkv5-hook 5-repeat forward sweep | `effed34`, `/tmp/sm120_model_variants_after_qpkv5_hooks_5x_20260529` | 78 cells, mean-ms geomean 1.048271, median-ms geomean 1.051726, median-ms wins 64/78 | Current-state reference after qpkv5 hook policy. Contains obvious one-repeat outliers, so use row medians/repeat ranges before treating a miss as actionable. |
 | Current long Qwen/Gemma forward sweep | `a11ddad` + qpkv8 long patches, `/tmp/sm120_longseq_qwen_gemma_after_qpkv8_long_20260529` | 52 cells, geomean 1.022723, median 1.010010, wins 31/52. Qwen geomean 1.005650, Gemma geomean 1.081755. qwen3-30B qpkv8 causal improved to S16384 1.052, S32768 1.048, S65536 1.023; S131072 remains a tiny 0.994 miss. | current long forward reference; one-repeat table, rerun targeted misses before patching |
+| Post-qpkv8-long 5-repeat broad forward sweep | `0d709fb`, `/tmp/sm120_model_variants_current_after_long_5x_20260529` | 78 cells, geomean 1.063193, median 1.037063, wins 66/78. D128 1.052319, D256 1.068062, qwen 1.044741, gemma 1.105912. | current short/mid sanity check after qpkv8 long keepers; comparable to the `d6bdf7e` 10-repeat keeper, but use targeted repeats for the remaining qpkv5/qpkv8 S4096 misses |
 | Current FA2/FA4/SDPA forward sweep | this commit, `/tmp/sm120_sdpa_fa2_fa4_forward_qpkv4_patch_20260528` | 60 cells, FA4/FA2 geomean 1.092207, wins 50/60; FA4/SDPA geomean 0.927178, wins 15/60 | D64 + qpkv4 lookup patches improved the old 60-cell reference from 1.080762 geomean and 41/60 wins. Peak FA4 189.82 TFLOPS in this run. |
 | SM120 paged-KV D192/D256 | this commit, `/tmp/sm120_paged_kv_hdgt128_bench_packoff_20260528` | New paged-KV coverage for head_dim 192/256. Full SM120 paged-KV suite: 51/51 pass. D256 B=2 qpkv4 paged/contiguous median ratio: S1024 noncausal 1.015x, S1024 causal 1.032x, S4096 noncausal 0.981x, S4096 causal 0.974x. | feature keeper; performance is near-contiguous without unpacking KV |
 | SM120 D256 backward functional baseline | current D256 alias path, `/tmp/sm120_bwd_d256_alias_overlap_3x_20260528`, `/tmp/sm120_bwd_d256_ncu_20260528` | Dense D256 backward now validates for qpkv2/qpkv4/qpkv8 causal and noncausal. 3-repeat S1024 causal smoke vs FA2: geomean 0.901647, wins 2/8. Qwen geomean 0.926900, Gemma geomean 0.861077. NCU qwen3.5-9B S1024 causal main kernel: FA4 479.5 us vs FA2 420.5 us; FA4 uses fewer instructions but launches half the CTA grid. | feature baseline, not a perf winner |
@@ -159,7 +160,10 @@ should not lose track of them.
 - qpkv8 D128: S8192 dispatch is retuned; if continuing this family, test
   S16384/S32768/S65536 causal and avoid broad old-commit restores.
 - D128/qpkv5 small and mid noncausal rows: repeat before patching; several
-  apparent misses have flipped with run order and FA2 variance.
+  apparent misses have flipped with run order and FA2 variance. The current
+  post-qpkv8-long 5-repeat broad sweep makes qwen3-14B S4096 noncausal the
+  only stable short/mid qpkv5 miss so far: 0.967620x, 0/5 wins, repeat range
+  0.931524-0.986940. Treat that exact row as the next forward probe target.
 - Gemma local qpkv4/qpkv8: keep `64x16`, but rerun broader repeats before
   extending to qpkv2 or dense Gemma shapes.
 - D64 MHA after the current lookup patch: S8192 noncausal and S16384
