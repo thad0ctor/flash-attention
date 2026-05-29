@@ -746,11 +746,13 @@ def _flash_attn_fwd(
                 and score_mod is None
                 and block_sparse_tensors is None
             ):
-                # qwen3-30B-style long causal qpkv8 regains tensor throughput on
-                # RTX 5090 with a wider N tile; keep this exact to avoid
-                # disturbing the noisier qpkv8 short/noncausal cells.
-                fwd_cfg = FwdConfig(128, 64, True, True)
-                if sm120_seq_q == 32768:
+                # qwen3-30B-style long causal qpkv8 is sensitive to both tile
+                # width and thread count. Keep this exact to avoid disturbing
+                # the noisier qpkv8 short/noncausal cells.
+                if sm120_seq_q == 65536:
+                    fwd_cfg = FwdConfig(128, 32, True, True)
+                else:
+                    fwd_cfg = FwdConfig(128, 64, True, True)
                     num_threads = 256
             elif lookup_key in _SM120_TILE_LOOKUP:
                 tm, tn, ns = _SM120_TILE_LOOKUP[lookup_key]
