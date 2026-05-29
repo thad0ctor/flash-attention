@@ -40,6 +40,7 @@ or reverted paths.
 | Current FA2/FA4/SDPA forward sweep | this commit, `/tmp/sm120_sdpa_fa2_fa4_forward_qpkv4_patch_20260528` | 60 cells, FA4/FA2 geomean 1.092207, wins 50/60; FA4/SDPA geomean 0.927178, wins 15/60 | D64 + qpkv4 lookup patches improved the old 60-cell reference from 1.080762 geomean and 41/60 wins. Peak FA4 189.82 TFLOPS in this run. |
 | SM120 paged-KV D192/D256 | this commit, `/tmp/sm120_paged_kv_hdgt128_bench_packoff_20260528` | New paged-KV coverage for head_dim 192/256. Full SM120 paged-KV suite: 51/51 pass. D256 B=2 qpkv4 paged/contiguous median ratio: S1024 noncausal 1.015x, S1024 causal 1.032x, S4096 noncausal 0.981x, S4096 causal 0.974x. | feature keeper; performance is near-contiguous without unpacking KV |
 | SM120 D256 backward functional baseline | current D256 alias path, `/tmp/sm120_bwd_d256_alias_overlap_3x_20260528`, `/tmp/sm120_bwd_d256_ncu_20260528` | Dense D256 backward now validates for qpkv2/qpkv4/qpkv8 causal and noncausal. 3-repeat S1024 causal smoke vs FA2: geomean 0.901647, wins 2/8. Qwen geomean 0.926900, Gemma geomean 0.861077. NCU qwen3.5-9B S1024 causal main kernel: FA4 479.5 us vs FA2 420.5 us; FA4 uses fewer instructions but launches half the CTA grid. | feature baseline, not a perf winner |
+| Current D256 backward smoke after qpkv8 fused-dKV | `e943809`, `/tmp/sm120_bwd_d256_smoke_after_qpkv8_fused_20260529` | 8-cell S1024 causal smoke: geomean 0.965548 vs FA2, wins 1/8 by mean. qwen geomean 0.991479, gemma geomean 0.923827. qpkv16 wins strongly; qpkv4 is near parity; qpkv6/qpkv8 remain the short causal drag. | current D256 backward reference |
 
 ## Best Known Winners
 
@@ -102,6 +103,9 @@ or reverted paths.
 | SM120 D256 qpkv4 S4096 backward tile/Atom probe | No dispatch patch after `/tmp/sm120_bwd_d256_qpkv4_s4096_tile_atom_probe_20260529`. N32 AtomLayoutNdKV=1/2 regressed every qpkv4 S4096 cell, N48/N96 failed MMA partitioning, and the default path was already near parity in the targeted rerun. Remaining S4096 variance points back to structural D256 backward work, not a simple tile/Atom condition. |
 | SM120 fused dK+dV postprocess expansion beyond exact keepers | No broader default-dispatch patch beyond packed split paths and the exact D256 qpkv8 S1024 causal keeper above. Forced fused dKV remains layout-safe for fixed non-varlen equal-D GQA and is available through `FLASH_ATTENTION_SM120_FUSED_DKV=on` for profiling, but broad timing was not stable enough to ship. Artifacts: `/tmp/sm120_fused_dkv_exact_rows_ab_20260529`, `/tmp/sm120_fused_dkv_exact_rows_repeat_20260529`, `/tmp/sm120_fused_dkv_qpkv8_s4096_confirm_20260529`, `/tmp/sm120_fused_dkv_qpkv8_s4096_default_validate_20260529`. The qwen3-30B D128 qpkv8 S4096 noncausal hint confirmed once (+0.7% mean) but then default validation regressed auto vs forced-off by mean, so keep it off by default. |
 | SM120 D256 backward N32 recheck after fused-dKV gate | Still rejected. `/tmp/sm120_bwd_d256_n32_recheck_20260529` repeated the old Gemma hint, but it was not stable enough to ship: qwen3.5-0.8B and qwen3.5-9B qpkv4 S1024 causal regressed by mean, gemma4-e2b was flat, and only gemma4-e4b showed a small mean win. The later pack8 causal qpkv4 path captures the useful short-shape win without changing N to 32. |
+| SM120 D256 qpkv8 S1024 causal N32 retry after fused-dKV | Still rejected. NCU showed qpkv8 H16 S1024 causal FA4 has fewer instructions/spills than FA2 but half the main-kernel grid, so N32/AtomLayoutNdKV=1/2 was retried. Interleaved A/B `/tmp/sm120_bwd_n32_qpkv8_s1024_causal_ab_20260529`: H16 regressed by about 7% median; H8 was parity/noise. Keep N64. |
+| SM120 D256 qpkv6/qpkv8 S1024 causal explicit PackGQA after fused-dKV | Rejected. `/tmp/sm120_bwd_causal_pack_qpkv6_qpkv8_after_fused_20260529`: qpkv6 true-pack median 0.962x vs auto, qpkv8 H16 true-pack median 0.981x vs auto, qpkv8 H8 was mean-positive but median-negative/noisy. Do not add causal qpkv6/qpkv8 to auto-pack. |
+| SM120 D256 backward K/V full-tile load predicate elision | Rejected. The env-gated source probe passed D256 SDPA correctness but timing did not hold: `/tmp/sm120_bwd_skip_kv_load_pred_ab_20260529` had qpkv6 S1024 causal median parity and mean regression, qpkv8 H8 parity/noise, qpkv8 H16 median-only +1.4% with mean regression, and qpkv6 S4096 noncausal median/mean regression. Do not skip K/V load predicates without a deeper SASS-level reason. |
 
 ## Review Risks To Keep Separate From Perf Winners
 
@@ -149,6 +153,10 @@ should not lose track of them.
   are not enough; a future dedicated D256 variant should solve the dK/dV
   epilogue/layout and row-mapping problem instead of adding another
   dispatcher-only condition.
+- D256 qpkv6/qpkv8 S1024 causal: fresh NCU after qpkv8 fused-dKV shows FA4
+  main kernels execute fewer instructions/spills than FA2, but still lose time
+  because they launch half the CTA grid. N32, explicit causal PackGQA, and
+  K/V load-predicate elision have all been rechecked and rejected.
 - Current 10-repeat short-mid sweep's three mean-ratio rows below 0.98 were
   rechecked and are not actionable. qwen3.5/qwen3.6-27B S1024 causal D256
   qpkv6 is tiny/noisy; gemma4-31B S4096 local D256 qpkv2 and qwen3.5-122B
