@@ -75,6 +75,7 @@ or reverted paths.
 | SM80-base qpkv6 hook-path `utils.cvt_f16(acc_S, rP)` conversion | Tried after `60354fd` and reverted locally. Focused dirty run `/tmp/sm120_qwen_focused_qpkv6_cvt_hook_dirty_20260528b` dropped D256 qpkv6 causal geomean to 1.015849 vs prior current reference 1.025739, mainly hurting S16384 causal. |
 | D256 qpkv6 hook scheduling K-only / V-only / off | Profiling-only env selector tested then reverted. NCU at S4096 causal: V-only was fastest in one profile (2.312 ms vs both 2.327 ms), but focused timing rejected changing the default: D256 qpkv6 causal geomean both-hooks 1.079767, V-only 1.049291, K-only 1.036348, hooks-off 0.985875. Artifacts: `/tmp/sm120_qpkv6_hook_ab_ncu_20260528b`, `/tmp/sm120_qwen_focused_hook_{both,v,off,k}_dirty_20260528b`. |
 | D256 qpkv6 first-load predicate / causal first-tile mask / SM120 softmax reductions | Rejected after dirty probes and reverted. Combined predicate+mask improved one S4096 run but regressed S8192/S16384; load-predicate-only had a tiny NCU duration win (2.328 ms -> 2.323 ms) but repeated timing regressed S4096; softmax-120 reduced instructions but added writeback and did not improve NCU duration. Artifacts: `/tmp/sm120_qwen_focused_predmask_dirty_20260528b`, `/tmp/sm120_qwen_focused_loadpred_dirty_20260528b`, `/tmp/sm120_qwen_focused_softmax120_dirty_20260528b`, `/tmp/sm120_qpkv6_s4096_loadpred_ncu_20260528b`. |
+| Current 10-repeat forward tail rows: qwen122 qpkv16 S8192 causal, Gemma31 qpkv2 S4096 local, qwen27 qpkv6 S1024 causal | No dispatch patch. Targeted reruns showed these are not repeatable misses: qwen122 qpkv16 S8192 causal subprocess repeat is parity (mean 1.001314, median 1.001489, 5/10 wins; `/tmp/sm120_forward_miss_repeat_qwen122_current_20260528`) and interleaved tile A/B favored current auto over explicit alternates (auto 1.054302x; `/tmp/sm120_qwen122_qpkv16_s8192_causal_ab_20260528`). Gemma31 qpkv2 S4096 local auto rerun was already 1.087680x vs FA2, with best alternate only +0.05% over auto; S8192 local's best was the current logical `64x64` path (`/tmp/sm120_current_gap_condition_ab_20260528_qpkv2_local_rerun`). qwen27 qpkv6 S1024 causal has median >1 in the 10-repeat broad sweep and extreme subprocess outliers, so treat it as tiny/noisy. |
 | Qwen D128 qpkv4 S4096 lookup changes | Rejected in the qpkv4 lookup patch. Interleaved explicit-tile timing suggested S4096 wins, but subprocess public-API validation showed FA4-time regressions versus the saved post-qpkv artifact, so S4096 noncausal stayed `64x64` and S4096 causal stayed `64x96`. |
 | Gemma31 D256 qpkv2 dense causal `64x48` | Interleaved timing looked mildly positive for S4096/S8192 causal, but public-API 5-repeat validation rejected shipping it: S4096 causal mean 0.989660 and S8192 causal median 0.979706. Noncausal must remain `64x64` for dense mask-skip behavior. Artifacts: `/tmp/sm120_gemma31_qpkv2_dense_condition_ab_20260528`, `/tmp/sm120_gemma31_qpkv2_patch_validation_20260528`. |
 | qwen3.5-9B S4096 noncausal D256 qpkv4 and gemma4-e2b S8192 noncausal D256 qpkv8 broad-repeat misses | No dispatch patch. A later public-API 10-repeat check flipped both apparent 5-repeat misses into wins: qwen3.5-9B S4096 noncausal mean 1.015043 / median 1.024537, wins 6/10; gemma4-e2b S8192 noncausal mean 1.020579 / median 1.029481, wins 8/10. The matching interleaved A/B run mostly favored the existing `64x64` path; qwen S4096 `64x48` was only a tiny distinct hint and would disable dense mask-skip divisibility. Artifacts: `/tmp/sm120_broad_miss_qpkv4_qpkv8_condition_ab_20260528`, `/tmp/sm120_broad_miss_public_repeat_20260528`. |
@@ -128,9 +129,9 @@ should not lose track of them.
   current safe path uses N=64. A future dedicated D256 variant should solve the
   N=32 dK/dV epilogue/layout problem instead of adding another dispatcher-only
   condition.
-- Current 10-repeat short-mid sweep leaves only three mean-ratio rows below
-  0.98: qwen3.5/qwen3.6-27B S1024 causal D256 qpkv6 at 0.952360 but median
-  1.024283 and wins 6/10; gemma4-31B S4096 local D256 qpkv2 at 0.965963; and
-  qwen3.5-122B S8192 causal D256 qpkv16 at 0.978322. Treat the first as tiny
-  noise; profile the latter two only if they remain negative in a targeted
-  paired rerun.
+- Current 10-repeat short-mid sweep's three mean-ratio rows below 0.98 were
+  rechecked and are not actionable. qwen3.5/qwen3.6-27B S1024 causal D256
+  qpkv6 is tiny/noisy; gemma4-31B S4096 local D256 qpkv2 and qwen3.5-122B
+  S8192 causal D256 qpkv16 both flipped to parity or wins in targeted reruns.
+  Do not add a dispatch condition for these rows without a new paired artifact
+  that reproduces a stable miss.
