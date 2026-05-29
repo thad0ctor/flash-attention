@@ -2119,6 +2119,55 @@ def _flash_attn_bwd(
         and seqused_k is None
         and (seqlen_q * qhead_per_kvhead) % m_block_size == 0
     )
+    sm120_skip_full_causal_mask_base = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and causal
+        and not local
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead in (4, 6, 8)
+        and seqlen_q == seqlen_k
+        and seqlen_q % m_block_size == 0
+        and seqlen_k % n_block_size == 0
+        and m_block_size == 64
+        and n_block_size == 64
+        and softcap == 0.0
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+    )
+    sm120_skip_full_causal_mask_default = sm120_skip_full_causal_mask_base and (
+        batch_size == 2
+        and (
+            (
+                qhead_per_kvhead == 4
+                and num_head == 8
+                and num_head_kv == 2
+                and seqlen_q == 1024
+            )
+            or (
+                qhead_per_kvhead == 6
+                and num_head == 24
+                and num_head_kv == 4
+                and seqlen_q == 1024
+            )
+        )
+    )
+    sm120_skip_full_causal_mask_override = os.environ.get(
+        "FLASH_ATTENTION_SM120_BWD_SKIP_FULL_CAUSAL_MASK", ""
+    ).lower()
+    if sm120_skip_full_causal_mask_override in {"0", "false", "off", "no"}:
+        sm120_skip_full_causal_mask = False
+    elif sm120_skip_full_causal_mask_override in {"1", "true", "on", "yes"}:
+        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_base
+    else:
+        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -2344,6 +2393,7 @@ def _flash_attn_bwd(
             pack_gqa,
             pack_gqa_m_splits,
             pack_gqa_all_rows_valid,
+            sm120_skip_full_causal_mask,
             num_stages_Q,
             num_stages_dO,
             SdP_swapAB,
@@ -2454,6 +2504,7 @@ def _flash_attn_bwd(
                 score_mod_bwd=score_mod_bwd,
                 pack_gqa_m_splits=pack_gqa_m_splits,
                 pack_gqa_all_rows_valid=pack_gqa_all_rows_valid,
+                skip_full_causal_mask=sm120_skip_full_causal_mask,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(

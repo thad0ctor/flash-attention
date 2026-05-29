@@ -51,6 +51,7 @@ class FlashAttentionBackwardSm80:
         score_mod_bwd: cutlass.Constexpr | None = None,
         pack_gqa_m_splits: int = 1,
         pack_gqa_all_rows_valid: bool = False,
+        skip_full_causal_mask: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -105,6 +106,7 @@ class FlashAttentionBackwardSm80:
         )
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        self.skip_full_causal_mask = skip_full_causal_mask
 
     @staticmethod
     def can_implement(
@@ -1123,7 +1125,32 @@ class FlashAttentionBackwardSm80:
             smem_pipe_read_do = cutlass.Int32(0)
             smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
             smem_pipe_write_do = cutlass.Int32(0)
-            for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
+            masked_m_block_max = m_block_max
+            if cutlass.const_expr(self.skip_full_causal_mask and self.is_causal):
+                if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa):
+                    full_valid_m_block_min = cute.ceil_div(
+                        self.qhead_per_kvhead
+                        * (
+                            n_block * self.n_block_size
+                            + self.n_block_size
+                            - 1
+                            + seqlen.seqlen_q
+                            - seqlen.seqlen_k
+                        ),
+                        self.m_block_size,
+                    )
+                else:
+                    full_valid_m_block_min = cute.ceil_div(
+                        n_block * self.n_block_size
+                        + self.n_block_size
+                        - 1
+                        + seqlen.seqlen_q
+                        - seqlen.seqlen_k,
+                        self.m_block_size,
+                    )
+                masked_m_block_max = min(max(full_valid_m_block_min, m_block_min), m_block_max)
+
+            for m_tile in cutlass.range(m_block_min, masked_m_block_max, unroll=1):
                 compute_one_m_block(
                     m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
                     mask_fn=mask_fn,
@@ -1132,6 +1159,16 @@ class FlashAttentionBackwardSm80:
                 smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
                 smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
                 smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
+            if cutlass.const_expr(self.skip_full_causal_mask and self.is_causal):
+                for m_tile in cutlass.range(masked_m_block_max, m_block_max, unroll=1):
+                    compute_one_m_block(
+                        m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
+                        mask_fn=None,
+                    )
+                    smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
+                    smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
+                    smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
+                    smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
