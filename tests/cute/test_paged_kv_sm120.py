@@ -27,10 +27,9 @@ The bf16 max-abs-diff tolerance vs SDPA is 0.05 (the actual achieved diff is
 ~0.004 on every supported config).
 
 Skips when not running on sm_120 because the fix lives in the SM120
-dispatch.  head_dim>128 with paged-KV still raises ``NotImplementedError``
-(tile_n>=128 + d>128 overflows the 99 KB SMEM cap); head_dim > head_dim_v
-with paged-KV is rejected by the Bug E ``can_implement`` gate. We assert
-those errors rather than silently passing.
+dispatch.  Phase 5 extends paged-KV coverage to head_dim in {192, 256} by
+using the SM120 non-TMA 64x64 path; head_dim > head_dim_v with paged-KV
+continues to route through the non-TMA path as covered below.
 """
 
 from __future__ import annotations
@@ -343,18 +342,33 @@ def test_d_gt64_gqa_mqa(d, nheads, nheads_kv):
     assert md < TOL_BF16, f"d={d} ({nheads},{nheads_kv}): max diff {md:.5f} >= {TOL_BF16}"
 
 
-def test_d192_paged_rejected():
-    """head_dim=192 with paged-KV must raise NotImplementedError (SMEM overflow)."""
+@pytest.mark.parametrize("d", [192, 256])
+@pytest.mark.parametrize("page_size,seqlen_k", [(16, 256), (64, 256), (256, 512)])
+def test_d_gt128_page_sizes(d, page_size, seqlen_k):
+    """head_dim in {192, 256} paged-KV across page sizes on SM120."""
     _sm120_only()
-    with pytest.raises(NotImplementedError, match="head_dim"):
-        _run_paged_case(d=192)
+    md, _ = _run_paged_case(d=d, page_size=page_size, seqlen_k=seqlen_k, seed=d * 1000 + page_size)
+    assert md < TOL_BF16, f"d={d} page_size={page_size}: max diff {md:.5f} >= {TOL_BF16}"
 
 
-def test_d256_paged_rejected():
-    """head_dim=256 with paged-KV must raise NotImplementedError (SMEM overflow)."""
+@pytest.mark.parametrize("d", [192, 256])
+@pytest.mark.parametrize("causal", [False, True])
+def test_d_gt128_causal(d, causal):
+    """head_dim in {192, 256} paged-KV with/without causal masking."""
     _sm120_only()
-    with pytest.raises(NotImplementedError, match="head_dim"):
-        _run_paged_case(d=256)
+    md, _ = _run_paged_case(d=d, causal=causal, seed=d * 1000 + int(causal))
+    assert md < TOL_BF16, f"d={d} causal={causal}: max diff {md:.5f} >= {TOL_BF16}"
+
+
+@pytest.mark.parametrize("d", [192, 256])
+@pytest.mark.parametrize("nheads,nheads_kv", [(8, 2), (8, 1)])
+def test_d_gt128_gqa_mqa(d, nheads, nheads_kv):
+    """head_dim in {192, 256} paged-KV with GQA and MQA."""
+    _sm120_only()
+    md, _ = _run_paged_case(
+        d=d, nheads=nheads, nheads_kv=nheads_kv, seed=d * 1000 + nheads_kv,
+    )
+    assert md < TOL_BF16, f"d={d} ({nheads},{nheads_kv}): max diff {md:.5f} >= {TOL_BF16}"
 
 
 def test_d128_dv64_paged_varlen_correctness():

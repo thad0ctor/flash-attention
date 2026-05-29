@@ -1369,15 +1369,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # paged_kv_manager as an explicit argument so the manager's
             # mutable register fragments dominate every use inside.
             #
-            # Requires tile_n >= num_threads so PagedKVManager.create's
-            # page_entry_per_thread = tile_n // num_threads >= 1; we assert
-            # this at the interface.py dispatch (see paged-KV branch).
-            assert self.tile_n >= self.num_producer_threads, (
-                f"Paged-KV mainloop requires tile_n >= num_threads "
-                f"(got tile_n={self.tile_n}, num_threads={self.num_producer_threads}). "
-                f"This typically means head_dim>=128 — use a smaller head_dim "
-                f"or route paged KV to SM100."
-            )
+            # PagedKVManager allocates ceil(tile_n / num_threads) page-table
+            # slots per producer thread, so SM120 D192/D256 can use tile_n=64
+            # and still stay under the 99 KB SMEM cap.
             # CRITICAL: skip wasted varlen grid tiles. SingleTileVarlenScheduler
             # rounds the grid up so blockIdx may correspond to batch_idx >=
             # num_batch; for those, work_tile.is_valid_tile is False and the

@@ -618,11 +618,10 @@ def _flash_attn_fwd(
             }
             sl = sm120_seq_k
             lookup_key = (head_dim, qhead_per_kvhead, sl, int(bool(causal)))
-            # Paged-KV needs tile_n >= num_threads (128) so PagedKVManager's
-            # page_entry_per_thread = tile_n // num_threads >= 1. For
-            # head_dim <= 128 force (128, 128, ns=1); SMEM fits (48 KB at
-            # d=64, 72 KB at d=96, 96 KB at d=128 with d==dv). head_dim>128
-            # is rejected in the gate below.
+            # For head_dim <= 128 paged-KV uses (128, 128, ns=1), which fits
+            # SMEM (48 KB at d=64, 72 KB at d=96, 96 KB at d=128 with d==dv).
+            # D192/D256 paged-KV falls through to the head_dim > 128 64x64
+            # non-TMA path below.
             if page_table is not None and head_dim <= 128 and head_dim_v <= 128:
                 fwd_cfg = FwdConfig(128, 128, True, True)
                 sm120_num_stages = 1
@@ -1170,18 +1169,10 @@ def _flash_attn_fwd(
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): SM80 MMA with 99 KB SMEM.
-            # Paged-KV needs tile_n >= num_threads (PagedKVManager's
-            # page_entry_per_thread = tile_n // num_threads >= 1). The
-            # tile-picker above forces (128, 128, ns=1) for head_dim <= 128,
-            # which fits SMEM. head_dim>128 with paged-KV would require
-            # tile_n>=128 + d>128 -> SMEM overflow, so reject.
-            if page_table is not None and head_dim > 128:
-                raise NotImplementedError(
-                    f"Paged KV with head_dim={head_dim} (>128) is not supported "
-                    f"on SM 12.0: tile_n>=128 (required by PagedKVManager) at "
-                    f"head_dim>128 overflows the 99 KB SMEM cap. Use head_dim<=128 "
-                    f"or run on SM100/SM90."
-                )
+            # Paged-KV for head_dim > 128 runs through this non-TMA path on
+            # SM120. The tile picker keeps those rows at 64x64, which fits the
+            # 99 KB SMEM cap; PagedKVManager supports tile_n < num_threads by
+            # allocating ceil(tile_n / num_threads) page-table slots.
             # The TMA kernel builds a fixed (tile_m, tile_hdim) Q TMA atom
             # from the unpacked layout, so pack_gqa=True must take the
             # SM80-base path (which calls pack_gqa_layout). is_varlen here
