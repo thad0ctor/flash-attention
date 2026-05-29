@@ -2463,26 +2463,33 @@ def _flash_attn_bwd(
         and seqused_k is None
     )
     sm120_skip_full_causal_mask_default = sm120_skip_full_causal_mask_base and (
-        batch_size == 2
-        and (
-            (
-                qhead_per_kvhead == 4
-                and num_head == 8
-                and num_head_kv == 2
-                and seqlen_q == 1024
-            )
-            or (
-                qhead_per_kvhead == 6
-                and num_head == 24
-                and num_head_kv == 4
-                and seqlen_q == 1024
-            )
-            or (
-                qhead_per_kvhead == 2
-                and num_head == 32
-                and num_head_kv == 16
-                and seqlen_q == 1024
-            )
+        (
+            qhead_per_kvhead == 4
+            and num_head == 8
+            and num_head_kv == 2
+            and batch_size in (1, 2)
+            and seqlen_q == 1024
+        )
+        or (
+            qhead_per_kvhead == 4
+            and num_head == 16
+            and num_head_kv == 4
+            and batch_size == 2
+            and seqlen_q == 1024
+        )
+        or (
+            qhead_per_kvhead == 6
+            and num_head == 24
+            and num_head_kv == 4
+            and batch_size == 2
+            and seqlen_q == 1024
+        )
+        or (
+            qhead_per_kvhead == 2
+            and num_head == 32
+            and num_head_kv == 16
+            and batch_size == 2
+            and seqlen_q == 1024
         )
     )
     sm120_skip_full_causal_mask_override = os.environ.get(

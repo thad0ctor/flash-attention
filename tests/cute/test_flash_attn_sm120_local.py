@@ -350,6 +350,38 @@ def test_sm120_bwd_qpkv8_s1024_causal_fused_dkv_policy(monkeypatch):
     )
 
 
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 16, 4)])
+def test_sm120_d256_bwd_maskskip_default_matches_forced_off(monkeypatch, batch, h_q, h_kv):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    torch.manual_seed(0)
+    q = torch.randn(batch, 1024, h_q, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, 1024, h_kv, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, 1024, h_kv, 256, device="cuda", dtype=torch.bfloat16)
+    dout = torch.randn_like(q)
+
+    def run(maskskip):
+        if maskskip is None:
+            monkeypatch.delenv("FLASH_ATTENTION_SM120_BWD_SKIP_FULL_CAUSAL_MASK", raising=False)
+        else:
+            monkeypatch.setenv("FLASH_ATTENTION_SM120_BWD_SKIP_FULL_CAUSAL_MASK", maskskip)
+        q_ = q.detach().clone().requires_grad_(True)
+        k_ = k.detach().clone().requires_grad_(True)
+        v_ = v.detach().clone().requires_grad_(True)
+        out = flash_attn_func(q_, k_, v_, causal=True, pack_gqa=None)
+        out = out[0] if isinstance(out, tuple) else out
+        out.backward(dout)
+        return out.detach(), q_.grad.detach(), k_.grad.detach(), v_.grad.detach()
+
+    default = run(None)
+    forced_off = run("off")
+    limits = (0.002, 0.05, 0.05, 0.05)
+    for actual, expected, limit in zip(default, forced_off, limits):
+        assert (actual.float() - expected.float()).abs().max().item() < limit
+
+
 @pytest.mark.timeout(60)
 def test_sm120_d128_fused_dkv_backward_matches_sdpa(monkeypatch):
     _sm120_only()
