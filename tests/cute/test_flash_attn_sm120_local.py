@@ -109,6 +109,36 @@ def test_sm120_qpkv5_d128_hook_forward_matches_sdpa(monkeypatch, hook_mode):
     assert (out.float() - ref).abs().max().item() < 0.05
 
 
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("h_kv", [4, 8])
+def test_sm120_pack_gqa_fast_valid_rows_forward_matches_reference(monkeypatch, h_kv):
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 256, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, h_kv, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 256, h_kv, 128, device="cuda", dtype=torch.bfloat16)
+
+    monkeypatch.delenv("FLASH_ATTENTION_SM120_PACK_GQA_VALID_ROWS_FAST", raising=False)
+    out = flash_attn_func(q, k, v, causal=False)
+    out = out[0] if isinstance(out, tuple) else out
+
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_PACK_GQA_VALID_ROWS_FAST", "off")
+    out_off = flash_attn_func(q, k, v, causal=False)
+    out_off = out_off[0] if isinstance(out_off, tuple) else out_off
+
+    q_ref = q.float().transpose(1, 2)
+    qpkv = q.shape[2] // h_kv
+    k_ref = k.float().repeat_interleave(qpkv, dim=2).transpose(1, 2)
+    v_ref = v.float().repeat_interleave(qpkv, dim=2).transpose(1, 2)
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref).transpose(1, 2)
+
+    assert (out.float() - out_off.float()).abs().max().item() == 0
+    assert (out.float() - ref).abs().max().item() < 0.05
+
+
 @pytest.mark.timeout(90)
 @pytest.mark.parametrize("hook_mode", ["off", "v", "both"])
 def test_sm120_qpkv6_d256_hook_forward_matches_sdpa(monkeypatch, hook_mode):

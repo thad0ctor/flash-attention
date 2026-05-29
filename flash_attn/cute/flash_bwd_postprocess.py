@@ -702,8 +702,9 @@ class FlashAttentionBackwardDkvPostprocessSm120(FlashAttentionBackwardPostproces
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mdV.element_type != mdK.element_type):
             raise TypeError("dK and dV must have the same dtype")
-        if const_expr(mdK.shape[3] != mdV.shape[3]):
-            raise NotImplementedError("SM120 fused dK+dV postprocess requires matching dK/dV head_dim")
+        # The Python wrapper validates matching dK/dV head_dim before compile.
+        # Rechecking mdK/mdV symbolic shapes here creates a dynamic CuTeDSL
+        # comparison and can reject otherwise eligible fixed-D kernels.
         if const_expr(mdKaccum.element_type not in [cutlass.Float32]):
             raise TypeError("dKaccum tensor must be Float32")
         if const_expr(mdVaccum.element_type not in [cutlass.Float32]):

@@ -63,6 +63,7 @@ class FlashAttentionForwardBase:
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
         pack_gqa_all_rows_valid: bool = False,
+        pack_gqa_fast_valid_rows: bool = False,
         skip_dense_seqlen_mask: bool = False,
         hook_load_k: bool = False,
         hook_load_v: bool = False,
@@ -102,6 +103,7 @@ class FlashAttentionForwardBase:
         self.is_local = is_local
         self.pack_gqa = pack_gqa
         self.pack_gqa_all_rows_valid = pack_gqa_all_rows_valid
+        self.pack_gqa_fast_valid_rows = pack_gqa_fast_valid_rows
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
@@ -408,9 +410,15 @@ class FlashAttentionForwardBase:
                             taccOgLSE[m, 0] = lse[m]
             else:
                 if const_expr(self.pack_gqa_all_rows_valid):
-                    pack_gqa.store_LSE_all_rows_valid(
-                        mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q
-                    )
+                    if const_expr(self.pack_gqa_fast_valid_rows):
+                        pack_gqa.store_LSE(
+                            mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q,
+                            all_rows_valid=True
+                        )
+                    else:
+                        pack_gqa.store_LSE_all_rows_valid(
+                            mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q
+                        )
                 else:
                     pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
@@ -472,9 +480,15 @@ class FlashAttentionForwardBase:
                         )
             else:
                 if const_expr(self.pack_gqa_all_rows_valid):
-                    pack_gqa.store_O_all_rows_valid(
-                        mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q
-                    )
+                    if const_expr(self.pack_gqa_fast_valid_rows):
+                        pack_gqa.store_O(
+                            mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q,
+                            all_rows_valid=True
+                        )
+                    else:
+                        pack_gqa.store_O_all_rows_valid(
+                            mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q
+                        )
                 else:
                     pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
 
@@ -1094,9 +1108,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
                     )
                     if const_expr(self.pack_gqa_all_rows_valid):
-                        pack_gqa_helper.load_Q_all_rows_valid(
-                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
-                        )
+                        if const_expr(self.pack_gqa_fast_valid_rows):
+                            pack_gqa_helper.load_Q(
+                                mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q,
+                                all_rows_valid=True
+                            )
+                        else:
+                            pack_gqa_helper.load_Q_all_rows_valid(
+                                mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                            )
                     else:
                         pack_gqa_helper.load_Q(
                             mQ_cur,
@@ -1175,9 +1195,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
                 )
                 if const_expr(self.pack_gqa_all_rows_valid):
-                    pack_gqa_helper.load_Q_all_rows_valid(
-                        mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
-                    )
+                    if const_expr(self.pack_gqa_fast_valid_rows):
+                        pack_gqa_helper.load_Q(
+                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q,
+                            all_rows_valid=True
+                        )
+                    else:
+                        pack_gqa_helper.load_Q_all_rows_valid(
+                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                        )
                 else:
                     pack_gqa_helper.load_Q(
                         mQ_cur,

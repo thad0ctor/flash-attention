@@ -1132,6 +1132,20 @@ def _flash_attn_fwd(
         and seqused_k is None
         and (seqlen_q * qhead_per_kvhead) % tile_m == 0
     )
+    sm120_pack_gqa_fast_valid_rows_env = os.environ.get(
+        "FLASH_ATTENTION_SM120_PACK_GQA_VALID_ROWS_FAST", ""
+    ).lower()
+    sm120_pack_gqa_fast_valid_rows = (
+        arch // 10 == 12
+        and pack_gqa_all_rows_valid
+        and not causal
+        and not local
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead in (4, 8)
+        and not use_block_sparsity
+        and sm120_pack_gqa_fast_valid_rows_env not in {"0", "false", "off", "no"}
+    )
     sm120_skip_dense_seqlen_mask = (
         arch // 10 == 12
         and not causal
@@ -1389,6 +1403,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         pack_gqa_all_rows_valid,
+        sm120_pack_gqa_fast_valid_rows if arch // 10 == 12 else None,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
         # On SM120 the SM80-base paged-KV mainloop (phase4R) bakes
@@ -1683,6 +1698,7 @@ def _flash_attn_fwd(
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
                     pack_gqa_all_rows_valid=pack_gqa_all_rows_valid,
+                    pack_gqa_fast_valid_rows=sm120_pack_gqa_fast_valid_rows,
                     skip_dense_seqlen_mask=sm120_skip_dense_seqlen_mask,
                     hook_load_k=sm120_hook_load_k,
                     hook_load_v=sm120_hook_load_v,
