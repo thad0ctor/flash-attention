@@ -777,7 +777,8 @@ def _flash_attn_fwd(
         and batch_size == 2
         and (
             (not causal and sm120_seq_q in (4096, 8192))
-            or (causal and sm120_seq_q == 8192)
+            # RTX6000: causal S4096 also wins with Q-in-regs (0.976 -> 1.067 vs FA2)
+            or (causal and sm120_seq_q in (4096, 8192))
         )
     ):
         sm120_qpkv6_d256_qregs_mode = "128x64_t256"
@@ -864,7 +865,9 @@ def _flash_attn_fwd(
             ):
                 # Gemma local attention only loads a narrow K window;
                 # smaller N tiles reduce wasted local-window work on SM120.
-                fwd_cfg = FwdConfig(64, 16, True, True)
+                # RTX6000: qpkv8 (Gemma e2b) wins ~7% with N=32 vs N=16
+                # (shuffled-tile A/B); qpkv4 (e4b) stays best at N=16.
+                fwd_cfg = FwdConfig(64, 32 if qhead_per_kvhead == 8 else 16, True, True)
             elif sm120_d256_qregs128:
                 # Qwen-style D256 qpkv8/qpkv16 noncausal rows fit a wider N
                 # tile on SM120 only when Q is staged through registers.

@@ -281,3 +281,48 @@ should not lose track of them.
   S8192 causal D256 qpkv16 both flipped to parity or wins in targeted reruns.
   Do not add a dispatch condition for these rows without a new paired artifact
   that reproduces a stable miss.
+
+## 2026-06-02 — RTX PRO 6000 Blackwell migration
+
+Target GPU is now the **RTX PRO 6000 Blackwell Workstation Edition** (sm_120,
+**188 SMs**, 102 GB), not the 170-SM RTX 5090 (occupied by llama-server). Prior
+win.md numbers were 5090-tuned and do NOT transfer: FA2 scales better on the
+larger part, so backward FA4/FA2 is worse here (S2048 bwd geomean ~0.98 vs the
+5090's 1.034). Bench scripts read `SM120_BENCH_GPU` (GPU-33a7e490 = GPU 0,
+GPU-a861102e = GPU 3); 5090 asserts relaxed to any sm_120. Cross-impl repeats
+are very noisy at S1024 (clock-boost variance between FA2/FA4 subprocesses);
+trust the interleaved in-process A/B (within-round speedup_vs_auto).
+
+Commit 7a6e8c8 — D128 forward tile retune + qpkv2 backward split:
+- Forward broad map (3x, B=2) showed a systematic D128 forward loss
+  (**geomean 0.955** vs FA2; D256 fwd wins at 1.027). The `_SM120_TILE_LOOKUP`
+  D128 entries (5090-tuned) mostly used `(64,64,1)`, worse than even the generic
+  `(128,64)` fallback here. Retuned 7 entries (each matches auto within bf16 tol):
+  (128,4,1024,0)/(128,4,2048,0)/(128,4,4096,0) 64x64->128x64;
+  (128,4,4096,1) 64x96->128x48; (128,8,1024,1) 64x64->64x128;
+  (128,8,4096,0) 64x64->128x64 (1.28x vs auto); (128,8,4096,1) 64x64->128x64.
+  Net: **D128 fwd 0.955 -> ~1.00**, overall fwd 1.004 -> 1.021, D256 unchanged.
+- Backward: extended nonpacked-M-split eligibility to qpkv2 Gemma31
+  (Hq32/Hkv16) D256 S1024 causal -> split2, **+7.3% FA4** (was a 5090 regression).
+
+Follow-up D256 forward fixes:
+- qpkv6 D256 causal: qwen3.5-27b (Hq24/Hkv4) S4096 causal B=2 flips 0.976 ->
+  **1.067** vs FA2 by enabling the existing Q-in-regs `128x64_t256` schedule
+  (was gated to causal S8192 only; now S4096 too). S1024 causal is already
+  1.034 (the map's 0.959 was subprocess noise).
+- Gemma local D256: qpkv8 (Gemma e2b, window 512) local N tile 16 -> 32, ~+7%
+  among shuffled-tile A/B (S4096 1.08x, S8192 ~tied); qpkv4 (e4b) stays N=16
+  (it is competitive at N=16, only marginally better at N=64). These rows were
+  already >=1.04 vs FA2 in-process; the map's sub-1.0 was subprocess noise.
+
+Methodology note: sm120_fwd_exact_tile_ab.py measures `auto` first every round
+(not shuffled), so its speedup_vs_auto is cold-clock-biased upward; trust
+comparisons AMONG the shuffled explicit tiles, and validate net via the
+cross-impl re-map (which moved D128 fwd 0.955 -> ~1.00).
+
+Confirmed exhausted (RTX 6000, dispatch-level): D256 S2048 backward gaps are a
+hard 1-CTA/SM occupancy wall — 255 reg/thread is dominated by acc_dK/acc_dV
+(shape n_block x 256, independent of m_block); n_block=32 is rejected, so
+2 CTAs/SM is unreachable. qpkv4 S2048 split16 is already FA4-optimal here;
+qpkv8/qpkv2 S2048 splitting is flat/harmful. These need a kernel redesign,
+not tile/split dispatch.
