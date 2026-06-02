@@ -2934,6 +2934,7 @@ def _flash_attn_bwd(
                 pack_gqa_m_splits=pack_gqa_m_splits,
                 pack_gqa_all_rows_valid=pack_gqa_all_rows_valid,
                 skip_full_causal_mask=sm120_skip_full_causal_mask,
+                is_local=local,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(

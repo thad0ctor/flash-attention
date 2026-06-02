@@ -52,6 +52,7 @@ class FlashAttentionBackwardSm80:
         pack_gqa_m_splits: int = 1,
         pack_gqa_all_rows_valid: bool = False,
         skip_full_causal_mask: bool = False,
+        is_local: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -87,6 +88,7 @@ class FlashAttentionBackwardSm80:
         self.pack_gqa_m_splits = pack_gqa_m_splits
         self.pack_gqa_all_rows_valid = pack_gqa_all_rows_valid
         self.is_causal = is_causal
+        self.is_local = is_local
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
         self.SdP_swapAB = SdP_swapAB
@@ -606,6 +608,8 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            window_size_left,
+            window_size_right,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -650,6 +654,8 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1115,11 +1121,17 @@ class FlashAttentionBackwardSm80:
                 self.m_block_size, self.n_block_size, seqlen,
                 qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa) else 1,
                 r2p_compatible=r2p_compatible,
+                # Local/sliding-window masking. The backward must apply the same
+                # window the forward used; otherwise it recomputes the attention
+                # matrix with the wrong mask and produces garbage dK/dV/dQ. Only
+                # pass the window when local so the causal path is unchanged.
+                window_size_left=window_size_left if cutlass.const_expr(self.is_local) else None,
+                window_size_right=window_size_right if cutlass.const_expr(self.is_local) else None,
             )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal
+                mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local,
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)
