@@ -448,3 +448,7 @@ that won on a specific shape (re-test on 188-SM RTX 6000). Outcomes:
   static+qregs is the known wrong-output combo). qpkv6 S16384 causal fwd FA4/FA2
   0.956 -> 0.967.
 Mining confirms the earlier tuning was thorough — little overlooked speed remained.
+- fused-dKV broadening (B5): re-tested qpkv6 S1024 causal + D128 S8192-nc rows;
+  flat/noisy (qpkv6 median +0.9% but mean regressed on outliers; D128 nc tied).
+  No change. Net mining result: 1 of ~5 candidates recovered (F1, +1.6%);
+  the rest confirm the prior tuning was thorough.
