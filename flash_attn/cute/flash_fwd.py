@@ -915,7 +915,19 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(not seqlen.has_cu_seqlens_q):
             mQ_cur = mQ[None, None, num_head, batch_size]
         else:
-            mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
+            # Under pack_gqa, mode 0 of mQ is the composite (qhead_per_kvhead,
+            # seqlen_q). A scalar token offset_q against that composite is
+            # decomposed colexicographically by crd2idx (offset_q % qpkv,
+            # offset_q // qpkv), which advances the base pointer by the wrong
+            # amount for qpkv>1 and batch>0 -> garbage for varlen GQA seq>=1.
+            # Offset the seqlen sub-mode only (matches the O/LSE offset_batch_Q
+            # epilogue). MHA (qpkv=1) and batch 0 are unaffected.
+            q_offset = (
+                ((None, seqlen.offset_q), 0)
+                if const_expr(self.pack_gqa)
+                else (seqlen.offset_q, 0)
+            )
+            mQ_cur = cute.domain_offset(q_offset, mQ[None, None, num_head])
         # gK/gV are only used by the contiguous (non-paged) load path. For paged KV
         # the PagedKVManager indexes mK/mV directly via the page table.
         if const_expr(mPageTable is None):
