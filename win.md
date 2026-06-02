@@ -352,6 +352,13 @@ RTX 6000:
   hint can't help; the long-scoreboard stall is on smem->reg dependency chains,
   not the already-async gmem->smem copy. (Consistent with the 5090 rejection.)
 
+ONE new backward win: the smallest-grid causal row, gemma-e2b qpkv8 Hq8/Hkv1,
+still underfills at S2048 (~2.7 waves) and gains ~6% from nonpack split3
+(split3==split4 peak; flat by S4096 where the grid no longer underfills).
+Extended nonpack-split eligibility to (qpkv8 Hq8/Hkv1, S2048) -> split3;
+gradients match split1 within bf16 tol. The larger qpkv8 Hq16/Hkv2, qpkv6,
+qpkv2 rows do NOT benefit at S2048 (already tested, split flat/harmful).
+
 CONCLUSION: the D256 causal backward (~0.93-0.98 vs FA2 on the 188-SM RTX 6000)
 is at its practical limit for dispatch/knob tuning. The only remaining lever is
 a ground-up D256 backward redesign to break the 1-CTA/SM occupancy wall, e.g.

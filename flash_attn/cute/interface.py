@@ -2449,16 +2449,31 @@ def _flash_attn_bwd(
         and not local
         and head_dim == 256
         and head_dim_v == 256
-        and (
-            qhead_per_kvhead in (6, 8)
-            # RTX PRO 6000 (sm_120, 188 SMs): the qpkv2 Gemma31-style row
-            # (Hq32/Hkv16) also underfills at S1024 and gains ~7% from split2.
-            # This was a regression on the 170-SM RTX 5090 (mean/outliers) but
-            # is a clean median+mean win on the larger part.
-            or (qhead_per_kvhead == 2 and num_head == 32 and num_head_kv == 16)
-        )
         and seqlen_q == seqlen_k
-        and seqlen_q == 1024
+        and (
+            (
+                seqlen_q == 1024
+                and (
+                    qhead_per_kvhead in (6, 8)
+                    # RTX PRO 6000 (sm_120, 188 SMs): the qpkv2 Gemma31-style row
+                    # (Hq32/Hkv16) also underfills at S1024 and gains ~7% from
+                    # split2. This was a regression on the 170-SM RTX 5090
+                    # (mean/outliers) but is a clean median+mean win on the
+                    # larger part.
+                    or (qhead_per_kvhead == 2 and num_head == 32 and num_head_kv == 16)
+                )
+            )
+            # RTX 6000: the small-grid gemma-e2b row (qpkv8 Hq8/Hkv1, ~2.7 waves
+            # at S2048) still underfills and gains ~6% from split3; the larger
+            # qpkv8 Hq16/Hkv2, qpkv6, and qpkv2 rows do NOT benefit at S2048,
+            # and even Hq8/Hkv1 is flat by S4096 (grid no longer underfills).
+            or (
+                seqlen_q == 2048
+                and qhead_per_kvhead == 8
+                and num_head == 8
+                and num_head_kv == 1
+            )
+        )
         and m_block_size == 64
         and n_block_size == 64
         and cu_seqlens_q is None
