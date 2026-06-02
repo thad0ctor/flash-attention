@@ -2490,10 +2490,18 @@ def _flash_attn_bwd(
             elif is_qpkv8_h8:
                 sm120_nonpack_m_split = 3
         elif seqlen_q == 4096:
-            # Only the smallest grid still underfills at B=1 (+10%, split6);
-            # qpkv8 Hq16/Hkv2 and qpkv6 are filled by S4096 (flat).
+            # Only the smallest grids still underfill at B=1: qpkv8 Hq8/Hkv1
+            # (+10%, split6) and qpkv4 Hq8/Hkv2 (+7%, split4). qpkv8 Hq16/Hkv2,
+            # qpkv6, and qpkv4 Hq16/Hkv4 are filled by S4096 (flat).
             if batch_size == 1 and is_qpkv8_h8:
                 sm120_nonpack_m_split = 6
+            elif (
+                batch_size == 1
+                and qhead_per_kvhead == 4
+                and num_head == 8
+                and num_head_kv == 2
+            ):
+                sm120_nonpack_m_split = 4
         if sm120_nonpack_m_split_override:
             sm120_nonpack_m_split = max(1, int(sm120_nonpack_m_split_override))
     sm120_nonpack_m_split_eligible = sm120_nonpack_base_ok and sm120_nonpack_m_split > 1
