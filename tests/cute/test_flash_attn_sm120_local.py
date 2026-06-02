@@ -87,6 +87,48 @@ def test_sm120_hd256_local_forward_matches_reference(h_q, h_kv, window_left):
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    "h_q,h_kv,window_left",
+    [
+        (8, 1, 64),   # Gemma E2B-style qpkv=8
+        (8, 2, 64),   # Gemma E4B-style qpkv=4
+        (32, 16, 96), # Gemma 31B-style qpkv=2
+    ],
+)
+def test_sm120_hd256_local_backward_matches_reference(h_q, h_kv, window_left):
+    # Regression for the local/sliding-window BACKWARD: it previously applied
+    # only a causal mask (ignoring the window), so dq/dk/dv were garbage while
+    # the forward was correct. The forward-only test above did not catch it.
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 256, h_q, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 256, h_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 256, h_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dout = torch.randn(1, 256, h_q, 256, device="cuda", dtype=torch.bfloat16)
+
+    out = flash_attn_func(q, k, v, causal=True, window_size=(window_left, 0))
+    out = out[0] if isinstance(out, tuple) else out
+    out.backward(dout)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    _sliding_ref(q_ref, k_ref, v_ref, window_left).backward(dout)
+
+    # Relative tolerance: dk/dv aggregate qpkv q-heads into one KV head, so their
+    # magnitudes are large (e.g. ~11 for qpkv8); an absolute bound would be
+    # mis-scaled. bf16 backward lands ~6e-3 relative; 0.02 leaves margin.
+    def _rel(a, b):
+        return float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp(min=1e-3))
+
+    assert _rel(q.grad, q_ref.grad) < 0.02
+    assert _rel(k.grad, k_ref.grad) < 0.02
+    assert _rel(v.grad, v_ref.grad) < 0.02
+
+
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("hook_mode", ["k", "v", "both"])
 def test_sm120_qpkv5_d128_hook_forward_matches_sdpa(monkeypatch, hook_mode):
     _sm120_only()
