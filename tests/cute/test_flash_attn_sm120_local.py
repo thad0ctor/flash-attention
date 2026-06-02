@@ -128,6 +128,55 @@ def test_sm120_hd256_local_backward_matches_reference(h_q, h_kv, window_left):
     assert _rel(v.grad, v_ref.grad) < 0.02
 
 
+def _window_ref(q, k, v, window_left, window_right):
+    # Non-causal symmetric sliding window: keys in [i-window_left, i+window_right].
+    b, s, hq, d = q.shape
+    qpkv = hq // k.shape[2]
+    qf = q.float().transpose(1, 2)
+    kf = k.float().repeat_interleave(qpkv, dim=2).transpose(1, 2)
+    vf = v.float().repeat_interleave(qpkv, dim=2).transpose(1, 2)
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * (1.0 / math.sqrt(d))
+    q_idx = torch.arange(s, device=q.device)[:, None]
+    k_idx = torch.arange(s, device=q.device)[None, :]
+    mask = (k_idx >= q_idx - window_left) & (k_idx <= q_idx + window_right)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    return torch.matmul(torch.softmax(scores, dim=-1), vf).transpose(1, 2).to(q.dtype)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("window", [(128, 128), (256, 128), (128, 256)])
+def test_sm120_hd256_bidirectional_window_matches_reference(window):
+    # Regression for non-causal SYMMETRIC sliding windows (window_right>0). The
+    # forward re-processed the first n-block for rows whose right window reached
+    # the seqlen boundary (wrong output / NaN). Forward + backward.
+    _sm120_only()
+    from flash_attn.cute import flash_attn_func
+
+    wl, wr = window
+    torch.manual_seed(0)
+    q = torch.randn(2, 512, 16, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 512, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(2, 512, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dout = torch.randn(2, 512, 16, 256, device="cuda", dtype=torch.bfloat16)
+
+    out = flash_attn_func(q, k, v, causal=False, window_size=(wl, wr))
+    out = out[0] if isinstance(out, tuple) else out
+
+    def _rel(a, b):
+        return float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp(min=1e-3))
+
+    assert _rel(out, _window_ref(q, k, v, wl, wr)) < 0.02
+
+    out.backward(dout)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    _window_ref(q_ref, k_ref, v_ref, wl, wr).backward(dout)
+    assert _rel(q.grad, q_ref.grad) < 0.02
+    assert _rel(k.grad, k_ref.grad) < 0.02
+    assert _rel(v.grad, v_ref.grad) < 0.02
+
+
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("hook_mode", ["k", "v", "both"])
 def test_sm120_qpkv5_d128_hook_forward_matches_sdpa(monkeypatch, hook_mode):
