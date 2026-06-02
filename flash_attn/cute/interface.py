@@ -2184,6 +2184,20 @@ def _flash_attn_bwd(
         # regressions >2%.
         num_stages_Q = 1
         num_stages_dO = 1
+        # RTX 6000: D128 long-seq backward is under-pipelined at stages=1. Unlike
+        # D256 (which needs the smem alias and is capped at ns=1), D128 has room
+        # for a 2nd Q stage; at S>=8192 the long mainloop makes pipelining the Q
+        # loads a consistent ~2% win (controlled A/B; gradients match SDPA).
+        # Asymmetric (Q=2, dO=1) keeps smem under the 99KB cap (symmetric ns=2
+        # overflows and fails to launch). Short seq stays ns=1 (async overhead
+        # dominates the latency-hiding benefit there).
+        if (
+            head_dim <= 128
+            and head_dim_v <= 128
+            and cu_seqlens_q is None
+            and q.shape[1] >= 8192
+        ):
+            num_stages_Q = 2
         SdP_swapAB = False
         dKV_swapAB = False
         dQ_swapAB = False

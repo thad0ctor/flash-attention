@@ -404,3 +404,17 @@ Parallel design/analysis agents + GPU validation. Outcomes:
 NET: dispatch-level tuning is exhausted across forward AND backward on the RTX
 6000. Both residual gap classes (D256 causal large-grid bwd; D128 S8192-nc bwd)
 are smem/occupancy-walled and need a kernel redesign, not a dispatch knob.
+
+## 2026-06-02 — D128 long-seq backward asymmetric pipeline stage (kernel-config)
+
+Kernel-config win for the D128 S8192-nc backward gap: D128 (no smem alias) has
+room for a 2nd Q-load stage. Symmetric ns=2 overflows the 99KB cap (verified:
+cudaErrorInvalidValue at launch), but ASYMMETRIC num_stages_Q=2 / num_stages_dO=1
+fits (~98KB) and pipelines the Q loads. Gated to D128 dense S>=8192 (short seq
+regresses ~14% from async overhead, matching the original SM120 ns=1 rationale).
+Controlled in-process A/B (stages1 vs stages2, same inputs, interleaved): a
+consistent **+2.0% (nc) / +1.5% (causal)** FA4 speedup at S8192 across qpkv4/5/8,
+no regressions; gradients match fp32 SDPA. (The single-shot +26% and cross-impl
++6% were clock noise; +2% is the controlled truth.) Modest but real and safe;
+the D128 nc backward still trails FA2 (~0.85-0.88) — fully closing it needs the
+same kernel redesign as D256.
