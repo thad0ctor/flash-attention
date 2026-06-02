@@ -625,3 +625,19 @@ IMPLICATION: gaps #2 (gemma4-e4b causal) and #3 (small-S wide-GQA D256) from the
 campaign brief are PHANTOM. Gap #1 (D128 bwd large-S) is also phantom (parity
 in-process). Do NOT spend kernel/dispatch effort on these — verify any future
 "loss" in-process interleaved with adequate warmup BEFORE treating it as real.
+
+## 2026-06-02 — WIN: qwen3-14b S4096 causal D128 qpkv5 fwd tile 64x128 -> 128x64
+
+After correcting the harness, the ONE genuine forward loss confirmed in-process
+is qwen3-14b (Hq40/Hkv8 D128 qpkv5, non-pack -> TMA path) S4096 causal: steady-
+state ~0.906x vs FA2 (block0 cold reads 0.98 but sustained-load settles ~0.91).
+Tile sweep via an in-process env probe (interleaved, all variants same inputs):
+  cur(64,128,1)=0.906  128,64,1=0.932  128,48,1=0.907  64,96,1=0.892
+  64,64,1=0.823  128,128,1=0.608  128,32,1=0.831  64,64,2=0.828  128,64,1,256=0.932
+128x64 is best: +2.8% (0.906->0.932, fa4 1.6875->1.6414 ms), confirmed across two
+runs (1.028x and 1.045x vs cur). Still a slight loss vs FA2 but the gap is
+narrowed. Correctness: FA4 vs SDPA rel 9.3e-4 (bf16, PASS).
+
+SCOPE: changed ONLY the (128,5,4096,1) lookup cell. S1024 (cur 1.004x, already a
+win) and S8192 (cur 1.011x, already a win) REGRESS under 128x64 (0.916 / 0.972),
+so they keep 64x128. Surgical one-cell edit, interface.py. (commit pending)
