@@ -708,6 +708,18 @@ class FlashAttentionBackwardSm80:
                         (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
                         m_block_min,
                     )
+            if cutlass.const_expr(self.is_local):
+                # Local/sliding-window: only m-blocks whose queries attend keys in
+                # this n-block within the window are non-empty. Mirror
+                # BlockInfo.get_m_block_min_max. Without this the kernel processes
+                # the full S^2 triangle (correct but ~2-7x slower than FA2).
+                pack_f = self.qhead_per_kvhead if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa) else 1
+                if cutlass.const_expr(window_size_right is not None):
+                    m_idx_right = n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k - window_size_right
+                    m_block_min = max(m_block_min, (pack_f * m_idx_right) // self.m_block_size)
+                if cutlass.const_expr(window_size_left is not None):
+                    m_idx_left = (n_block + 1) * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k + window_size_left
+                    m_block_max = min(m_block_max, cute.ceil_div(pack_f * m_idx_left, self.m_block_size))
             if cutlass.const_expr(
                 getattr(self, "arch", 80) == 120
                 and self.pack_gqa_m_splits > 1
