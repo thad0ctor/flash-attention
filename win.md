@@ -418,3 +418,16 @@ no regressions; gradients match fp32 SDPA. (The single-shot +26% and cross-impl
 +6% were clock noise; +2% is the controlled truth.) Modest but real and safe;
 the D128 nc backward still trails FA2 (~0.85-0.88) — fully closing it needs the
 same kernel redesign as D256.
+
+## 2026-06-02 — DEFINITIVE: sm_120 has no tcgen05/TMEM/WGMMA (hardware limit)
+
+flash_fwd_sm120_tma.py header: sm_120 (consumer Blackwell, RTX PRO 6000 / 5090)
+has "No WGMMA, no tcgen05, no TMEM" — only SM80-era mma.sync.m16n8k16 tensor
+cores. Both fwd and bwd subclass the SM80 kernels (arch=80 for MMA selection).
+CONSEQUENCE: the flash_bwd_sm100 (tcgen05/UMMA, tensor-memory accumulators)
+approach CANNOT run on sm_120 — the instructions don't exist. With only mma.sync,
+the D256 backward accumulators (dK/dV/dQ) must be register-resident, so the
+255-reg / 1-CTA-per-SM occupancy wall is INTRINSIC to the hardware. There is no
+FA4 kernel redesign that breaks it on this GPU. The D256 causal large-grid
+backward (~0.93-0.98 vs FA2) is at its true hardware limit; all achievable wins
+are dispatch-level + the one D128 long-seq stage config. Campaign complete.
