@@ -1306,7 +1306,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                         seqlen, m_block, n_block_min
                     )
-                unmasked_n_block_start = n_block_min_causal_local_mask
+                # The first n_block (n_block_max - 1) was already processed above
+                # (is_first_n_block). For non-causal local with a right window that
+                # reaches the seqlen boundary, get_n_block_min_causal_local_mask can
+                # return a value >= n_block_max, which would make the unmasked loop
+                # below re-process the first block (double-count) or read an
+                # out-of-range block (NaN). Clamp the unmasked start to n_block_max-1.
+                # (No-op for causal/causal-local, where it is already <= n_block_max-1;
+                # cf. flash_fwd_sm90.py which caps n_block_max for the same reason.)
+                unmasked_n_block_start = cutlass.min(n_block_min_causal_local_mask, n_block_max - 1)
                 for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 2 - n_tile
                     compute_one_n_block(
