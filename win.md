@@ -357,8 +357,11 @@ backward grid ~ceil(S/64)*B*Hq underfills the 188 SMs, <~3 waves):
 - B>=2 S2048: only the smallest grid, qpkv8 Hq8/Hkv1 (gemma-e2b, ~2.7 waves),
   still underfills -> nonpack split3 (+6%). Larger qpkv8 Hq16/Hkv2, qpkv6,
   qpkv2 are filled at B>=2 S2048 (split flat/harmful, unchanged).
-- B=1 S2048 (grid halved): qpkv6 AND qpkv8 (Hq8/Hkv1, Hq16/Hkv2, Hq24/Hkv4) all
-  underfill -> split4 (+4% to +9%).
+- B=1 S2048 (grid halved): the small-grid rows (num_head<=24) all underfill ->
+  split4 (+4% to +9%): qpkv6 Hq24/Hkv4, qpkv8 Hq8/Hkv1 + Hq16/Hkv2, and qpkv4
+  Hq8/Hkv2 (+9.3%) + Hq16/Hkv4 (+7.7%). qpkv4 at B=1 is NOT auto-packed (pack
+  needs B=2) and prefers nonpack split4 over packed split16 here. Larger-Hq
+  rows (e.g. qpkv4 Hq32/Hkv8, ~5 waves) are filled and left unsplit.
 - B=1 S4096: only qpkv8 Hq8/Hkv1 still underfills -> split6 (+10%); qpkv8
   Hq16/Hkv2 and qpkv6 are filled by S4096 (flat, unchanged).
 - B=1 S1024: the tiny B=1 grid wants MORE splits than the B>=2-tuned defaults:

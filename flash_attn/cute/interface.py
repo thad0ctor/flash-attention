@@ -2480,9 +2480,12 @@ def _flash_attn_bwd(
             elif qhead_per_kvhead in (6, 8) or is_qpkv2_gemma31:
                 sm120_nonpack_m_split = 2
         elif seqlen_q == 2048:
-            # B=1 halves the grid so qpkv6/qpkv8 still underfill (+4-9%, split4);
-            # at B>=2 only the smallest grid (qpkv8 Hq8/Hkv1) underfills (+6%).
-            if batch_size == 1 and qhead_per_kvhead in (6, 8):
+            # B=1 halves the grid so the small-grid qpkv4/qpkv6/qpkv8 rows
+            # (num_head<=24, ~<3 waves) still underfill and gain +4-9% from
+            # split4; qpkv4 at B=1 prefers nonpack split4 over packing here.
+            # At B>=2 only the smallest grid (qpkv8 Hq8/Hkv1) underfills (+6%,
+            # split3); larger qpkv4/6/8 rows are filled (split flat/harmful).
+            if batch_size == 1 and qhead_per_kvhead in (4, 6, 8) and num_head <= 24:
                 sm120_nonpack_m_split = 4
             elif is_qpkv8_h8:
                 sm120_nonpack_m_split = 3
