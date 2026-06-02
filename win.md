@@ -537,3 +537,23 @@ varlen gaps were re-investigated per-file/in-isolation:
 CONCLUSION: no real sm_120 feature gaps among these — the kernels work. The
 failures are a pre-existing test-batching artifact; run via the documented
 two-pass workflow or smaller per-process batches. Not a kernel fix.
+
+## 2026-06-02 — CORRECTION + FIX: the "feature gaps" were a real varlen+GQA bug
+
+My earlier "test-batching contamination" diagnosis was WRONG. Re-investigation
+(FA4 varlen vs FA4 dense batch=N, the gold comparison) found a REAL bug:
+varlen + GQA (qpkv>1) forward returned GARBAGE for sequence index >= 1 (seq0 OK,
+seq1+ rel ~1.0), for ALL head dims; MHA correct. Root cause: flash_fwd.py:918
+offset the pack_gqa composite mode 0 (qpkv, seqlen_q) with a SCALAR token
+offset_q -> crd2idx decomposes it colexicographically -> wrong packed-Q base for
+qpkv>1, batch>0. Fix (d27ebd0): offset the seqlen sub-mode ((None, offset_q), 0)
+when pack_gqa, matching the O/LSE offset_batch_Q epilogue.
+
+Validation: varlen GQA/MQA (qpkv4/8, D64/128/256, causal+nc, 2/3/4 seqs) now
+rel 0.0 vs dense (was ~1.0); backward already correct; MHA unchanged. The FULL
+varlen test passes 96/96 in one batch run -> there was NO contamination; the
+combine failures were cascade from the GQA garbage corrupting the process. This
+is a HIGH-IMPACT fix: GQA + packed/varlen sequences is ubiquitous, and it was
+silently wrong for all but the first sequence on sm_120. General fix (all arches
+on flash_fwd.py). Only remaining cute-test failure: marginal pre-existing qpkv16
+backward tolerance (0.0553 vs 0.05).
