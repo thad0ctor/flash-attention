@@ -501,3 +501,18 @@ Probed backward feature combos the benchmark suite never exercised (vs SDPA):
   mis-handles it. No target model uses symmetric bidirectional windows (gemma
   is causal-local), so low priority; needs a separate forward-kernel fix.
   Common cases (causal, causal-local/sliding-window, full, softcap) are correct.
+
+## 2026-06-02 — FIXED: non-causal symmetric bidirectional window (forward+backward)
+
+The bidirectional-window bug (window_left>0 AND window_right>0) is now FIXED
+(commit 318eccb). Root cause: the SM80-base forward (flash_fwd.py, used by SM120
+non-TMA / D256) re-processed the first n-block for query rows where
+i+window_right >= seqlen — get_n_block_min_causal_local_mask returns >= n_block_max
+there, so the unmasked Phase-3 loop re-ran the already-processed first block
+(double-count -> wrong; out-of-range read -> NaN for large window_right). Only
+those boundary rows were affected; causal/causal-local/full were correct. SM90
+already caps n_block_max the same way. Fix: clamp unmasked_n_block_start to
+n_block_max-1 (no-op for causal). Forward out_rel 0.44->~2e-3; backward
+grad_rel ~3-5e-3 (the window_right wiring from the local-backward fix already
+handled the backward). Regression tests added (local backward + bidirectional).
+This is a general fix for all arches using flash_fwd.py, not SM120-specific.
