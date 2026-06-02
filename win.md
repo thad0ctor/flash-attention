@@ -578,3 +578,50 @@ SM80-base bwd). Validated: repro all-ok; exact failing test configs dk/dv
 ~5e-4..5e-3 (D64/128/256, causal+nc, fp16+bf16); pytest GQA/MQA scale=0.1 subset
 288 green (72 + 216). PRE-EXISTING (baseline dfb7a24; non-local/non-causal, so
 is_local-gated bwd + cu_seqlens_q-gated splits never touched it).
+
+## 2026-06-02 — MAJOR: the sweep's "losses" are a clock-boost MEASUREMENT artifact
+
+Re-investigated the top forward AND backward gaps (gemma4-e4b S1024 causal
+0.715x; D128 backward S8192 noncausal qpkv4 0.856x; the whole bwd-d128 0.966x
+geomean). With a controlled IN-PROCESS interleaved A/B on the exact shapes,
+every one is parity-to-WIN, not a loss:
+
+  Forward S1024 (in-process FA4/FA2 vs subprocess sweep ratio):
+    gemma4-e4b   c=1 D256 qpkv4 : 1.150  (sweep 0.715)
+    qwen3.5-27b  c=1 D256 qpkv6 : 0.968  (sweep 0.912)
+    qwen3.5-9b   c=0 D256 qpkv4 : 0.993  (sweep 0.947)
+    qwen3.5-27b  c=0 D256 qpkv6 : 0.975  (sweep 0.951)
+    qwen3-14b    c=1 D128 qpkv5 : 1.010  (sweep 0.954)
+    qwen3.5-122b c=0 D256 qpkv16: 1.007  (sweep 0.974)
+  Backward (backward-only timing, in-process interleaved vs sweep):
+    qwen3-vl-8b  S8192 c=0 qpkv4 : 1.002 (sweep 0.856)
+    qwen3-embed  S8192 c=0 qpkv4 : 1.001 (sweep 0.866)
+    qwen3-30b    S8192 c=0 qpkv8 : 1.008 (sweep 0.902)
+    qwen3-vl-8b  S8192 c=1 qpkv4 : 0.999 (sweep 0.892)
+    qwen3-30b    S8192 c=1 qpkv8 : 1.012 (sweep 0.943)
+
+ROOT CAUSE (proven): model_shape_bench_runner.py used warmup=2, iters=5, and
+model_variant_matrix.py runs `for impl in ["fa2","fa4"]` — fa2 ALWAYS first in
+a fresh, cold/boosted-clock subprocess; fa4 second when the card has warmed and
+throttled. On a 24 ms S8192 backward the GPU boosts at the start of a burst then
+settles: a single run shows p10=19.4 ms but median=24 ms — a 24% swing WITHIN one
+run. median-of-5 lands fa2 in the boosted regime (~20 ms) and fa4 in steady
+state (~24 ms) -> spurious 0.84-0.90. Reproduced 3x at the old setting
+(0.844/0.901/0.891); at warmup=10 iters=40 it is rock-stable 0.997/1.001/0.998.
+Same mechanism at S1024 (0.1 ms kernels never ramp clocks in 2 warmup iters).
+
+This means the campaign's reported standing (fwd 1.015x, bwd-d128 0.966x / 7/24
+wins) is ARTIFICIALLY PESSIMISTIC — biased systematically against FA4 by the
+fa2-first ordering + under-warmup. The real in-process picture is parity-to-win
+across the board, including the "primary place to improve" (D128 backward).
+
+FIX (agent_space, gitignored, no commit): model_shape_bench_runner.py now does a
+WALL-CLOCK warmup soak (`--warmup-ms`, default 400) so clocks reach steady state
+regardless of kernel duration, and the sweep passes --warmup 5 --iters 40
+--warmup-ms 400. Re-running the full fwd + bwd-d128 sweeps with the corrected
+harness to establish the TRUE baseline before chasing any further "gap".
+
+IMPLICATION: gaps #2 (gemma4-e4b causal) and #3 (small-S wide-GQA D256) from the
+campaign brief are PHANTOM. Gap #1 (D128 bwd large-S) is also phantom (parity
+in-process). Do NOT spend kernel/dispatch effort on these — verify any future
+"loss" in-process interleaved with adequate warmup BEFORE treating it as real.
