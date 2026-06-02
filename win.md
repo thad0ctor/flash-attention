@@ -326,3 +326,36 @@ hard 1-CTA/SM occupancy wall — 255 reg/thread is dominated by acc_dK/acc_dV
 2 CTAs/SM is unreachable. qpkv4 S2048 split16 is already FA4-optimal here;
 qpkv8/qpkv2 S2048 splitting is flat/harmful. These need a kernel redesign,
 not tile/split dispatch.
+
+## 2026-06-02 — overnight backward campaign: full lever sweep on RTX 6000
+
+Backward maps (5x cross-impl): the backward problem is CAUSAL-specific.
+S2048 noncausal geomean 1.046 (28/40 wins, healthy); S2048 causal 0.979 and
+S4096 causal 0.980 (12/40 wins). Consistent causal losers across S2048+S4096:
+qpkv4 (0.93 Hq8 / 0.965 Hq16), qpkv8 (0.974), qpkv2 (0.977); winners are
+qpkv16/qpkv6. (Only noncausal loser: qwen3.5-9b qpkv4 S2048 nc 0.967.)
+
+Every safe lever for the causal S2048/S4096 gaps was tested and REJECTED on the
+RTX 6000:
+- nonpack M-split at S2048/S4096 (all qpkv): flat-to-harmful (split hurts ~2-4%);
+  the underfill that makes split help only exists at S1024. Keep split S1024-only.
+- packed-GQA split for qpkv4 S4096 causal: all splits slower than unpacked
+  (off/mode 0.95-1.0). Keep qpkv4 packed only at S1024/S2048.
+- mask-skip at S2048/S4096 causal (all qpkv): "on" is ~4% SLOWER than off
+  (speed_vs_off 0.96-0.98, wins 0-9/40). Keep mask-skip S1024-only.
+- RS-dKV (Mma_dKV_is_RS) kernel change: REJECTED by analysis — holding P/dS in
+  registers would add ~+512 reg/thread (registers are already the binding cap),
+  sP/sdS smem isn't even conditionally freed, and it needs a deep softmax-loop
+  rewrite. Would worsen the occupancy wall, not fix it.
+- cp.async cache policy (GLOBAL->ALWAYS): rejected on reasoning — K/V/Q/dO are
+  read ONCE from gmem into smem (reused from smem, not gmem), so the L1 cache
+  hint can't help; the long-scoreboard stall is on smem->reg dependency chains,
+  not the already-async gmem->smem copy. (Consistent with the 5090 rejection.)
+
+CONCLUSION: the D256 causal backward (~0.93-0.98 vs FA2 on the 188-SM RTX 6000)
+is at its practical limit for dispatch/knob tuning. The only remaining lever is
+a ground-up D256 backward redesign to break the 1-CTA/SM occupancy wall, e.g.
+a Blackwell-native UMMA/tcgen05 backward (cf. flash_bwd_sm100) or a head_dim-
+split dK/dV accumulation to cut register pressure. That is a multi-day project,
+not overnight tuning. The one overnight backward win was qpkv2 Gemma31 S1024
+causal -> split2 (committed 7a6e8c8).
