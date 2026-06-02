@@ -584,6 +584,14 @@ def test_sm120_hd256_backward_matches_sdpa(causal, h_q, h_kv, pack_gqa):
 
     dk_ref = k_ref.grad.view(1, 128, h_kv, repeat, 256).sum(dim=3)
     dv_ref = v_ref.grad.view(1, 128, h_kv, repeat, 256).sum(dim=3)
-    assert (q.grad.float() - q_ref.grad).abs().max().item() < 0.05
-    assert (k.grad.float() - dk_ref).abs().max().item() < 0.05
-    assert (v.grad.float() - dv_ref).abs().max().item() < 0.05
+
+    # Relative tolerance: dk/dv aggregate `repeat` (= qpkv) q-heads into one KV
+    # head, so their magnitude grows with qpkv (e.g. ~18 at qpkv16). A fixed
+    # absolute bound is mis-scaled and falsely fails qpkv16 (abs 0.055 = rel
+    # ~3e-3). bf16 backward lands ~3e-3 relative.
+    def _rel(a, b):
+        return (a.float() - b).abs().max().item() / b.float().abs().max().clamp(min=1e-3).item()
+
+    assert _rel(q.grad, q_ref.grad) < 0.02
+    assert _rel(k.grad, dk_ref) < 0.02
+    assert _rel(v.grad, dv_ref) < 0.02
