@@ -667,3 +667,20 @@ kernel deficit. Gap #1 (D128 bwd large-S noncausal qpkv4) is confirmed PHANTOM
 unmeasurable under current contention; defer to a clean-GPU session (candidate
 lever: nonpack M-split for the underfilled small-S grid, see
 [[sm120-backward-split-underfill-principle]]). No kernel change warranted now.
+
+## 2026-06-02 — S1024 backward RESOLVED: parity-to-WIN, not a loss
+
+Settled the S1024 D128 backward question with 20 interleaved blocks,
+warmup=5/iters=40 (agent_space/sm120_bwd_s1024_settle.py). Despite the user's
+concurrent bench_nvfp4 contention, the median over 20 blocks is a clean WIN:
+  qwen3-vl  c=0 qpkv4 = 1.027 IQR[1.014,1.061]
+  qwen3-vl  c=1 qpkv4 = 1.044 IQR[1.024,1.106]
+  qwen3-30b c=1 qpkv8 = 1.041 IQR[1.009,1.116]
+  qwen3-embed c=1 qpkv4= 1.048 IQR[0.999,1.082]
+The earlier 0.78-0.84 readings were undersampling (5 blocks, fewer iters).
+
+DEFINITIVE: backward D128 is parity-to-WIN at EVERY seqlen (S1024/4096/8192).
+There is NO real backward-D128 gap to close — the entire "0.966 / 7-of-24 net
+loss, primary place to improve" premise was 100% the clock-boost + fa2-first
+measurement artifact. No backward kernel/dispatch work is warranted on D128.
+The nonpack-M-split lever (D256-only anyway) is NOT needed here.
