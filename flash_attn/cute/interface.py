@@ -2471,7 +2471,11 @@ def _flash_attn_bwd(
         )
         if seqlen_q == 1024:
             # qpkv2 Gemma31 was a 5090 regression but a clean S1024 win here.
-            if is_qpkv8_h8:
+            # B=1 halves the grid, so both qpkv8 rows (Hq8/Hkv1 and Hq16/Hkv2)
+            # want split4 (+6% / +9% vs the B>=2-tuned split3 / split2).
+            if batch_size == 1 and qhead_per_kvhead == 8:
+                sm120_nonpack_m_split = 4
+            elif is_qpkv8_h8:
                 sm120_nonpack_m_split = 3
             elif qhead_per_kvhead in (6, 8) or is_qpkv2_gemma31:
                 sm120_nonpack_m_split = 2

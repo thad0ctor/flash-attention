@@ -361,6 +361,9 @@ backward grid ~ceil(S/64)*B*Hq underfills the 188 SMs, <~3 waves):
   underfill -> split4 (+4% to +9%).
 - B=1 S4096: only qpkv8 Hq8/Hkv1 still underfills -> split6 (+10%); qpkv8
   Hq16/Hkv2 and qpkv6 are filled by S4096 (flat, unchanged).
+- B=1 S1024: the tiny B=1 grid wants MORE splits than the B>=2-tuned defaults:
+  qpkv8 Hq8/Hkv1 split3->split4 (+6%), qpkv8 Hq16/Hkv2 split2->split4 (+9%).
+  qpkv6/qpkv2 B=1 S1024 are marginal (kept at split2). B>=2 S1024 keeps 3/2/2.
 All gradients match split1 within bf16 tol. The nonpack policy was refactored
 into a single batch/seqlen/shape-gated block; the env override
 FLASH_ATTENTION_SM120_BWD_NONPACK_M_SPLITS now works for any D256-causal-nonpack
