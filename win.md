@@ -641,3 +641,29 @@ narrowed. Correctness: FA4 vs SDPA rel 9.3e-4 (bf16, PASS).
 SCOPE: changed ONLY the (128,5,4096,1) lookup cell. S1024 (cur 1.004x, already a
 win) and S8192 (cur 1.011x, already a win) REGRESS under 128x64 (0.916 / 0.972),
 so they keep 64x128. Surgical one-cell edit, interface.py. (commit pending)
+
+## 2026-06-02 — TRUE backward-d128 standing (in-process, contention-robust)
+
+Built an in-process interleaved full bwd-d128 matrix (agent_space/
+sm120_bwd_d128_inproc_matrix.py) to bypass the subprocess clock-boost artifact.
+Headline geomean reads 0.95 / 6-of-24, BUT that is dragged entirely by the
+S1024 cells, which are NOISE-dominated (1-1.6 ms multi-launch kernels; the same
+cell read 0.84 in the matrix and 1.00 in an earlier verify). With adequate
+warmup(4)/iters(20), the real-weight cells are at PARITY:
+
+  S8192 (all 8 cells): 0.982-1.010   -> parity
+  S4096 (focused reconfirm, 8 interleaved blocks):
+    qwen3-vl  c=1 qpkv4 = 0.992   qwen3-30b c=1 qpkv8 = 1.016
+    qwen3-vl  c=0 qpkv4 = 0.993
+  S1024: 0.79-1.07, unstable -> not reliably measurable (esp. under the user's
+    concurrent bench_nvfp4 GPU-cycling job; qwen3-30b S4096 spread was
+    0.368-2.844 single-block, median still recovered 1.016).
+
+CONCLUSION: backward D128 is at parity for all training-relevant seqlens
+(S>=4096). The campaign brief's "backward D128 is a net LOSS (0.966, 7/24),
+primary place to improve" was the measurement artifact + S1024 noise, NOT a real
+kernel deficit. Gap #1 (D128 bwd large-S noncausal qpkv4) is confirmed PHANTOM
+(S8192 nc qpkv4 = 0.993-1.001). S1024 backward MAY have a small real loss but is
+unmeasurable under current contention; defer to a clean-GPU session (candidate
+lever: nonpack M-split for the underfilled small-S grid, see
+[[sm120-backward-split-underfill-principle]]). No kernel change warranted now.
