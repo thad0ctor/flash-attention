@@ -472,3 +472,18 @@ change is D128-only, the tile changes are forward-only). Flagged for separate
 investigation — likely FA4-cute local backward never applies the K/V window mask
 to dK/dV/dQ. The benchmark suite never caught it (gemma was benched local-FORWARD
 and full-causal-BACKWARD only). Not a regression introduced here.
+
+## 2026-06-02 — FIXED: SM120/SM80 local/sliding-window backward (correctness + speed)
+
+The discovered pre-existing local-backward bug is now FIXED (2 commits):
+- c29cc0e (correctness): backward never applied the window (mask_causal only,
+  window params dead). For a local request causal resolves False, so it
+  recomputed FULL attention vs the windowed-forward LSE -> garbage grads. Added
+  is_local + threaded window_size into the device kernel + apply the window in
+  the recompute mask. gemma-local backward grad_rel ~3e-3 (was ~1490x) vs SDPA;
+  causal/full byte-identical (no-op when not local).
+- 50cc3b6 (speed): the correctness fix left the m-range full (S^2 triangle),
+  making local bwd 2-7x slower than FA2. Added the windowed m-block range
+  (mirror BlockInfo.get_m_block_min_max), gated `if self.is_local`. Local bwd
+  FA4/FA2 now 0.87 (S2048) / 0.94 (S4096) / 1.01 (S8192) -- 1.9-8.5x faster,
+  competitive-to-winning vs FA2. SM90/SM100 unaffected (separate files).
