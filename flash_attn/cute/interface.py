@@ -1284,7 +1284,12 @@ def _flash_attn_fwd(
         sm120_qpkv6_d256_load_hooks
         and causal
         and sm120_seq_q == sm120_seq_k
-        and sm120_seq_q in (32768, 65536)
+        # RTX 6000: S16384 added. Static causal block bounds was a regression on
+        # the 5090 at S16384 but is a clean +1.6% here (controlled A/B); this
+        # B=2 row uses no Q-regs (qregs is B=2 S4096/8192 only), so the
+        # qregs+static wrong-output combo does not apply. Gain scales with S
+        # (+1.6% S16384, +2.8% S32768). S8192 excluded (qregs is on there).
+        and sm120_seq_q in (16384, 32768, 65536)
     )
     if sm120_qpkv6_d256_static_causal_env in {"1", "true", "on", "yes"}:
         sm120_qpkv6_d256_static_causal_blocks = (

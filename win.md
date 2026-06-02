@@ -431,3 +431,20 @@ the D256 backward accumulators (dK/dV/dQ) must be register-resident, so the
 FA4 kernel redesign that breaks it on this GPU. The D256 causal large-grid
 backward (~0.93-0.98 vs FA2) is at its true hardware limit; all achievable wins
 are dispatch-level + the one D128 long-seq stage config. Campaign complete.
+
+## 2026-06-02 — history-mining pass: recover overlooked shape wins
+
+Mined the full reject/supersede commit history + win.md for 5090-dropped configs
+that won on a specific shape (re-test on 188-SM RTX 6000). Outcomes:
+- N32 backward path (small-grid Gemma qpkv8/qpkv6, B3): re-REJECTED — 10-17%
+  slower than the current N64+nonpack-split default (split beats N32 for underfill).
+- qpkv4 Hq16/Hkv4 S1024 packed split16 (B4): TIED with current split8 (+0.09%);
+  the 5090 outlier instability is just parity here. No change.
+- qpkv6 D256 S16384 causal FORWARD static causal block bounds (F1): RECOVERED.
+  Was a regression on the 5090 (rejected at S16384) but a clean GPU-specific
+  flip here: +1.6% (controlled A/B; output bit-identical, max_abs_diff=0). Gain
+  scales with S (+0.65% S8192, +1.6% S16384, +2.8% S32768). Added S16384 to the
+  default (S32768/65536 already shipped). S8192 excluded (qregs is on there;
+  static+qregs is the known wrong-output combo). qpkv6 S16384 causal fwd FA4/FA2
+  0.956 -> 0.967.
+Mining confirms the earlier tuning was thorough — little overlooked speed remained.
