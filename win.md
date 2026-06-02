@@ -452,3 +452,23 @@ Mining confirms the earlier tuning was thorough — little overlooked speed rema
   flat/noisy (qpkv6 median +0.9% but mean regressed on outliers; D128 nc tied).
   No change. Net mining result: 1 of ~5 candidates recovered (F1, +1.6%);
   the rest confirm the prior tuning was thorough.
+
+## 2026-06-02 — double-check (correctness audit of all campaign changes)
+
+Holistic correctness sweep (FA4 vs fp32 SDPA / FA2) across every shape touched
+this campaign: 11/12 PASS within bf16 tol (out_rel ~2-3e-3, grad_rel ~3-5e-3) —
+D128 fwd tiles, D128 S8192 stages2, D256 qpkv6 qregs, qpkv6 S16384 static
+(out bit-identical), all backward splits (qpkv2/4/6/8, B=1 & B=2). The gemma
+qpkv8 D256 LOCAL row: my change was the FORWARD tile (64x16->64x32) and its
+FORWARD output is correct (matches FA2, out_rel 1e-3).
+
+DISCOVERED — PRE-EXISTING (NOT from this campaign): FA4-cute local/sliding-window
+BACKWARD gradients diverge ~1490x from FA2/SDPA (forward is correct) for the
+gemma local shape (qpkv8 Hq8/Hkv1 D256, window 512), for both causal=True+ws and
+causal=False+ws invocations. CONFIRMED present at dfb7a24 (campaign baseline) with
+identical dq_rel=1.49e3, so it predates all campaign commits. My changes never
+touch the local backward path (nonpack splits are `not local`-gated, the stages
+change is D128-only, the tile changes are forward-only). Flagged for separate
+investigation — likely FA4-cute local backward never applies the K/V window mask
+to dK/dV/dQ. The benchmark suite never caught it (gemma was benched local-FORWARD
+and full-causal-BACKWARD only). Not a regression introduced here.
