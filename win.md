@@ -487,3 +487,17 @@ The discovered pre-existing local-backward bug is now FIXED (2 commits):
   (mirror BlockInfo.get_m_block_min_max), gated `if self.is_local`. Local bwd
   FA4/FA2 now 0.87 (S2048) / 0.94 (S4096) / 1.01 (S8192) -- 1.9-8.5x faster,
   competitive-to-winning vs FA2. SM90/SM100 unaffected (separate files).
+
+## 2026-06-02 — sibling-bug hunt after the local-backward fix
+
+Probed backward feature combos the benchmark suite never exercised (vs SDPA):
+- D256 local non-causal, D128 local causal, softcap causal, softcap+local:
+  all CORRECT now (grad_rel ~3-4e-3) — the local-backward fix is robust and
+  composes with softcap and D128.
+- DISCOVERED (separate, PRE-EXISTING, uncommon): symmetric BIDIRECTIONAL window
+  (window_size_left>0 AND window_size_right>0, non-causal) is wrong in the
+  FA4-cute FORWARD (FA4 vs SDPA out_rel 0.34; FA2 correct at 0.0025), so the
+  backward inherits it. The forward threads window_size_right through but
+  mis-handles it. No target model uses symmetric bidirectional windows (gemma
+  is causal-local), so low priority; needs a separate forward-kernel fix.
+  Common cases (causal, causal-local/sliding-window, full, softcap) are correct.
