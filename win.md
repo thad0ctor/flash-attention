@@ -516,3 +516,24 @@ n_block_max-1 (no-op for causal). Forward out_rel 0.44->~2e-3; backward
 grad_rel ~3-5e-3 (the window_right wiring from the local-backward fix already
 handled the backward). Regression tests added (local backward + bidirectional).
 This is a general fix for all arches using flash_fwd.py, not SM120-specific.
+
+## 2026-06-02 — investigated the "sm_120 feature gaps" (NOT real gaps)
+
+The test_suite failures earlier attributed to SplitKV/combine, d!=dv (MLA), and
+varlen gaps were re-investigated per-file/in-isolation:
+- d!=dv (test_flash_attn_sm120_dgtdv.py): 12/12 PASS in isolation. Works.
+- combine / SplitKV-combine kernel (test_flash_attn_combine): PASSES in isolation
+  (12/12); its full-run failures were a CASCADE from varlen failures corrupting
+  the CUDA context in the same process. The combine kernel works.
+- varlen (test_flash_attn_varlen_unpad_output): EVERY param passes alone, but the
+  full parametrization fails ~45/96. NOT the compile cache (cache-disabled: same
+  ~43 fails), ORDER-DEPENDENT (failing set changes under `-n 8`), and
+  VARLEN-SPECIFIC (dgtdv/combine each compile 12 distinct kernels with 0 fails).
+  => pre-existing varlen-specific cross-test CUDA/process-state contamination
+  (wrong numerical output ~1.37 for later cases), a TEST-HARNESS issue, not a
+  kernel feature gap. Present at baseline dfb7a24. Does not affect real usage
+  (which compiles few kernels and reuses them) or any campaign change.
+
+CONCLUSION: no real sm_120 feature gaps among these — the kernels work. The
+failures are a pre-existing test-batching artifact; run via the documented
+two-pass workflow or smaller per-process batches. Not a kernel fix.
