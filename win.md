@@ -352,12 +352,19 @@ RTX 6000:
   hint can't help; the long-scoreboard stall is on smem->reg dependency chains,
   not the already-async gmem->smem copy. (Consistent with the 5090 rejection.)
 
-ONE new backward win: the smallest-grid causal row, gemma-e2b qpkv8 Hq8/Hkv1,
-still underfills at S2048 (~2.7 waves) and gains ~6% from nonpack split3
-(split3==split4 peak; flat by S4096 where the grid no longer underfills).
-Extended nonpack-split eligibility to (qpkv8 Hq8/Hkv1, S2048) -> split3;
-gradients match split1 within bf16 tol. The larger qpkv8 Hq16/Hkv2, qpkv6,
-qpkv2 rows do NOT benefit at S2048 (already tested, split flat/harmful).
+NEW backward wins via the grid-underfill principle (split helps only when the
+backward grid ~ceil(S/64)*B*Hq underfills the 188 SMs, <~3 waves):
+- B>=2 S2048: only the smallest grid, qpkv8 Hq8/Hkv1 (gemma-e2b, ~2.7 waves),
+  still underfills -> nonpack split3 (+6%). Larger qpkv8 Hq16/Hkv2, qpkv6,
+  qpkv2 are filled at B>=2 S2048 (split flat/harmful, unchanged).
+- B=1 S2048 (grid halved): qpkv6 AND qpkv8 (Hq8/Hkv1, Hq16/Hkv2, Hq24/Hkv4) all
+  underfill -> split4 (+4% to +9%).
+- B=1 S4096: only qpkv8 Hq8/Hkv1 still underfills -> split6 (+10%); qpkv8
+  Hq16/Hkv2 and qpkv6 are filled by S4096 (flat, unchanged).
+All gradients match split1 within bf16 tol. The nonpack policy was refactored
+into a single batch/seqlen/shape-gated block; the env override
+FLASH_ATTENTION_SM120_BWD_NONPACK_M_SPLITS now works for any D256-causal-nonpack
+shape (no dirty edits needed to probe new shapes).
 
 CONCLUSION: the D256 causal backward (~0.93-0.98 vs FA2 on the 188-SM RTX 6000)
 is at its practical limit for dispatch/knob tuning. The only remaining lever is

@@ -2441,7 +2441,13 @@ def _flash_attn_bwd(
     sm120_nonpack_m_split_override = os.environ.get(
         "FLASH_ATTENTION_SM120_BWD_NONPACK_M_SPLITS", ""
     )
-    sm120_nonpack_m_split_eligible = (
+    # SM120 nonpacked causal-D256 M-split policy (RTX PRO 6000, 188 SMs).
+    # Splitting the nonpacked M loop adds CTAs and only helps when the backward
+    # grid (~ceil(S/64) * B * Hq CTAs) underfills the SMs (<~3 waves); the split
+    # counts below are the measured per-shape A/B peaks, gated to the rows that
+    # win. Larger-grid rows are flat/harmful and left unsplit. This avoids the
+    # rejected N32 / explicit-PackGQA changes.
+    sm120_nonpack_base_ok = (
         arch // 10 == 12
         and not pack_gqa
         and q.dtype == torch.bfloat16
@@ -2450,30 +2456,6 @@ def _flash_attn_bwd(
         and head_dim == 256
         and head_dim_v == 256
         and seqlen_q == seqlen_k
-        and (
-            (
-                seqlen_q == 1024
-                and (
-                    qhead_per_kvhead in (6, 8)
-                    # RTX PRO 6000 (sm_120, 188 SMs): the qpkv2 Gemma31-style row
-                    # (Hq32/Hkv16) also underfills at S1024 and gains ~7% from
-                    # split2. This was a regression on the 170-SM RTX 5090
-                    # (mean/outliers) but is a clean median+mean win on the
-                    # larger part.
-                    or (qhead_per_kvhead == 2 and num_head == 32 and num_head_kv == 16)
-                )
-            )
-            # RTX 6000: the small-grid gemma-e2b row (qpkv8 Hq8/Hkv1, ~2.7 waves
-            # at S2048) still underfills and gains ~6% from split3; the larger
-            # qpkv8 Hq16/Hkv2, qpkv6, and qpkv2 rows do NOT benefit at S2048,
-            # and even Hq8/Hkv1 is flat by S4096 (grid no longer underfills).
-            or (
-                seqlen_q == 2048
-                and qhead_per_kvhead == 8
-                and num_head == 8
-                and num_head_kv == 1
-            )
-        )
         and m_block_size == 64
         and n_block_size == 64
         and cu_seqlens_q is None
@@ -2481,16 +2463,35 @@ def _flash_attn_bwd(
         and seqused_q is None
         and seqused_k is None
     )
-    if sm120_nonpack_m_split_eligible:
-        # Short causal qpkv6/qpkv8 D256 underfills the main kernel with the safe
-        # N64 path. Splitting the nonpacked M loop adds useful CTAs without the
-        # rejected N32/PackGQA changes. The small-H qpkv8 Gemma row benefits
-        # from one extra split; wider qpkv6/qpkv8 rows keep the stabler split2.
-        pack_gqa_m_splits = (
-            3 if qhead_per_kvhead == 8 and num_head == 8 and num_head_kv == 1 else 2
+    sm120_nonpack_m_split = 1
+    if sm120_nonpack_base_ok:
+        is_qpkv8_h8 = qhead_per_kvhead == 8 and num_head == 8 and num_head_kv == 1
+        is_qpkv2_gemma31 = (
+            qhead_per_kvhead == 2 and num_head == 32 and num_head_kv == 16
         )
+        if seqlen_q == 1024:
+            # qpkv2 Gemma31 was a 5090 regression but a clean S1024 win here.
+            if is_qpkv8_h8:
+                sm120_nonpack_m_split = 3
+            elif qhead_per_kvhead in (6, 8) or is_qpkv2_gemma31:
+                sm120_nonpack_m_split = 2
+        elif seqlen_q == 2048:
+            # B=1 halves the grid so qpkv6/qpkv8 still underfill (+4-9%, split4);
+            # at B>=2 only the smallest grid (qpkv8 Hq8/Hkv1) underfills (+6%).
+            if batch_size == 1 and qhead_per_kvhead in (6, 8):
+                sm120_nonpack_m_split = 4
+            elif is_qpkv8_h8:
+                sm120_nonpack_m_split = 3
+        elif seqlen_q == 4096:
+            # Only the smallest grid still underfills at B=1 (+10%, split6);
+            # qpkv8 Hq16/Hkv2 and qpkv6 are filled by S4096 (flat).
+            if batch_size == 1 and is_qpkv8_h8:
+                sm120_nonpack_m_split = 6
         if sm120_nonpack_m_split_override:
-            pack_gqa_m_splits = max(1, int(sm120_nonpack_m_split_override))
+            sm120_nonpack_m_split = max(1, int(sm120_nonpack_m_split_override))
+    sm120_nonpack_m_split_eligible = sm120_nonpack_base_ok and sm120_nonpack_m_split > 1
+    if sm120_nonpack_m_split_eligible:
+        pack_gqa_m_splits = sm120_nonpack_m_split
     pack_gqa_all_rows_valid = (
         arch // 10 == 12
         and pack_gqa
