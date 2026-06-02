@@ -380,3 +380,27 @@ a Blackwell-native UMMA/tcgen05 backward (cf. flash_bwd_sm100) or a head_dim-
 split dK/dV accumulation to cut register pressure. That is a multi-day project,
 not overnight tuning. The one overnight backward win was qpkv2 Gemma31 S1024
 causal -> split2 (committed 7a6e8c8).
+
+## 2026-06-02 — multi-agent across-the-board pass
+
+Parallel design/analysis agents + GPU validation. Outcomes:
+- FORWARD is fully dispatch-tuned. qpkv5 D128 confirmed kernel-limited (no tile
+  beats the current auto; S4096 causal 0.959 is the FA4 best); the other forward
+  "losers" (qpkv5/qpkv6 S1024) are cross-impl map noise (>=1.0 in-process). No
+  forward dispatch wins remain.
+- D256 backward KERNEL-body changes all rejected by design analysis: head_dim-
+  split dK/dV lands ~223 reg/thread (need <=128 for 2 CTAs/SM); can't free enough
+  smem for a 2nd stage (sK/sQ are 32KB each, unavoidable; 2nd stage >99KB);
+  cp.async reorder is alias-bound (the exposed Q-reload before MMA dK can't be
+  deferred — dK reads it immediately). See memory sm120-backward-kernel-changes-rejected.
+- D128 BACKWARD map (B=2): geomean 0.986. Reliable losses are at S8192
+  NONCAUSAL (qpkv4 0.83, qpkv8 0.84) — a FILLED grid, so M-split does not apply;
+  the lever would be num_stages=2, but D128 stages=2 EXCEEDS the 99KB smem cap
+  (cudaErrorInvalidValue at launch). Closing it needs the D256 reuse_qk_dov_smem
+  alias extended to D128 to free stage room — a kernel change with uncertain
+  payoff (alias Q-reload overhead vs pipelining benefit); deferred to supervised
+  work. D128 short-causal backward is healthy (>=1.0).
+
+NET: dispatch-level tuning is exhausted across forward AND backward on the RTX
+6000. Both residual gap classes (D256 causal large-grid bwd; D128 S8192-nc bwd)
+are smem/occupancy-walled and need a kernel redesign, not a dispatch knob.
