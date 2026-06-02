@@ -557,3 +557,24 @@ is a HIGH-IMPACT fix: GQA + packed/varlen sequences is ubiquitous, and it was
 silently wrong for all but the first sequence on sm_120. General fix (all arches
 on flash_fwd.py). Only remaining cute-test failure: marginal pre-existing qpkv16
 backward tolerance (0.0553 vs 0.05).
+
+## varlen + GQA BACKWARD dK/dV — non-block-aligned cu_seqlens (FIXED, flash_bwd.py)
+A second, distinct varlen+GQA bug (sibling to the forward Q-offset one): the
+backward returned GARBAGE dK/dV (~100% rel err) whenever a sequence start offset
+in cu_seqlens_k was not a multiple of n_block_size (64). dQ correct, fwd correct,
+MHA correct, aligned-offset varlen correct. This is the real cause of the
+test_flash_attn_varlen.py failures (the failing params were softmax_scale=0.1
+GQA/MQA — generate_varlen_args uses randint seqlens => non-aligned offsets; the
+0.1 was a red herring, scale is applied correctly: FA4 vs SDPA rel ~3e-3).
+
+Root cause: varlen bwd uses pack_gqa=False (interface.py:3119) -> the GQA
+atomic-add dK/dV path WROTE dk_accum/dv_accum at raw `seqlen.offset_k +
+batch_idx*n_block_size`, but the dKV postprocess READER floors to a block
+boundary (seqlen.padded_offset_k). They agree iff offset_k % 64 == 0. dQ was fine
+because writer+reader both floor (padded_offset_q). Fix (1 line, flash_bwd.py
+~1585): `padded_offset_k = seqlen.padded_offset_k`. seqlen created with
+tile_n=n_block_size; cluster_size==1 on this path. General fix (all arches on the
+SM80-base bwd). Validated: repro all-ok; exact failing test configs dk/dv
+~5e-4..5e-3 (D64/128/256, causal+nc, fp16+bf16); pytest GQA/MQA scale=0.1 subset
+288 green (72 + 216). PRE-EXISTING (baseline dfb7a24; non-local/non-causal, so
+is_local-gated bwd + cu_seqlens_q-gated splits never touched it).
