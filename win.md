@@ -755,3 +755,29 @@ VALIDATION:
   deterministic): 120 passed / 0 failed (was 60 pass / 60 FAIL — the 60 fails
   were exactly the sink=True configs). Zero regression on the 60 non-sink cases.
 This also enables learnable_sink on Ampere (SM80) via the same base kernel.
+
+## 2026-06-02 — post-fix forward sweep + in-process truth
+
+Clean corrected forward sweep (GPU0, no contention, warmup-ms soak harness)
+AFTER the qpkv5/qpkv4/D256-wide commits:
+  geomean 1.044, median 1.037, wins 53/78. D256 1.072, D128 0.983, gemma 1.071.
+D256 wide win is visible (D256 S>=4096 rows now 1.04-1.24; nc up to 1.24).
+
+BUT the subprocess sweep STILL under-rates FA4 (residual fa2-first ordering bias
+survives the warmup fix). In-process interleaved verification of the D128
+"laggards" shows almost all are artifacts:
+  qwen3-vl  S1024 nc qpkv4 : sweep 0.813 -> in-proc 1.000
+  qwen3-30b S8192 c  qpkv8 : sweep 0.917 -> in-proc 1.004
+  qwen3-vl  S8192 c  qpkv4 : sweep 0.931 -> in-proc 0.999
+  qwen3-emb S8192 c  qpkv4 : sweep 0.959 -> in-proc 1.000
+So the sweep's D128 0.983 is bias; in-process D128 is parity-to-win and the true
+overall forward is well above 1.044 (~1.07+).
+
+GENUINE forward laggards (confirmed in-process, NOT artifacts):
+  1. qwen3-14b qpkv5 S4096 causal D128 = 0.938 (non-pack -> TMA path; tile
+     already 128x64-optimized, tile sweep found nothing better).
+  2. gemma LOCAL (sliding-window 512) D256: e4b qpkv4 S4096 c=1 = 0.933,
+     e2b qpkv8 S8192 c=1 = 0.954, e4b qpkv4 S8192 = 0.967, e2b qpkv8 S4096 nc
+     = 0.967. Real, and local is gemma's PRIMARY attention mode -> high value.
+Next: attack the gemma-local D256 path (current dispatch 64x16 qpkv4 / 64x32
+qpkv8 for local).
