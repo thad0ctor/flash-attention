@@ -829,3 +829,17 @@ ONE genuine forward laggard remains: qwen3-14b qpkv5 S4096 causal D128 = 0.938
 (in-process, consistent). Non-pack -> TMA path, tile already 128x64-optimized
 (tile sweep found nothing better); near its architectural floor on sm_120.
 Not worth further dispatch effort.
+
+## 2026-06-02 — WIN: extend D256 wide tile to S2048 non-causal (num_head>=16)
+
+Followup to the D256 wide tile: at S2048 non-causal the wide tile (128x64+Qregs
++256t) also wins for the larger-head dense models, but the small Hq8 model and
+S2048 causal are mixed, so gate S2048 to (not causal and num_head>=16).
+New-default in-process (was ~1.03 at 64x64):
+  qwen3.5-9b   Hq16 S2048 nc: 1.109 (+8%)
+  qwen3.6-35b  Hq16 S2048 nc: 1.122 (+9%)
+  qwen3.5-122b Hq32 S2048 nc: 1.134 (+9%)
+Excluded (unchanged 64x64, verified): qwen3.5-0.8b Hq8 S2048 nc = 0.998 (median
+of 12), S2048 causal (9b 0.995, 122b 1.029). Correctness vs SDPA rel ~1-3e-3.
+One-line gate change; not in the standard bench (which uses 1024/4096/8192) but
+real perf for S2048 training/inference.
