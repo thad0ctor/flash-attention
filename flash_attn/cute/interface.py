@@ -818,6 +818,34 @@ def _flash_attn_fwd(
         and score_mod is None
         and sm120_d256_wide_env not in {"0", "false", "off", "no"}
     )
+    # Local (sliding-window) D256: same Q-in-regs win as the dense wide path.
+    # The narrow local-window dispatch used a 64x16/64x32 tile; 128x{32,64}
+    # +Qregs+256t is faster by +3-13% (RTX 6000 interleaved A/B + SDPA-window
+    # validated, agent_space/sm120_local_wide_confirm.py). tile_n scales with
+    # the window: 32 for window<=512, 64 for window~1024 (gemma4-31b). Gated to
+    # S>=4096 (the validated range; gemma local benches there).
+    sm120_local_d256_wide_env = os.environ.get("FLASH_ATTENTION_SM120_LOCAL_D256_WIDE", "").lower()
+    sm120_local_d256_wide = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and local
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead in (1, 2, 4, 8)
+        and sm120_seq_q == sm120_seq_k
+        and sm120_seq_q >= 4096
+        and page_table is None
+        and qv is None
+        and learnable_sink is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and mask_mod is None
+        and score_mod is None
+        and sm120_local_d256_wide_env not in {"0", "false", "off", "no"}
+    )
     if (
         arch // 10 == 12
         and causal
@@ -891,6 +919,14 @@ def _flash_attn_fwd(
                 # registers, which requires the 256-thread 128x128 shape.
                 fwd_cfg = FwdConfig(128, 128, True, True)
                 sm120_num_stages = 1
+            elif sm120_local_d256_wide:
+                # Gemma local D256, S>=4096: 128x{32,64}+Qregs+256t beats the
+                # narrow 64x16/64x32 tile by +3-13% (see sm120_local_d256_wide).
+                # tile_n scales with the window (32 for w<=512, 64 for w~1024).
+                fwd_cfg = FwdConfig(
+                    128, 64 if (window_size_left or 0) >= 1024 else 32, True, True
+                )
+                num_threads = 256
             elif (
                 local
                 and head_dim == 256
@@ -1054,8 +1090,11 @@ def _flash_attn_fwd(
     # it cuts the non-TMA shared-memory footprint from Q+K+V to max(Q,V)+K.
     sm120_q_in_regs = (
         arch // 10 == 12
-        and (causal or sm120_d256_qregs128 or sm120_qpkv6_d256_qregs_mode or sm120_d256_wide)
-        and not local
+        and (
+            causal or sm120_d256_qregs128 or sm120_qpkv6_d256_qregs_mode
+            or sm120_d256_wide or sm120_local_d256_wide
+        )
+        and (not local or sm120_local_d256_wide)
         and (
             (
                 head_dim == 128
@@ -1067,6 +1106,7 @@ def _flash_attn_fwd(
             or sm120_qpkv16_d256_causal_qregs_mode
             or sm120_qpkv6_d256_qregs_mode
             or sm120_d256_wide
+            or sm120_local_d256_wide
         )
         and (
             sm120_seq_q == 8192
@@ -1077,6 +1117,7 @@ def _flash_attn_fwd(
             or sm120_qpkv16_d256_causal_qregs_mode
             or sm120_qpkv6_d256_qregs_mode
             or sm120_d256_wide
+            or sm120_local_d256_wide
         )
     )
 

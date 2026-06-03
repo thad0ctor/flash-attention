@@ -781,3 +781,30 @@ GENUINE forward laggards (confirmed in-process, NOT artifacts):
      = 0.967. Real, and local is gemma's PRIMARY attention mode -> high value.
 Next: attack the gemma-local D256 path (current dispatch 64x16 qpkv4 / 64x32
 qpkv8 for local).
+
+## 2026-06-02 — WIN: gemma LOCAL D256 forward wide tile (128x{32,64}+Qregs+256t) at S>=4096
+
+The genuine gemma-local forward laggards (0.93-0.97 vs FA2) are now fixed with
+the same Q-in-regs trick as the dense D256 wide path, applied to the local
+(sliding-window) dispatch. The narrow local path used 64x16 (qpkv4) / 64x32
+(qpkv8) / 64x64 (qpkv2 fell through); 128x{32,64}+Qregs+256t is far faster:
+tile_n=32 for window<=512, tile_n=64 for window~1024.
+
+FA4-vs-FA4 interleaved + SDPA-window validated (sm120_local_wide_confirm.py):
+  gemma4-e4b qpkv4 w512: S4096 c1 0.93->0.99 (+7%), S8192 c1 0.96->1.05 (+10%),
+                          S4096 nc 0.93->0.99 (+6%)
+  gemma4-e2b qpkv8 w512: S8192 c1 0.99->1.06 (+7%), S4096 nc 0.96->1.00 (+4%)
+  gemma4-31b qpkv2 w1024: S4096 c1 1.00->1.12 (+11%), S8192 c1 1.01->1.14 (+13%)
+new-default in-process re-verify (no env): e4b S4096 c1 0.995, e2b S8192 1.011,
+e4b S8192 1.080, gemma31 S4096 1.125 — all at/above parity (were 0.93-0.97).
+Output rel vs SDPA-window ~2e-3 (bit-equivalent retiling).
+
+GATING: local D256, S>=4096 (square), qpkv in {1,2,4,8}, no paged/qv/varlen/
+sparse/mask/score/sink. Required relaxing the `not local` clause in
+sm120_q_in_regs (local + Q-in-regs is correct here). Kill-switch
+FLASH_ATTENTION_SM120_LOCAL_D256_WIDE=0. S<4096 keeps the narrow 64x16/64x32
+tile (unchanged).
+
+CORRECTNESS: dedicated SM120 local test (test_flash_attn_sm120_local.py, S=256
+small-S path) 49 passed / 0 failed (unchanged path intact). Wide-path shapes
+SDPA-window rel ~2e-3. High value: local is gemma's PRIMARY attention mode.
