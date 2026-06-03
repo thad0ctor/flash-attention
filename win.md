@@ -977,3 +977,35 @@ the head_dim quarter-split is the only path to 2 CTA/SM but the recompute cost i
 predicted (by the n=32 proxy + 4x-GEMM accounting) to EXCEED the occupancy gain
 -> net loss. De-risk says do NOT build the multi-day redesign. Reported to user
 for a final call on whether to build the head_dim quarter-split prototype anyway.
+
+## 2026-06-02 — REJECTED: L2-residency bwd scheduler (SingleTileLPTBwdScheduler) on SM120
+
+Pursued the "more efficient front and back" redirect. An opus brainstorm flagged
+the register-free L2-residency backward swizzle scheduler (already implemented +
+SM90-wired, gated behind `deterministic`, unused on the SM80-base SM120 path) as
+the highest-leverage, lowest-risk lever for the D256 backward's 91%-global-reload
+bottleneck. Wired it into the SM120 backward (use_lpt_bwd flag, compile-keyed,
+seqlen_k/element_size/lpt args) behind FLASH_ATTENTION_SM120_BWD_LPT and A/B'd:
+
+  D256 qpkv16 S2048 c : lpt/off 1.487  (with spt reversal) -> 1.060 (swizzle only)
+  D256 qpkv16 S4096 c : 1.825
+  D256 qpkv8  S4096 c : 1.463 -> 1.037 (swizzle only)
+  D256 qpkv8  S4096 nc: 0.997 (neutral)
+  D256 qpkv4  S8192 c : 1.838
+  D128 qpkv8  S4096 c : 1.947 ;  D128 qpkv4 S8192 c : 2.547
+  grads correct (rel ~1e-3) — pure scheduling regression, not a correctness issue.
+
+WHY IT LOSES: the DEFAULT SM120 backward grid (n-block fastest within head) already
+runs consecutive n-block CTAs of the SAME head concurrently, and all of a head's
+CTAs reload the same Q/dO — so the L2 already caches the reload working set. The
+LPT head-grouping swizzle DISRUPTS this natural locality (and the spt block-reversal,
+gated on causal, is catastrophic: up to 2.5x). Even the pure swizzle w/o reversal
+is 4-6% slower. REVERTED in full.
+
+CONCLUSION (now also empirically, not just by analysis): the SM120 backward is at
+its floor. The register-free scheduling lever — the last plausible win — loses
+because the default scheduler already exploits the available L2 locality. Combined
+with the ncu profiling (D128 compute-bound; D256 occupancy-walled, spill only 8.5%)
+and the occupancy-redesign de-risk (dK/dV split infeasible, head_dim-split net-loss),
+there is no backward win available on sm_120. Forward remains the productive surface
+(1.053 geomean, Q-in-regs wide tile). See [[sm120-d256-backward-occupancy-wall]].
