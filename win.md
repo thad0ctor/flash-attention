@@ -1109,3 +1109,34 @@ REMAINING: tile-tuning plateaus (~0.6-0.8x D128) because the SM80-base kernel's
 MMA is structurally tied to tile_m*warps. The memory floor for this decode is
 ~45us vs FA2 99us, so a memory-bound (GEMV-style, no wasted MMA) sm_120 decode
 kernel could match/beat FA2. That's the kernel-rewrite effort (next).
+
+## 2026-06-03 — Custom sm_120 GEMV decode kernel (FlashAttentionDecodeSm120, gated)
+
+Built a from-scratch memory-bound decode kernel (opus agent + my re-validation).
+flash_fwd_decode_sm120.py (~327L): one CTA per (split, kv_head, batch) processes
+all qhead_per_kvhead query rows together (KV read ONCE, no GQA redundancy ->
+grid 1504->188), Q.K^T and P.V as GEMV (FMA + warp shuffles, NO m16n8k16 MMA on
+empty query rows), cp.async double-buffered K/V streaming, online softmax with
+cross-thread-group smem reduction, writing fp32 partial O/LSE for the existing
+combine. Gated behind FLASH_ATTENTION_SM120_DECODE_KERNEL (default OFF); dispatch
+is additive + early-returns through the combine (flag off = byte-identical).
+
+RE-VALIDATED (my env, RTX6000, seqlen_q=1, causal=False, vs SDPA + baseline + FA2):
+  D256 q4  B4  Sk16384: new/base 1.19x, new/fa2 0.948 (nearly FA2!)
+  D256 q16 B16 Sk32768: new/base 1.31x
+  D256 q16 B1  Sk32768: new/base 0.96 (~tie)
+  D128 q8/q4: new/base 1.00-1.07 (tie — D128 already tile-fixed memory-leaning)
+  correctness rel 9e-4..5.9e-3 (PASS; GEMV accumulates fp32 -> often 10-100x
+  tighter than baseline).
+ncu proof: D256 Sk32768 qpkv8 main kernel baseline 132us/SM61%/DRAM30% (compute-
+bound) -> new 90us/SM18%/DRAM44% (memory-leaning). The 7.7x early fix was
+partitioning keys across thread-groups (a naive every-thread-all-keys version
+was 369us/DRAM5%).
+
+VERDICT: real D256 decode win (1.2-1.3x over baseline; one shape ~0.95x FA2),
+tie on D128, does NOT beat FA2 overall. Same wall as everywhere on sm_120: still
+register-bound (254 reg -> 1 CTA/SM, DRAM 44% not the ~1.5TB/s floor) — needs
+register reduction / warp-specialization for >=2 CTA/SM to close the rest.
+qpkv16 may fall back (reduction smem). Gated/causal=False/seqlen_q=1 only.
+Merged gated+off as an opt-in D256-decode improvement and a foundation; lab
+notes in agent_space/DECODE_KERNEL_NOTES.md. See [[sm120-d256-backward-occupancy-wall]].

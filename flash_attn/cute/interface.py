@@ -33,6 +33,7 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_decode_sm120 import FlashAttentionDecodeSm120
 from flash_attn.cute.flash_fwd_sm120_tma import FlashAttentionForwardSm120Tma
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -1225,6 +1226,75 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
+    # ----------------------------------------------------------------------
+    # SM120 memory-bound decode kernel (gated, off by default).
+    # A from-scratch GEMV decode path: one CTA per (split, kv_head, batch)
+    # processes all qhead_per_kvhead query rows together (KV read once, no GQA
+    # redundancy) using FMA + warp shuffles instead of the wasteful m16n8k16
+    # MMA over empty query rows.  Produces the same fp32 partial O / LSE the
+    # combine kernel expects, then reuses _flash_attn_fwd_combine.
+    # ----------------------------------------------------------------------
+    if (
+        os.environ.get("FLASH_ATTENTION_SM120_DECODE_KERNEL", "0").lower()
+        in ("1", "true", "on", "yes")
+        and arch // 10 == 12
+        and is_split_kv
+        and seqlen_q is not None
+        and seqlen_q == 1
+        and qhead_per_kvhead > 1
+        and head_dim == head_dim_v
+        and head_dim in (128, 256)
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and page_table is None
+        and qv is None
+        and not causal
+        and not local
+        and mask_mod is None
+        and score_mod is None
+        and softcap is None
+        and learnable_sink is None
+        and block_sparse_tensors is None
+        and q_descale is None and k_descale is None and v_descale is None
+        and not is_fake_mode()
+        and FlashAttentionDecodeSm120.can_implement(
+            dtype, head_dim, head_dim_v, qhead_per_kvhead, 128,
+            32 if head_dim == 256 else 64
+        )
+    ):
+        decode_tile_n = 32 if head_dim == 256 else 64
+        decode_key = (dtype, head_dim, qhead_per_kvhead, num_splits, decode_tile_n)
+        if decode_key not in _flash_attn_fwd.decode_compile_cache:
+            fa_decode = FlashAttentionDecodeSm120(
+                dtype, head_dim, head_dim_v, qhead_per_kvhead, num_splits,
+                tile_n=decode_tile_n, num_threads=128,
+            )
+            q_t = to_cute_tensor(q.detach())
+            k_t = to_cute_tensor(k.detach())
+            v_t = to_cute_tensor(v.detach())
+            op_t = to_cute_tensor(out_partial, assumed_align=4)
+            lp_t = to_cute_tensor(lse_partial, assumed_align=4)
+            _flash_attn_fwd.decode_compile_cache[decode_key] = cute.compile(
+                fa_decode, q_t, k_t, v_t, op_t, lp_t,
+                Float32(softmax_scale), current_stream,
+                options="--enable-tvm-ffi",
+            )
+        _flash_attn_fwd.decode_compile_cache[decode_key](
+            q.detach(), k.detach(), v.detach(),
+            out_partial, lse_partial, Float32(softmax_scale),
+        )
+        _flash_attn_fwd_combine(
+            out_partial,
+            lse_partial.transpose(-1, -2),
+            out,
+            lse.transpose(-1, -2) if lse is not None else None,
+            None,
+            None,
+        )
+        return out, lse
+
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
@@ -2015,6 +2085,7 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
+_flash_attn_fwd.decode_compile_cache = {}
 
 
 def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
