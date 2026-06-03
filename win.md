@@ -872,3 +872,46 @@ better) and is mixed/laggard at S2048 (e4b/e2b ~0.8 with either tile — tiny
 0.15ms kernels where FA4 launch overhead dominates, not tile-fixable), so the
 local gate stays S>=4096. Only the dense S2048-causal-qpkv16 cell is added.
 Correctness vs SDPA rel ~1e-3.
+
+## 2026-06-02 — Backward deep-profiling pass (register/occupancy + config sweep + ext. inspiration)
+
+Goal: find backward wins (it's at parity in-process; wanted to push above). Result:
+the SM120 backward is already at its sm_120 optimum — no dispatch win found, and
+the kernel-level low-hanging fruit is already implemented.
+
+PROFILING (cuFuncGetAttribute via dump_kernel_attributes, no root needed):
+  D128 bwd main dKV kernel: 255 reg/thread, local=168B (SPILLING), 256 thr -> 1 CTA/SM
+  D128 dQ kernel: 209 reg -> 1 CTA/SM
+  D256 bwd main kernel: 255 reg, local=72B (spilling), 256 thr -> 1 CTA/SM
+=> BOTH D128 and D256 backward are register-bound at the 255 cap -> 1 CTA/SM
+   (16.7% occ). 2 CTA/SM needs <=128 reg/thread; the acc_dK/dV/dQ accumulators
+   make that infeasible (intrinsic, no tcgen05 on sm_120). FA2 hits the same
+   wall -> ratio is parity (confirmed: D256 bwd geomean 0.996 in-process).
+
+DISPATCH CONFIG SWEEP (isolated subprocess per config, FA4-vs-FA4 interleaved):
+  num_stages_Q=2 at S4096: SLOWER (0.90-0.92) -> current ns=1 for S<8192 is right
+  num_stages_dO=2: SMEM OVERFLOW (crash) on both D128 and D256
+  V_in_regs=1: SLOWER (0.88-0.98)
+  num_stages_Q=2,dO=2: overflow. D256 any extra stage: overflow (smem-capped).
+  => no dispatch lever helps; the config (ns=1, ns_Q=2 only for D128 S>=8192,
+     M-split for underfilled grids) is already optimal.
+
+EXTERNAL INSPIRATION (gau-nernst/learn-cuda, forward-only FA2 on sm_120, studied
+by subagent): its v1->v5 ladder wins came from (1) XOR smem swizzle (+18pts),
+(2) cp.async multi-stage pipelining, (3) ldmatrix.x4.trans, (4) in-place bf16
+P/dS packing + smem aliasing to cut spills. Assessment vs our backward:
+  (1) ALREADY DONE — get_smem_layout_atom swizzles all tiles (Q/K/V/dO/P/dS,
+      swizzle_bits=3); the flash_bwd.py "TODO swizzle=3?" is already satisfied.
+  (2) ALREADY DONE/tuned — cp.async staging IS num_stages; more stages overflow
+      smem or slow it (see sweep above).
+  (3) likely already via CuTeDSL copy atoms.
+  (4) the ONLY untried lever with potential upside: reduce the local-memory
+      SPILLS (local=168/72) by in-place bf16 packing of P/dS. But: deep CuTeDSL
+      surgery on Tri Dao's FA2 backward, can't confirm the spill is on the hot
+      path WITHOUT ncu (root-gated here, ERR_NVGPUCTRPERM), high regression risk
+      on a parity kernel. NOT attempted blind; recommend only with ncu access.
+
+CONCLUSION: backward (D128 + D256) is at parity and well-optimized; the register
+wall is intrinsic to sm_120. No safe backward win remains at the dispatch level.
+The forward Q-in-regs wide-tile lever has no backward analogue (the wall is
+registers, not smem). See [[sm120-d256-backward-occupancy-wall]].
