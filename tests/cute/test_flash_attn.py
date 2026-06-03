@@ -59,6 +59,12 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV is not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+# Consumer Blackwell (RTX PRO 6000 / RTX 50xx). arch // 10 == 12, matching the
+# `arch // 10 == 12` dispatch checks in flash_attn/cute/interface.py. The SM120
+# backward reuses the SM80-base kernel, which raises AssertionError for the
+# deterministic dQ-semaphore path that only exists in the SM90/SM100 kernels
+# (see flash_attn/cute/interface.py:~2421).
+IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -361,6 +367,12 @@ def test_flash_attn_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if deterministic and IS_SM120:
+                pytest.skip(
+                    "SM120 deterministic backward not supported: the SM80-base "
+                    "bwd kernel lacks the dQ_semaphore code path (asserts in "
+                    "interface.py:~2421); only SM90/SM100 implement it."
+                )
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -843,6 +855,12 @@ def test_flash_attn_varlen_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if deterministic and IS_SM120:
+                pytest.skip(
+                    "SM120 deterministic backward not supported: the SM80-base "
+                    "bwd kernel lacks the dQ_semaphore code path (asserts in "
+                    "interface.py:~2421); only SM90/SM100 implement it."
+                )
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
