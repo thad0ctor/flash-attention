@@ -861,3 +861,14 @@ harness + S1024 noise. The 1-CTA/SM occupancy wall is a real HARDWARE limit
 is no D256-backward laggard to chase and no rewrite is warranted (consistent with
 [[sm120-d256-backward-occupancy-wall]] / [[sm120-backward-kernel-changes-rejected]]
 on the kernel being unfixable — but the ratio was never actually a loss).
+
+## 2026-06-02 — WIN: D256 wide tile for S2048 causal qpkv16 (num_head>=32)
+
+Edge followup: at S2048 CAUSAL the wide tile helps ONLY the widest head count.
+qwen3.5-122b (qpkv16 Hq32) +6.5% (wide/cur 1.065), new-default fa4/fa2 1.094;
+qwen3.5-9b / qwen3.6-35b (Hq16) regress (0.96) so gated out via num_head>=32.
+gemma-local S1024/S2048 was also probed: wide REGRESSES at S1024 (narrow tile
+better) and is mixed/laggard at S2048 (e4b/e2b ~0.8 with either tile — tiny
+0.15ms kernels where FA4 launch overhead dominates, not tile-fixable), so the
+local gate stays S>=4096. Only the dense S2048-causal-qpkv16 cell is added.
+Correctness vs SDPA rel ~1e-3.

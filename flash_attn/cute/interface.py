@@ -805,9 +805,12 @@ def _flash_attn_fwd(
             sm120_seq_q >= 4096
             # S2048 non-causal wins +9-13% for the larger-head models
             # (qwen3.5-9b/qwen3.6-35b Hq16, qwen3.5-122b Hq32) but the small
-            # Hq8 (qwen3.5-0.8b) regresses and S2048 causal is mixed, so gate
-            # S2048 to non-causal + num_head>=16. RTX6000 A/B validated.
+            # Hq8 (qwen3.5-0.8b) regresses, so gate S2048 nc to num_head>=16.
+            # S2048 causal only the widest head count (qpkv16, Hq32 qwen3.5-122b)
+            # wins (+6.5%); Hq16 (9b/35b) regress, so gate causal to num_head>=32.
+            # RTX6000 interleaved A/B validated.
             or (sm120_seq_q == 2048 and not causal and num_head >= 16)
+            or (sm120_seq_q == 2048 and causal and num_head >= 32)
         )
         and not sm120_d256_qregs128
         and not sm120_qpkv8_d256_causal_qregs_mode
