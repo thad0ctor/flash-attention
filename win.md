@@ -1200,3 +1200,21 @@ worse penalty, and coalescing is already optimal. Beating FA2 on M=1 decode
 needs a tensor-core formulation, impractical on mma.sync-only sm_120. The gated
 kernel stays as a marginal opt-in D256-decode-over-SM80-base improvement; not a
 default. Decode effort concluded here.
+
+## 2026-06-03 — WIN: paged-KV D128 forward tile 128x128 -> 64x64/128t (~1.8x, inference path)
+
+Opportunity-hunt agent flagged paged-KV D128 as ~24x slow; that baseline figure
+was a cold/stale-cache artifact (didn't reproduce — my env: 128x128 = 1.06ms, not
+16ms), BUT the underlying inefficiency is REAL: the forced 128x128 tile
+(interface.py paged branch) is ~1.8x slower than 64x64 because tile_n=128 + the
+paged cp.async load is inefficient. Fix: paged-KV D128 (head_dim<=128) now uses
+64x64 + num_threads=128, EXCEPT qpkv5 (Hq40/Hkv8) which prefers 128x128 (kept).
+RTX6000 in-process A/B (vs current 128x128):
+  B1 Sq4096 q4 ps128 c1: 1.06->0.57ms (1.84x);  c0: 1.45->0.91ms (1.59x)
+  B4 Sq1024 q8 c1: 1.38x;  B1 Sq2048 q1 ps64 c1: 1.84x
+  qpkv5 S8192: 128x128 stays (64x64 was 0.92x -> regression) -> gated out
+Paged-KV is THE inference-serving prefill path (vLLM/SGLang). Correctness vs SDPA
+on reconstructed K/V rel ~1e-3; test_paged_kv_sm120.py 51 passed / 0 failed
+(covers D128/D192/D256, identity/permuted/shared page tables). D192/D256 paged
+unchanged (already 64x64). (Found via the creative opportunity audit; the agent's
+24x was wrong but the 1.8x is real and verified.)

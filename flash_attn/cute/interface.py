@@ -924,7 +924,16 @@ def _flash_attn_fwd(
             # D192/D256 paged-KV falls through to the head_dim > 128 64x64
             # non-TMA path below.
             if page_table is not None and head_dim <= 128 and head_dim_v <= 128:
-                fwd_cfg = FwdConfig(128, 128, True, True)
+                # Paged-KV D128: the old 128x128 tile is ~1.4-1.9x slower than
+                # 64x64 / 128-thread on the RTX 6000 (tile_n=128 + the paged
+                # cp.async load is inefficient). qpkv5 (Hq40/Hkv8) is the lone
+                # exception — it prefers 128x128 — so it keeps the old tile.
+                # Validated vs SDPA on reconstructed K/V (rel ~1e-3).
+                if qhead_per_kvhead == 5:
+                    fwd_cfg = FwdConfig(128, 128, True, True)
+                else:
+                    fwd_cfg = FwdConfig(64, 64, True, True)
+                    num_threads = 128
                 sm120_num_stages = 1
             elif sm120_qpkv5_s16384_qregs:
                 # Exact qwen3-14B S16384 causal row wins by staging Q in
@@ -1149,7 +1158,6 @@ def _flash_attn_fwd(
             or sm120_local_d256_wide
         )
     )
-
     # SM120 decode auto-split: a small-seqlen_q call (decode / speculative
     # decode) launches only ~batch*num_head_kv CTAs (1 m-block), badly
     # underfilling the 188 SMs while each streams the entire KV cache — 5-10x
