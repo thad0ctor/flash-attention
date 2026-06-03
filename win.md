@@ -1376,3 +1376,22 @@ noise. Causal MHA's +5.3% geo is far above it = real. NOTE the harder harness al
 S1024 question: small-seq is ~parity, just noisy (D128 dense S1024 median ~0.99 with [0.84..1.02]
 spread) — NOT a laggard; the earlier 0.97 (single-soak) and 1.13 (other agent) were both method
 artifacts. The fix is in the SHARED TMA-path scheduler so it helps ANY causal/local TMA shape.
+
+## 2026-06-03 — Causal-MHA large-S residual (~0.95x at S>=8192): NO-GO, intrinsic reg wall
+
+Took a kernel shot at the post-LPT residual (causal D128 MHA S>=8192 still ~0.95-0.96x FA2).
+Hypothesis was cross-wave tail imbalance fixable by a persistent scheduler. ncu REFUTED it:
+FA4 and FA2 have IDENTICAL grid (4096 CTAs) and IDENTICAL 21.79 waves/SM at S8192 — tail is
+~1/22, negligible, and LPT already front-loads across the whole launch. The real deficit is
+steady-state SM throughput (FA4 68.7% vs FA2 74.0%): the TMA forward kernel is 255 regs/thread
+-> Block Limit Registers = 1 -> 1 CTA/SM -> achieved occupancy 10.4% (== theoretical), so a
+stalled resident block has no sibling warps to hide tensor-pipeline/TMA latency. Same occupancy-
+wall class as the D256-backward note, now on the D128 forward. (Not memory bound: DRAM 8.9%.)
+Levers tried, all dead: tile shape (128x64 default is best; 128x32/48, 64x64/128, 128x128 all
+WORSE at S>=4096), LPT L2-swizzle (1..64 all inert — S8192 stays 0.968), head_swizzle (not wired
+for non-varlen). Persistent scheduler: the kernel body is strictly one-tile-per-CTA (single
+initial_work_tile_info + one mainloop+epilogue, no while-work loop / per-tile reset), so enabling
+is_persistent drops tiles -> needs a kernel-body REWRITE, and wouldn't help the 1-CTA/SM wall
+anyway. Tree clean, all edits reverted. Conclusion: closing it needs register-pressure reduction
+or a Blackwell-native forward redesign — not worth it for ~3-5% on niche MHA (GQA already wins).
+Forward campaign is at the true floor everywhere.
