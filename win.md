@@ -1089,3 +1089,23 @@ VALIDATION:
 
 GATED OUT (untested, left on safe path): varlen+split, paged+split, seqused,
 MLA(qv). The structural code paths exist but are not validated — don't rely yet.
+
+## 2026-06-03 — WIN: D128 decode tile 128x64 -> 16x64/1-warp (+50-68% on top of SplitKV)
+
+ncu on the SplitKV decode kernel (B1 Sk32768 D128 qpkv8) showed it COMPUTE-bound
+(SM 81.7%, DRAM only 19.6%) — decode should be memory-bound. Cause: the default
+128x64 tile runs the MMA on ~120 empty query rows (seqlen_q=1, ~8 packed real
+rows -> 6% M-utilization). A tiny 16x64 / 32-thread (1-warp) tile cuts the wasted
+MMA. Decode dispatch now picks 16x64/32t for D128 seqlen_q<=8:
+  D128 q8 B1 Sk32768: 0.406 -> 0.646 vs FA2 (+59%)
+  D128 q4 B1 Sk16384: 0.535 -> 0.816 (+53%)
+Cumulative decode (orig -> SplitKV -> +tile): D128 0.10-0.21 -> 0.40-0.54 ->
+0.65-0.82x of FA2 (~4-6x faster than the original disabled-SplitKV baseline).
+D256 decode does NOT benefit from the small tile (kept on the lookup path,
+still ~0.38-0.76x) -> needs the kernel rewrite. Training (seqlen_q>8) unaffected.
+Correctness vs SDPA rel 5-8e-3 (PASS).
+
+REMAINING: tile-tuning plateaus (~0.6-0.8x D128) because the SM80-base kernel's
+MMA is structurally tied to tile_m*warps. The memory floor for this decode is
+~45us vs FA2 99us, so a memory-bound (GEMV-style, no wasted MMA) sm_120 decode
+kernel could match/beat FA2. That's the kernel-rewrite effort (next).

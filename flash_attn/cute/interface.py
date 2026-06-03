@@ -1075,6 +1075,23 @@ def _flash_attn_fwd(
                 else:
                     fwd_cfg = FwdConfig(128, 64, True, True)
                     num_threads = 256
+            elif (
+                head_dim <= 128
+                and head_dim_v <= 128
+                and sm120_seq_q <= 8
+                and cu_seqlens_q is None
+                and seqused_q is None
+                and page_table is None
+                and qv is None
+            ):
+                # Decode (seqlen_q<=8): the default 128x64 tile wastes the MMA on
+                # ~120 empty query rows -> compute-bound (81% SM, 19% DRAM) while
+                # decode should be memory-bound. A tiny 16x64 / 1-warp tile cuts
+                # the wasted MMA; with the decode SplitKV trigger this is +50-68%
+                # on D128 decode (RTX6000). D256 decode does not benefit (kept on
+                # the path below).
+                fwd_cfg = FwdConfig(16, 64, True, True)
+                num_threads = 32
             elif lookup_key in _SM120_TILE_LOOKUP:
                 tm, tn, ns = _SM120_TILE_LOOKUP[lookup_key]
                 fwd_cfg = FwdConfig(tm, tn, True, True)
