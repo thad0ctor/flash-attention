@@ -1218,3 +1218,24 @@ on reconstructed K/V rel ~1e-3; test_paged_kv_sm120.py 51 passed / 0 failed
 (covers D128/D192/D256, identity/permuted/shared page tables). D192/D256 paged
 unchanged (already 64x64). (Found via the creative opportunity audit; the agent's
 24x was wrong but the 1.8x is real and verified.)
+
+## 2026-06-03 — Creative opportunity-hunt outcome (1 real win + verified-marginal/dead leads)
+
+Ran a broad opus audit of the whole SM120 surface. Re-validated every lead in my
+env (the agent's baselines were SYSTEMATICALLY inflated — cold/stale-cache — so
+its x-figures were 5-15x optimistic; always re-verify):
+- #1 paged-KV D128 tile: agent "24x" -> REAL 1.84x. BANKED (commit 86f0ee5).
+- #2 head_dim=96 lookup: agent "1.7x (0.56->0.95)" -> REAL default is 0.85-1.43x,
+  128x96 gives only +3-6% on a few S8192 cells, no win on S4096/q4. Niche head
+  dim (not a target model), marginal+inconsistent -> NOT worth lookup entries. SKIP.
+- #3 D128 MHA(qpkv1) causal lookup: agent "+5%" -> by the same inflated-baseline
+  pattern, expected marginal. SKIP (low value).
+- #4 small-batch prefill SplitKV: agent confirmed DEAD (split hurts prefill).
+- #5 d192 tile: confirmed at floor (64x64 best; wider tiles reg-bound). DEAD.
+- #6 fp8 / MLA-qv: hard-gated off (interface.py:601 fp8 SM100-only;:1574 qv
+  SM100/101-only). Real ~2x potential for fp8 but needs a k=32 MMA path + descale
+  plumbing (kernel rewrite, not a gate flip). Separate project; deprioritized.
+
+NET from the hunt: one real win (paged-KV D128 1.84x). Lesson reinforced: trust
+in-process interleaved timing, not agent-reported x-figures (their fresh-process
+baselines are cold-clock/stale-cache inflated).
