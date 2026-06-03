@@ -111,8 +111,12 @@ class FlashAttentionDecodeSm120:
         # shrinks to 1 byte/elem so the fp32 scratch dominates; for bf16 the tile
         # bytes dominate (== legacy size), so bf16 smem is byte-identical.
         kv_tile = num_stages * tile_n * head_dim * kv_elem_bytes
-        red_acc = rpi * R * tpr * vec * 4
-        red_ms = 2 * rpi * R * tpr * 4
+        # Two-level reduction: warp-shuffle merge within each warp, then an smem
+        # fan-out across only `nwarps` warps (not the rpi row-groups), so the fp32
+        # reduction scratch is sized by nwarps.
+        nwarps = num_threads // 32
+        red_acc = nwarps * R * tpr * vec * 4
+        red_ms = 2 * nwarps * R * tpr * 4
         sK_smem = max(kv_tile, red_acc)
         sV_smem = max(kv_tile, red_ms)
         if sK_smem + sV_smem > 99 * 1024:
@@ -123,8 +127,9 @@ class FlashAttentionDecodeSm120:
         kv_elem_bytes = self.kv_dtype.width // 8
         kv_tile = self.num_stages * self.tile_n * self.head_dim * kv_elem_bytes
         rpi, R, tpr, vec = self.rows_per_iter, self.R, self.threads_per_row, self.vec
-        red_acc = rpi * R * tpr * vec * 4
-        red_ms = 2 * rpi * R * tpr * 4
+        nwarps = self.num_threads // 32
+        red_acc = nwarps * R * tpr * vec * 4
+        red_ms = 2 * nwarps * R * tpr * 4
         sK_bytes = max(kv_tile, red_acc)
         sV_bytes = max(kv_tile, red_ms)
         return sK_bytes + sV_bytes
@@ -224,8 +229,9 @@ class FlashAttentionDecodeSm120:
         # (recast onto the same bytes after the mainloop) still fits.
         kv_elem_bytes = const_expr(self.kv_dtype.width // 8)
         kv_tile_bytes = const_expr(NS * TN * d * kv_elem_bytes)
-        red_acc_bytes = const_expr(rpi * R * tpr * vec * 4)
-        red_ms_bytes = const_expr(2 * rpi * R * tpr * 4)
+        nwarps = const_expr(self.num_threads // 32)
+        red_acc_bytes = const_expr(nwarps * R * tpr * vec * 4)
+        red_ms_bytes = const_expr(2 * nwarps * R * tpr * 4)
         sK_bytes = const_expr(max(kv_tile_bytes, red_acc_bytes))
         sV_bytes = const_expr(max(kv_tile_bytes, red_ms_bytes))
         smem = cutlass.utils.SmemAllocator()
@@ -323,36 +329,76 @@ class FlashAttentionDecodeSm120:
             cute.arch.barrier()
 
         # ---- cross-row-group reduction of (max, sum, acc) over the rpi groups ----
-        # Each row_grp owns a disjoint key subset; merge their online-softmax
-        # state keyed by (row_grp, r, lane_d).  The scratch is ALIASED onto the
-        # now-finished K/V smem (recast bf16 -> fp32): sKc holds acc, sVc holds
-        # [max | sum].  can_implement guarantees these fit.
+        # Each row_grp owns a disjoint key subset; their online-softmax states are
+        # merged in two levels to keep the smem fan-out (and hence occupancy) low:
+        #   1) WARP level: the `groups_per_warp` row-groups that live in the same
+        #      warp (and share a lane_d) are merged with shuffle-butterfly XORs over
+        #      the row-group bits of the lane index (offsets tpr, 2*tpr, ...).  After
+        #      this every lane holds its warp's merged state for its lane_d.
+        #   2) SMEM level: one representative lane per (warp, lane_d) writes the
+        #      warp-merged state to scratch indexed by warp_id; warp 0 then merges
+        #      across the `nwarps` warps.
+        # This shrinks the smem fan-out from rpi -> nwarps.  For bf16 the K/V tile
+        # bytes still dominate so the smem is byte-identical to the legacy size; for
+        # fp8 (where the fan-out scratch dominated) it drops ~rpi/nwarps x.
+        nwarps = const_expr(self.num_threads // 32)
+        gpw = const_expr(32 // tpr)  # row-groups per warp sharing a lane_d
+        warp_id = tidx // 32
+        lane = tidx % 32
+
+        # 1) warp-level butterfly merge of (max, sum, acc) across the gpw groups.
+        for r in cutlass.range_constexpr(R):
+            wm = row_max[r]
+            ws = row_sum[r]
+            for off in cutlass.range_constexpr(int(math.log2(gpw))):
+                step = const_expr(tpr << off)
+                om = cute.arch.shuffle_sync_bfly(wm, offset=step)
+                os_ = cute.arch.shuffle_sync_bfly(ws, offset=step)
+                nm = cutlass.max(wm, om)
+                cself = cute.math.exp2((wm - nm) * LOG2_E, fastmath=True)
+                cself = cself if wm > Float32(-1e29) else Float32(0.0)
+                cother = cute.math.exp2((om - nm) * LOG2_E, fastmath=True)
+                cother = cother if om > Float32(-1e29) else Float32(0.0)
+                for e in cutlass.range_constexpr(vec):
+                    oa = cute.arch.shuffle_sync_bfly(acc_o[r, e], offset=step)
+                    acc_o[r, e] = acc_o[r, e] * cself + oa * cother
+                ws = ws * cself + os_ * cother
+                wm = nm
+            row_max[r] = wm
+            row_sum[r] = ws
+
+        # 2) smem fan-out across the nwarps warps.  Scratch ALIASED onto the
+        # now-finished K/V smem (recast -> fp32): sKc holds acc, sVc holds
+        # [max | sum], indexed by warp_id.  can_implement guarantees these fit.
         sRedAcc = cute.make_tensor(
             cute.recast_ptr(sKc.iterator, dtype=Float32),
-            cute.make_layout((rpi, R, tpr, vec), stride=(R * tpr * vec, tpr * vec, vec, 1)),
+            cute.make_layout((nwarps, R, tpr, vec), stride=(R * tpr * vec, tpr * vec, vec, 1)),
         )
         sRedMS = cute.make_tensor(
             cute.recast_ptr(sVc.iterator, dtype=Float32),
-            cute.make_layout((2, rpi, R, tpr), stride=(rpi * R * tpr, R * tpr, tpr, 1)),
+            cute.make_layout((2, nwarps, R, tpr), stride=(nwarps * R * tpr, R * tpr, tpr, 1)),
         )
         cute.arch.barrier()
-        for r in cutlass.range_constexpr(R):
-            sRedMS[0, row_grp, r, lane_d] = row_max[r]
-            sRedMS[1, row_grp, r, lane_d] = row_sum[r]
-            for e in cutlass.range_constexpr(vec):
-                sRedAcc[row_grp, r, lane_d, e] = acc_o[r, e]
+        # Lanes in local group 0 of each warp (lane < tpr) own a distinct lane_d
+        # and hold the warp-merged state; they publish it keyed by warp_id.
+        if lane < tpr:
+            for r in cutlass.range_constexpr(R):
+                sRedMS[0, warp_id, r, lane_d] = row_max[r]
+                sRedMS[1, warp_id, r, lane_d] = row_sum[r]
+                for e in cutlass.range_constexpr(vec):
+                    sRedAcc[warp_id, r, lane_d, e] = acc_o[r, e]
         cute.arch.barrier()
 
-        # row_grp 0 reduces across all rpi groups, writes results back into regs.
+        # row_grp 0 (which is lane_d == lane, warp 0) merges across all nwarps.
         if row_grp == 0:
             for r in cutlass.range_constexpr(R):
                 gmax = Float32(-1e30)
-                for g in cutlass.range_constexpr(rpi):
+                for g in cutlass.range_constexpr(nwarps):
                     gmax = cutlass.max(gmax, sRedMS[0, g, r, lane_d])
                 gsum = Float32(0.0)
                 for e in cutlass.range_constexpr(vec):
                     acc_o[r, e] = Float32(0.0)
-                for g in cutlass.range_constexpr(rpi):
+                for g in cutlass.range_constexpr(nwarps):
                     gm = sRedMS[0, g, r, lane_d]
                     corr = cute.math.exp2((gm - gmax) * LOG2_E, fastmath=True)
                     corr = corr if gm > Float32(-1e29) else Float32(0.0)

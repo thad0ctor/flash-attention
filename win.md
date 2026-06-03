@@ -1275,3 +1275,56 @@ NET: clear 1.6-1.85x decode win at R≤4 (Llama-3 8B/70B = R4, many serving conf
 R2-4), beats both bf16 AND FA2. Reusable for milestone 2 (fp8 prefill MMA): the
 descale-folding semantics (k→score scale, v→O rescale) and the uint8-bytes fp8
 call convention are now proven on SM120. Scripts: agent_space/fp8_decode_{correctness,bench}.py.
+
+## 2026-06-03 — fp8 PREFILL MMA forward — milestone 2: NO-GO (~1.7x SLOWER than bf16)
+
+Built a standalone fp8 (e4m3) prefill prototype on the SM80-base MMA path (agent_space/
+fp8_prefill_proto.py, notes FP8_PREFILL_NOTES.md). NO production file touched; the
+arch//10==10 fp8 gate is untouched; nothing committed. Correctness is fine (~2.6e-2
+vs fp8-ref, P-requant-dominated by e4m3's ~2 mantissa bits — irreducible, not a bug)
+but it is **~1.7x SLOWER than bf16** on compute-bound dense MHA D128 at S2048-8192
+(fp8/bf16 ≈ 1.73, fp8/fa2 ≈ 1.70 — i.e. fp8 takes 1.7x the time). Refutes the
+feasibility 1.3-1.6x estimate.
+
+ROOT CAUSE (the milestone-defining finding): the fp8 QK m16n8k32 atom's C-layout and
+the fp8 PV m16n8k32 atom's A-layout are INCOMPATIBLE for the softmax probs P — QK-C
+gives each thread 2 cols per n8 group, PV-A needs 4 *contiguous* cols (the others live
+in a neighbor thread). For bf16 m16n8k16 these coincide, so bf16 does a FREE register
+relabel S→P. For fp8 a register-only reshape is impossible → a forced smem P round-trip
+EVERY K-block (store fp8 P → barrier → ldmatrix back as A). That round-trip + the V
+gmem-transpose pre-pass (ldmatrix has no 8-bit transpose, must physically transpose V
+to (b,h,d,s) like SM100's V_layout_transpose — a transpose-VIEW alone fails: cp.async
+8-bit-vs-128-bit src alignment error) more than erase the fp8 MMA's nominal 2x.
+
+To win fp8 prefill on sm_120 you'd need the S accumulator and P operand to SHARE a
+layout — i.e. a tcgen05/WGMMA Blackwell-native kernel (as SM100 does via tmem), not an
+extension of the SM80 mma.sync path. Same conclusion class as the backward "needs
+Blackwell-native rewrite" wall. fp8 effort CLOSED: decode banked, prefill dead.
+(Speed figures are agent-reported from the standalone prototype; uniform 1.73x across
+3 shapes + a sound mechanistic cause = credible NO-GO, not re-run since nothing to commit.)
+
+## 2026-06-03 — fp8 decode polish: R8 +10-13%, auto-enable, pytest (all re-validated in-process)
+
+Two follow-ups to the banked fp8 decode, validated together in one clean single-process
+pass on the RTX 6000 by me (not just the agents):
+
+(1) R8 regression partial fix (kernel two-level reduction). Root cause confirmed = the
+fp32 cross-group reduction scratch: at fp8-R8/D128 the old single-level smem fan-out was
+red_acc=rpi*R*tpr*vec*4 = 64KB → 80KB total → ~1 CTA/SM. Replaced with a two-level merge:
+warp-shuffle butterfly across the gpw=32/tpr row-groups in a warp, THEN smem fan-out
+across only nwarps (=4) instead of rpi. Scratch sized by nwarps. fp8-R8 scratch 64→16KB,
+total 80→32KB. bf16 smem byte-identical (K/V tile still dominates). Re-validated:
+  R8 (h32/4) batch16 fp8/bf16: 0.70-0.73 → 0.79-0.85 (fp8 10-13% faster), still <1.0
+    (residual = intrinsic fp8→fp32 conversion cost in the TN*R GEMV loop, not scratch).
+  R4/R2 batch16: unchanged at 1.54-1.85x. Correctness unchanged (worst 1.69e-3).
+
+(2) Auto-enable + guard + pytest (usability). fp8 K/V decode now auto-routes WITHOUT the
+FLASH_ATTENTION_SM120_DECODE_KERNEL env flag (it's the ONLY sm_120 path that can serve an
+fp8 K/V cache, so requiring an env var made a quantized cache unusable). The env flag stays
+as the manual override for the *bf16* decode kernel. For bf16 inputs the new predicates
+(fp8_kv_decode, want_fp8_decode) are always False → default dispatch BYTE-IDENTICAL (proven:
+the 2651 "failures" in an over-broad -k sweep are PRE-EXISTING sm_120 gaps at seqlen 4224 etc.
+— confirmed identical fail set on clean HEAD with changes stashed). Added a guard: fp8 K/V in
+an unsupported shape (seqlen_q>1 / MHA / D192 / non-sm120) now raises NotImplementedError
+instead of silently running the bf16 MMA over reinterpreted fp8 bytes. New pytest
+tests/cute/test_fp8_decode_sm120.py: 25 passed (R∈{2,4,8}, env on/off, auto-enable assertion).
