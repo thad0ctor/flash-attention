@@ -1140,3 +1140,35 @@ register reduction / warp-specialization for >=2 CTA/SM to close the rest.
 qpkv16 may fall back (reduction smem). Gated/causal=False/seqlen_q=1 only.
 Merged gated+off as an opt-in D256-decode improvement and a foundation; lab
 notes in agent_space/DECODE_KERNEL_NOTES.md. See [[sm120-d256-backward-occupancy-wall]].
+
+## 2026-06-03 — Decode occupancy-crack: VALIDATED NEGATIVE (it's access-bound, not warp-starved)
+
+Attacked the decode kernel's 1-CTA/SM (smem-limited) wall to reach 2 CTA/SM.
+Result: the hypothesis was WRONG. The kernel is NOT concurrency-limited; it is
+memory-ACCESS-inefficiency-bound. Every occupancy lever failed (authoritative
+single-process CUDA-event timing, qpkv8 D256 Sk32768, decode-only):
+  baseline 128t/NS=2/partition/tile_n32 (65.5KB): 318us  <- already fastest
+  NS=1/allkeys/tile_n32 (32KB, fits 2-3 CTA/SM): 1225us (3.9x SLOWER)
+  256t/NS=1/allkeys: 1343us; tile_n 16/64 variants: 1228-1373us
+  num_splits 23->47->94->188 (grid 184->1504): 318->317->324->354 (more CTAs = no help/worse)
+Reducing smem to allow 2 CTA/SM forces the "allkeys" GEMV (no row-partition),
+whose redundant on-chip FMA + smem re-reads dominate -> 4x worse. More
+CTAs/warps don't help -> NOT warp-starved.
+
+ncu SOL (baseline default config, which ncu profiles correctly): DRAM 46%,
+Compute 18%, L2 17% — NOTHING saturated; top stall MIO scoreboard; "only 4 of 32
+bytes per sector utilized" -> the per-thread GEMV K/V loads are bandwidth-
+INEFFICIENT (uncoalesced effective access). Kernel moves 268MB at ~843 GB/s vs
+FA2's ~1.14 TB/s. Plus R-fold redundancy at high qpkv.
+
+VERDICT: 2 CTA/SM is the wrong target for decode. To beat FA2 needs a MEMORY-
+ACCESS redesign (coalesced K/V streaming, fewer redundant smem reads), not
+occupancy — a substantial rewrite. The shipping gated decode kernel (318us, D256
+1.2-1.3x over baseline, ~0.6-0.95x FA2) is already its best config.
+
+METHODOLOGY CAVEAT (important for future ncu work): `sudo ncu` serves a STALE
+kernel from the root-owned /tmp/root/cutlass_python_cache and is INSENSITIVE to
+env-var kernel configs (always profiles the default). Trust single-process
+CUDA-event timing (config-responsive) for A/B; use sudo-ncu only for the
+default-config occupancy/SOL snapshot. (My earlier decode ncu numbers were the
+default config, so directionally valid, but cross-config ncu A/B is unreliable.)
