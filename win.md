@@ -1328,3 +1328,20 @@ the 2651 "failures" in an over-broad -k sweep are PRE-EXISTING sm_120 gaps at se
 an unsupported shape (seqlen_q>1 / MHA / D192 / non-sm120) now raises NotImplementedError
 instead of silently running the bf16 MMA over reinterpreted fp8 bytes. New pytest
 tests/cute/test_fp8_decode_sm120.py: 25 passed (R∈{2,4,8}, env on/off, auto-enable assertion).
+
+## 2026-06-03 — Forward dispatch re-sweep: 1 win, otherwise at floor
+
+Full opus re-sweep of the B2 forward grid (D128/D256 x MHA/GQA-4/5/8/MQA x dense/causal/
+local x S 1024-16384) for any shape still losing to FA2. Result: the forward is essentially
+AT FLOOR. Exactly ONE genuine, reliable dispatch lever found and BANKED:
+- (128,4,2048,1) lookup 64x96,ns1 -> 128x64,ns2. The old tile was erratic vs FA2 (fa4/fa2
+  swinging 0.98-1.08 across seeds, sometimes a laggard); the new tile holds a tight
+  1.068-1.081x across all seeds. Re-validated in-process by me (interleaved, clock soak,
+  8 repeats x 3 seeds), correctness 1.1e-3. Net: removes a parity-prone config -> shape now
+  reliably beats FA2 ~7%. Committed.
+Everything else: either a real laggard with NO tile/thread/stage lever (D128 MHA causal ~0.94,
+D256 MHA S1024 causal ~0.95 — kernel-level, not dispatch), or a measurement phantom from
+cold/short-soak baselines that reversed under rigorous interleaved timing (the sweep caught a
+live "1.69x win" at D256 S1024 that was actually current-throttled). Confirms again: the prior
+subprocess sweep systematically under-rated FA4; tuned GQA shapes measure parity-to-winning
+in-process. No further forward dispatch wins available without kernel-level work.
