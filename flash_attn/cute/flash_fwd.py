@@ -695,7 +695,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -787,6 +786,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale,
             window_size_left,
             window_size_right,
+            learnable_sink,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -811,6 +811,34 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             stream=stream,
         )
 
+    @cute.jit
+    def compute_sink_val(
+        self,
+        learnable_sink: Optional[cute.Tensor],
+        softmax: Softmax,
+        m_block: Int32,
+        head_idx: Int32,
+        thr_mma_qk,
+    ):
+        """Per-row learnable-sink logit for softmax.finalize (mirrors SM90).
+
+        Non-pack: head_idx is the query head -> a single scalar. Pack-GQA:
+        head_idx is the KV head and each packed row maps to a different query
+        head, so produce a per-row fragment shaped like softmax.row_max.
+        """
+        if const_expr(learnable_sink is None):
+            return None
+        if const_expr(not self.pack_gqa):
+            return Float32(learnable_sink[head_idx])
+        sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
+        for r in cutlass.range(cute.size(sink_val), unroll_full=True):
+            row = m_block * self.tile_m + tScS_mn[r][0]
+            q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
+            sink_val[r] = Float32(learnable_sink[q_head_idx])
+        return sink_val
+
     @cute.kernel
     def kernel(
         self,
@@ -828,6 +856,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        learnable_sink: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1182,7 +1211,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     subtile,
                 )
 
-            row_scale = softmax.finalize()
+            row_scale = softmax.finalize(
+                sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, num_head, thr_mma_qk)
+            )
             softmax.rescale_O(acc_O, row_scale)
             sO = cute.make_tensor(sQ.iterator, sO_layout)
             self.epilogue(
@@ -1382,7 +1413,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
 
             # normalize acc_O by row_sum and calculate the lse
-            row_scale = softmax.finalize()
+            row_scale = softmax.finalize(
+                sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, num_head, thr_mma_qk)
+            )
             softmax.rescale_O(acc_O, row_scale)
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1492,6 +1525,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     num_head,
                     window_size_left,
                     window_size_right,
+                    learnable_sink,
                     gQ,
                     tidx,
                     aux_tensors=aux_tensors,
@@ -1765,6 +1799,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         head_idx: Int32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        learnable_sink: Optional[cute.Tensor],
         gQ: cute.Tensor,
         tidx: Int32,
         aux_tensors=None,
@@ -2092,7 +2127,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # slots can race with our completion fence.
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
-        row_scale = softmax.finalize()
+        row_scale = softmax.finalize(
+            sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, head_idx, thr_mma_qk)
+        )
         softmax.rescale_O(acc_O, row_scale)
         sO = cute.make_tensor(sQ.iterator, sO_layout)
         self.epilogue(

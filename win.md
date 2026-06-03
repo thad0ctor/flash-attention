@@ -727,3 +727,31 @@ tile. Among 7 candidates, 64x96 is the robust winner over 3 runs (15 interleaved
 blocks each): +5-6% vs current, flipping it to 1.02-1.04 vs FA2. Correctness vs
 SDPA rel 2.3e-3 (PASS). Surgical: only the (128,4,1024,1) lookup cell; the
 non-causal cell keeps 128x64.
+
+## 2026-06-02 — FIX: learnable_sink on the SM80-base forward kernel (D256 + pack-GQA)
+
+The pre-existing learnable_sink+D256 failure flagged earlier is now FIXED. Root
+cause: it was NOT a numerical bug — flash_fwd.py (FlashAttentionForwardSm80, the
+SM80-base forward used by SM120 for D256 and all pack-GQA/varlen/paged shapes)
+HARD-ASSERTED `learnable_sink is None`. The shared softmax.finalize(sink_val=...)
+already implements the sink denominator term; only the SM80-base kernel never
+wired it. interface.py already routes sink shapes here (use_tma_sm120 requires
+learnable_sink is None) and already passes learnable_sink_tensor to __call__ and
+keys the compile cache on `learnable_sink is not None` — so the kernel body was
+the only gap.
+
+Fix (flash_fwd.py): removed the assertion; threaded learnable_sink through
+kernel() and _paged_kv_mainloop(); added compute_sink_val() (mirrors SM90:
+scalar per head for non-pack, per-row fragment via the QK identity-tensor
+row->q_head map for pack_gqa); passed sink_val to softmax.finalize at all three
+finalize sites (main, block-sparse, paged-KV). Fully guarded by
+`learnable_sink is None` -> returns None -> byte-identical no-op for the common
+(no-sink) path.
+
+VALIDATION:
+- Direct vs fp32 SDPA-with-sink reference: D128 & D256, S 512-4096, causal+nc,
+  pack_gqa qpkv4 -> rel ~2-3e-3 (all PASS; previously raised AssertionError).
+- pytest d=256 seqlen 4096 FULL set (mha/mqa/gqa x softcap{0,15} x sink{T,F} x
+  deterministic): 120 passed / 0 failed (was 60 pass / 60 FAIL — the 60 fails
+  were exactly the sink=True configs). Zero regression on the 60 non-sink cases.
+This also enables learnable_sink on Ampere (SM80) via the same base kernel.
