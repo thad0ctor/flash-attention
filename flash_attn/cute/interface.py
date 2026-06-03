@@ -1132,6 +1132,26 @@ def _flash_attn_fwd(
         )
     )
 
+    # SM120 decode auto-split: a small-seqlen_q call (decode / speculative
+    # decode) launches only ~batch*num_head_kv CTAs (1 m-block), badly
+    # underfilling the 188 SMs while each streams the entire KV cache — 5-10x
+    # slower than FA2. Request auto (num_splits=0) HERE, before the pack_gqa
+    # disable below, so SplitKV engages with pack_gqa correctly turned off (the
+    # GQA+SplitKV combo is unsupported). The num_splits heuristic further down
+    # returns 1 when the grid is actually filled (e.g. large batch), so this is
+    # self-protecting. Non-varlen / non-paged / non-MLA only.
+    if (
+        arch // 10 == 12
+        and num_splits == 1
+        and seqlen_q is not None
+        and seqlen_q <= 8
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and page_table is None
+        and qv is None
+    ):
+        num_splits = 0  # request the heuristic (engages SplitKV iff underfilled)
+
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
@@ -1168,9 +1188,10 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
-    # SM120 does not support SplitKV in this kernel variant
-    if arch // 10 == 12 and num_splits > 1:
-        num_splits = 1
+    # SM120 SplitKV (FlashDecoding-style) is implemented on the SM80-base
+    # non-TMA path (FlashAttentionForwardSm120).  The TMA path
+    # (FlashAttentionForwardSm120Tma) does not support it; the dispatch below
+    # forces the non-TMA path when num_splits > 1.
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
@@ -1530,6 +1551,10 @@ def _flash_attn_fwd(
         q_stage,
         num_threads,
         is_split_kv,
+        # SM120 SplitKV bakes num_splits into the grid shape and the
+        # scheduler's FastDivmodDivisor as a compile-time constant, so
+        # kernels compiled for different num_splits must not share a key.
+        num_splits if (arch // 10 == 12 and is_split_kv) else None,
         pack_gqa,
         pack_gqa_all_rows_valid,
         sm120_pack_gqa_fast_valid_rows if arch // 10 == 12 else None,
@@ -1769,6 +1794,7 @@ def _flash_attn_fwd(
                 and not use_block_sparsity
                 and not pack_gqa
                 and learnable_sink is None
+                and not is_split_kv
                 and not sm120_qpkv5_s4096_nc_notma
             )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
@@ -1793,7 +1819,6 @@ def _flash_attn_fwd(
                     skip_dense_seqlen_mask=sm120_skip_dense_seqlen_mask,
                 )
             else:
-                assert not is_split_kv, "SplitKV not supported on SM 12.0 (SM80-base kernel)"
                 # can_implement gates configs that would either overflow SMEM
                 # or fault on bad head_dim divisibility. head_dim > head_dim_v
                 # is supported on this (non-TMA) path; the TMA path still
@@ -1832,6 +1857,8 @@ def _flash_attn_fwd(
                     hook_load_k=sm120_hook_load_k,
                     hook_load_v=sm120_hook_load_v,
                     static_causal_blocks=sm120_qpkv6_d256_static_causal_blocks,
+                    is_split_kv=is_split_kv,
+                    num_splits=num_splits,
                 )
         else:
             raise ValueError(

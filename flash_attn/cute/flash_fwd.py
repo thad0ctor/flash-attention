@@ -68,6 +68,8 @@ class FlashAttentionForwardBase:
         hook_load_k: bool = False,
         hook_load_v: bool = False,
         static_causal_blocks: bool = False,
+        is_split_kv: bool = False,
+        num_splits: int = 1,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -116,6 +118,8 @@ class FlashAttentionForwardBase:
         self.hook_load_k = hook_load_k
         self.hook_load_v = hook_load_v
         self.static_causal_blocks = static_causal_blocks
+        self.is_split_kv = is_split_kv
+        self.num_splits = num_splits
         self.qk_acc_dtype = Float32
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -203,8 +207,15 @@ class FlashAttentionForwardBase:
         mSeqUsedQ_type: Type[cutlass.Numeric] | None,
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
     ):
-        # Get the data type and check if it is fp16 or bf16
-        if const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
+        # Get the data type and check if it is fp16 or bf16.  SplitKV writes a
+        # float32 partial output (out_partial), so mO is allowed to be fp32
+        # while Q/K/V remain fp16/bf16.
+        if const_expr(self.is_split_kv):
+            if const_expr(not (mQ_type == mK_type == mV_type)):
+                raise TypeError("Q/K/V must have the same data type")
+            if const_expr(mO_type != Float32):
+                raise TypeError("SplitKV partial output must be Float32")
+        elif const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
             raise TypeError("All tensors must have the same data type")
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
@@ -360,26 +371,32 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        split_idx: Int32 = 0,
     ):
-        # store acc_O
-        rO = cute.make_fragment_like(acc_O, self.dtype)
-        rO.store(acc_O.load().to(self.dtype))
-        # Make sure all threads have finished reading V
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
-        )
-        # SM80/SM120 use SM80 MMA (m16n8k16) whose register layout is incompatible
-        # with the SM90 stmatrix path get_smem_store_atom picks for arch >= 90;
-        # force universal copy for them. SM90 keeps stmatrix (matches WGMMA layout).
-        arch_int = self.arch.major * 10 + self.arch.minor
-        store_atom_arch = 80 if arch_int // 10 in [8, 12] else arch_int
-        smem_copy_atom_O = utils.get_smem_store_atom(store_atom_arch, self.dtype)
-        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
-        taccOrO = smem_thr_copy_O.retile(rO)
-        taccOsO = smem_thr_copy_O.partition_D(sO)
-        # taccOsO = copy_utils.partition_D_position_independent(smem_thr_copy_O, sO)
-        # copy acc O from rmem to smem with the smem copy atom
-        cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
+        # SplitKV writes the fp32 partial output (out_partial) directly from
+        # registers to gmem, bypassing the bf16-sized smem O buffer (which is
+        # aliased onto sQ and could not hold fp32 without doubling smem).  The
+        # smem roundtrip below is only for the packed dtype (fp16/bf16) output.
+        if const_expr(not self.is_split_kv):
+            # store acc_O
+            rO = cute.make_fragment_like(acc_O, self.dtype)
+            rO.store(acc_O.load().to(self.dtype))
+            # Make sure all threads have finished reading V
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
+            )
+            # SM80/SM120 use SM80 MMA (m16n8k16) whose register layout is incompatible
+            # with the SM90 stmatrix path get_smem_store_atom picks for arch >= 90;
+            # force universal copy for them. SM90 keeps stmatrix (matches WGMMA layout).
+            arch_int = self.arch.major * 10 + self.arch.minor
+            store_atom_arch = 80 if arch_int // 10 in [8, 12] else arch_int
+            smem_copy_atom_O = utils.get_smem_store_atom(store_atom_arch, self.dtype)
+            smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
+            taccOrO = smem_thr_copy_O.retile(rO)
+            taccOsO = smem_thr_copy_O.partition_D(sO)
+            # taccOsO = copy_utils.partition_D_position_independent(smem_thr_copy_O, sO)
+            # copy acc O from rmem to smem with the smem copy atom
+            cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
 
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         pack_gqa = PackGQA(
@@ -388,7 +405,13 @@ class FlashAttentionForwardBase:
 
         # Write LSE from rmem -> gmem
         if const_expr(mLSE is not None):
-            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
+            # SplitKV: mLSE is (s, h, b, split) [non-varlen] or
+            # (total_q, h, split) [varlen]; index batch (via offset_batch_Q),
+            # then head and split.  Non-split: (s, h, b) -> select head.
+            if const_expr(self.is_split_kv):
+                mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx, split_idx]
+            else:
+                mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
             if const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 gLSE_expanded_layout = cute.append(
@@ -423,12 +446,40 @@ class FlashAttentionForwardBase:
                     pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
         ragged = self.use_tma_O and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
-        mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
+        # SplitKV: mO is (s, d, h, b, split) [non-varlen] or (total_q, d, h, split)
+        # [varlen]; index batch, then head and split.  Non-split: (s, d, h, b).
+        if const_expr(self.is_split_kv):
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx, split_idx]
+        else:
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
         # thr_mma = tiled_mma.get_slice(tidx)
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)
         # sync to make sure all smem stores are done
-        if const_expr(self.use_tma_O):
+        if const_expr(self.is_split_kv):
+            # Direct fp32 register -> gmem store of the partial output, using
+            # the MMA accumulator's partition_C layout (same as acc_O) so no
+            # smem roundtrip / type conversion is needed.  reshape_acc_to_mn
+            # gives a 2D (M, N) view; predicate rows by seqlen_q and columns by
+            # head_dim_v via the identity-tensor coordinates (matches the LSE
+            # write above and the SM100 split epilogue).
+            gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+            thr_mma = tiled_mma.get_slice(tidx)
+            taccOgO_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gO))
+            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+            t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+            for m in cutlass.range_constexpr(cute.size(taccOgO_mn.shape[0])):
+                if (
+                    t0accOcO[m, 0][0]
+                    < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
+                ):
+                    for n in cutlass.range_constexpr(cute.size(taccOgO_mn.shape[1])):
+                        if const_expr(not self.check_hdim_v_oob):
+                            taccOgO_mn[m, n] = acc_O_mn[m, n]
+                        elif taccOcO[0, n][1] < mO.shape[1]:
+                            taccOgO_mn[m, n] = acc_O_mn[m, n]
+        elif const_expr(self.use_tma_O):
             # ensure smem writes are visible to TMA
             cute.arch.fence_view_async_shared()
             cute.arch.barrier_arrive(
@@ -716,16 +767,24 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Layout permutation: 4D non-varlen vs 3D varlen
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mQ, mO = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
-            for t in (mQ, mO)
-        ]
+        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=QO_layout_transpose))
         mK, mV = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
             for t in (mK, mV)
         ]
-        if const_expr(mLSE is not None):
+        # SplitKV: mO is the 5D out_partial (num_splits, b, s, h, d) and mLSE
+        # the 4D lse_partial (num_splits, b, s, h) [or (num_splits, h, total_q)
+        # for varlen].  Reorder so seqlen leads, head and split are selectable.
+        # Mirrors flash_fwd_sm100.py: O select [2,4,3,1,0] -> (s, d, h, b, split),
+        # LSE select [3,2,1,0] -> (s, h, b, split).
+        if const_expr(self.is_split_kv):
+            O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
+            LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
+        else:
+            O_layout_transpose = QO_layout_transpose
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
+        if const_expr(mLSE is not None):
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
         # Fold qhead_per_kvhead into the seqlen mode of mQ/mO/mLSE so the
         # mainloop iterates over KV heads with packed Q rows. Required for
@@ -754,8 +813,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             num_block=cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
-            num_splits=1,
-            seqlen_k=0,
+            # SplitKV: the SingleTileScheduler multiplies the head axis by
+            # num_splits in get_grid_shape and divmods head_idx back into
+            # (head_idx, split_idx) in get_current_work.  num_splits is a
+            # compile-time Python int here (self.num_splits) so the grid shape
+            # and the FastDivmodDivisor are static for this kernel variant.
+            num_splits=self.num_splits if const_expr(self.is_split_kv) else 1,
+            seqlen_k=cute.size(mK.shape[0]),
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
             total_q=cute.size(mQ.shape[0])
@@ -765,6 +829,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            is_split_kv=self.is_split_kv,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -880,14 +945,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, num_head, batch_size, _ = work_tile.tile_idx
+        m_block, num_head, batch_size, split_idx = work_tile.tile_idx
 
         block_info = BlockInfo(
             self.tile_m,
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,  # is_split_kv
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -917,15 +982,33 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
         )
-        if const_expr(self.static_causal_blocks):
+        if const_expr(self.static_causal_blocks and not self.is_split_kv):
             n_block_min, n_block_max = Int32(0), m_block + 1
         else:
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            # SplitKV: get_n_block_min_max partitions [0, n_block_full_max) into
+            # num_splits contiguous block ranges by split_idx; empty splits
+            # (n_block_min >= n_block_max) run zero mainloop iterations so the
+            # epilogue writes O=0 and LSE=-inf (softmax.finalize handles the
+            # row_sum==0 case), which the combine kernel then drops.
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen,
+                m_block,
+                split_idx,
+                self.num_splits if const_expr(self.is_split_kv) else 1,
+            )
         # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
         # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
         # negative block index for K/V loads; the load/store predicates already
         # guard all memory accesses when seqlen is 0.
         n_block = cutlass.max(n_block_max - 1, 0)
+        # SplitKV: a split with no assigned KV blocks must skip all compute and
+        # fall straight through to the epilogue (which writes O=0, LSE=-inf so
+        # the combine drops it).  For the non-split path has_work is always
+        # True (a valid tile always has >= 1 block).
+        if const_expr(self.is_split_kv):
+            has_work = n_block_max > n_block_min
+        else:
+            has_work = True
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread block.
@@ -1218,7 +1301,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             sO = cute.make_tensor(sQ.iterator, sO_layout)
             self.epilogue(
                 acc_O, softmax.row_sum, mO, mLSE, sO, seqlen, gmem_tiled_copy_O,
-                None, tiled_mma_pv, tidx, m_block, num_head, batch_size,
+                None, tiled_mma_pv, tidx, m_block, num_head, batch_size, split_idx,
             )
 
         if const_expr(blocksparse_tensors is None and mPageTable is None):
@@ -1321,23 +1404,27 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # dispatch proved there is no K tail tile.
             smem_pipe_read = Int32(0)
             smem_pipe_write = Int32(self.num_stages - 1)
-            if const_expr(self.skip_dense_seqlen_mask):
-                compute_one_n_block(
-                    n_block,
-                    smem_pipe_read,
-                    smem_pipe_write,
-                    is_first_n_block=True,
-                    seqlen=seqlen,
-                )
-            else:
-                compute_one_n_block(
-                    n_block,
-                    smem_pipe_read,
-                    smem_pipe_write,
-                    is_first_n_block=True,
-                    seqlen=seqlen,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-                )
+            # SplitKV: skip the unconditional first-block compute for an empty
+            # split (no assigned blocks).  The masked/unmasked loops below are
+            # already bounded by ranges that clamp to 0 trips for empty splits.
+            if has_work:
+                if const_expr(self.skip_dense_seqlen_mask):
+                    compute_one_n_block(
+                        n_block,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        is_first_n_block=True,
+                        seqlen=seqlen,
+                    )
+                else:
+                    compute_one_n_block(
+                        n_block,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        is_first_n_block=True,
+                        seqlen=seqlen,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                    )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # Next couple of iterations with causal masking
@@ -1437,6 +1524,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 m_block,
                 num_head,
                 batch_size,
+                split_idx,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////

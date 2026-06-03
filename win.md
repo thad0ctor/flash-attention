@@ -1043,3 +1043,49 @@ rel ~2.5e-3 (PASS). Net positive across all gemma-local varlen shapes. seqused
 stays on the narrow path. (varlen test doesn't parametrize local -> validated via
 SDPA-windowed-varlen on the exact gemma shapes; local-wide and varlen-wide are
 each independently pytest-validated.)
+
+## 2026-06-02 — BIG WIN: SplitKV (FlashDecoding) for SM120 forward — decode 2-4x
+
+Investigated decode/SplitKV (seqlen_q=1, large KV). Found SM120 hard-disabled
+SplitKV (interface.py `if arch//10==12 and num_splits>1: num_splits=1`), so
+decode launched only ~batch*num_head_kv CTAs (B=1 -> ~8 CTAs on 188 SMs), each
+streaming the whole KV cache: FA4 was 0.10-0.21x of FA2 at B=1 Sk>=16384.
+
+Implemented SplitKV on the SM80-base forward (opus agent in a worktree, reviewed
++ re-validated by me): the split scheduler (SingleTileScheduler), split n-block
+range (BlockInfo), combine kernel, partial buffers, and per-split
+softmax.finalize ALL already existed and are arch-neutral — the kernel just
+hard-coded split off. Changes (all const_expr(self.is_split_kv)-gated, so the
+non-split/training path compiles byte-identical):
+- flash_fwd.py (~194L): is_split_kv/num_splits ctor; split-aware O/LSE 5D/4D
+  layout transpose (mirrors SM100); split_idx from work tile; BlockInfo split
+  range; empty-split guard (has_work -> O=0/LSE=-inf, combine drops them);
+  direct fp32 reg->gmem partial-O write (bypasses the bf16 smem O buffer); 3
+  epilogue call sites. NO softmax math change.
+- flash_fwd_combine.py (~15L): gate griddepcontrol.wait (PDL) to arch>=90 (it's
+  illegal on the sm_80-compiled SM120 target; combine never ran on SM120 before
+  since split was disabled).
+- interface.py: remove the disable + assert; force non-TMA for split; pass
+  is_split_kv/num_splits to the ctor; num_splits in compile_key (SM120-split
+  only); DECODE AUTO-TRIGGER: for seqlen_q<=8 + non-varlen/paged/MLA, request
+  num_splits=0 BEFORE the pack_gqa disable (the GQA+SplitKV combo is unsupported,
+  so pack_gqa must be off; ordering matters). The num_splits heuristic
+  self-protects (returns 1 for a filled grid, e.g. large batch), so prefill/
+  training (seqlen_q>8) is never touched.
+
+VALIDATION:
+- Correctness vs SDPA (bottom-right causal for seqlen_q<seqlen_k): decode B in
+  {1,4,64}, Sk in {4096..32768}, D128/256, qpkv 4/8/16, seqlen_q 1/2/4/8 -> rel
+  2e-3..8e-3 (PASS). Explicit num_splits 2..128 all correct. (NOTE: the earlier
+  "no-split rel 0.85" was a transient buggy auto-elif (set num_splits after the
+  pack_gqa disable), since removed — the true no-split path is correct.)
+- Speed: decode now 0.32-0.65x of FA2 (was 0.10-0.21x) -> ~2-4x faster. Split vs
+  no-split ~3.2-3.7x (B1 Sk32768 D128: 0.99->0.27ms). FA4 still slower than FA2
+  absolute (residual = SM80-base per-CTA decode inefficiency: no TMA, tile_m
+  wasted on few query rows -> needs a Blackwell-native decode kernel, separate).
+- No regression: training (seqlen_q>=1024) early-trigger does NOT fire, wide-tile
+  wins intact (122b 1.139, vl 1.016); pytest test_flash_attn d256 seqlen4096
+  120 passed / 0 failed.
+
+GATED OUT (untested, left on safe path): varlen+split, paged+split, seqused,
+MLA(qv). The structural code paths exist but are not validated — don't rely yet.
