@@ -843,3 +843,21 @@ Excluded (unchanged 64x64, verified): qwen3.5-0.8b Hq8 S2048 nc = 0.998 (median
 of 12), S2048 causal (9b 0.995, 122b 1.029). Correctness vs SDPA rel ~1-3e-3.
 One-line gate change; not in the standard bench (which uses 1024/4096/8192) but
 real perf for S2048 training/inference.
+
+## 2026-06-02 — D256 BACKWARD is parity in-process (NOT an occupancy-walled laggard)
+
+In-process interleaved D256 backward matrix (sm120_bwd_d256_inproc.py, 28 cells,
+backward-only timing): geomean 0.9961, wins 13/28. The larger shapes WIN:
+  qwen3.5-27b qpkv6 S2048 nc 1.056, S1024 c 1.075
+  qwen3.5-122b qpkv16 S2048 nc 1.064, S1024 nc 1.043
+  qwen3.6-35b qpkv8 S1024 nc 1.018; gemma4-31b qpkv2 S2048 nc 1.021
+Only the tiny S1024 gemma cells dip (gemma4-e2b qpkv8 S1024 c 0.875, e4b qpkv4
+S1024 nc 0.904) — ~0.4ms multi-launch kernels, noise-dominated.
+
+So the D256 backward "occupancy wall 0.93-0.98 laggard" (campaign brief's
+"biggest latent prize") is NOT a real FA4-vs-FA2 deficit — it was the biased
+harness + S1024 noise. The 1-CTA/SM occupancy wall is a real HARDWARE limit
+(255 reg, no tcgen05) but FA2 hits the same wall, so the RATIO is ~parity. There
+is no D256-backward laggard to chase and no rewrite is warranted (consistent with
+[[sm120-d256-backward-occupancy-wall]] / [[sm120-backward-kernel-changes-rejected]]
+on the kernel being unfixable — but the ratio was never actually a loss).
