@@ -784,6 +784,40 @@ def _flash_attn_fwd(
         sm120_qpkv6_d256_qregs_mode = "128x64_t256"
     else:
         sm120_qpkv6_d256_qregs_mode = ""
+    # General D256 forward: the 99 KB SMEM cap forces a 64x64 tile only because
+    # 128x64 won't fit Q+K+V — but staging Q through registers (max(Q,V)+K)
+    # makes 128x64 fit, and it is materially faster for any reasonably long
+    # sequence. RTX 6000 interleaved A/B (agent_space/sm120_d256_wide_confirm.py):
+    # at S>=4096 (square) 128x64+Qregs+256t beats 64x64 by +6-14% across qpkv
+    # 4/8/16, causal and non-causal, with bit-identical output (the per-key
+    # reduction order is unchanged). S<=2048 is mixed (several causal shapes
+    # regress) so it is gated out. Shapes already routed to a specific qregs
+    # path keep theirs.
+    sm120_d256_wide_env = os.environ.get("FLASH_ATTENTION_SM120_D256_WIDE", "").lower()
+    sm120_d256_wide = (
+        arch // 10 == 12
+        and q.dtype == torch.bfloat16
+        and head_dim == 256
+        and head_dim_v == 256
+        and not local
+        and sm120_seq_q == sm120_seq_k
+        and sm120_seq_q >= 4096
+        and not sm120_d256_qregs128
+        and not sm120_qpkv8_d256_causal_qregs_mode
+        and not sm120_qpkv16_d256_causal_qregs_mode
+        and not sm120_qpkv6_d256_qregs_mode
+        and page_table is None
+        and qv is None
+        and learnable_sink is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and mask_mod is None
+        and score_mod is None
+        and sm120_d256_wide_env not in {"0", "false", "off", "no"}
+    )
     if (
         arch // 10 == 12
         and causal
@@ -900,6 +934,11 @@ def _flash_attn_fwd(
                     num_threads = 256
                 else:
                     fwd_cfg = FwdConfig(64, 64, True, True)
+            elif sm120_d256_wide:
+                # d=256, S>=4096: 128x64 fits via Q-in-regs and beats 64x64 by
+                # +6-14% (see sm120_d256_wide above). 256 threads is the A/B win.
+                fwd_cfg = FwdConfig(128, 64, True, True)
+                num_threads = 256
             elif head_dim > 128:
                 # d=256: (128, 64) overflows the 99 KB SMEM cap; shrink to 64x64.
                 fwd_cfg = FwdConfig(64, 64, True, True)
@@ -1015,7 +1054,7 @@ def _flash_attn_fwd(
     # it cuts the non-TMA shared-memory footprint from Q+K+V to max(Q,V)+K.
     sm120_q_in_regs = (
         arch // 10 == 12
-        and (causal or sm120_d256_qregs128 or sm120_qpkv6_d256_qregs_mode)
+        and (causal or sm120_d256_qregs128 or sm120_qpkv6_d256_qregs_mode or sm120_d256_wide)
         and not local
         and (
             (
@@ -1027,6 +1066,7 @@ def _flash_attn_fwd(
             or sm120_qpkv8_d256_causal_qregs_mode
             or sm120_qpkv16_d256_causal_qregs_mode
             or sm120_qpkv6_d256_qregs_mode
+            or sm120_d256_wide
         )
         and (
             sm120_seq_q == 8192
@@ -1036,6 +1076,7 @@ def _flash_attn_fwd(
             or sm120_qpkv8_d256_causal_qregs_mode
             or sm120_qpkv16_d256_causal_qregs_mode
             or sm120_qpkv6_d256_qregs_mode
+            or sm120_d256_wide
         )
     )
 

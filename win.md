@@ -684,3 +684,37 @@ There is NO real backward-D128 gap to close — the entire "0.966 / 7-of-24 net
 loss, primary place to improve" premise was 100% the clock-boost + fa2-first
 measurement artifact. No backward kernel/dispatch work is warranted on D128.
 The nonpack-M-split lever (D256-only anyway) is NOT needed here.
+
+## 2026-06-02 — BIG WIN: general D256 forward wide tile (128x64+Qregs+256t) at S>=4096
+
+The D256 forward was forced to a 64x64 tile only because 128x64 won't fit
+Q+K+V in the 99 KB SMEM cap. Staging Q through registers (smem = max(Q,V)+K)
+makes 128x64 fit, and it is much faster. The existing qregs paths enabled this
+only for a handful of narrow B=1 long-seq shapes; it generalizes to ALL D256.
+
+Discovered by an autonomous FA4-vs-FA4 in-process tile explorer
+(agent_space/sm120_fwd_tile_explore.py) + robust confirm
+(sm120_d256_wide_confirm.py, 12 interleaved blocks). At S>=4096 (square),
+128x64+Qregs+256t beats 64x64 by (wide/cur):
+  qpkv4 (9b)   : S4096 c0 1.114 c1 1.058 | S8192 c0 1.139 c1 1.117
+  qpkv8 (35b)  : S4096 c0 1.115 c1 1.065 | S8192 c0 1.139 c1 1.121
+  qpkv16 (122b): S4096 c0 1.140 c1 1.113 | S8192 c0 1.137 c1 1.126
+  qpkv4 (0.8b) : S4096 c0 1.134 c1 1.000 | S8192 c0 1.110 c1 1.088
+vs FA2 these shapes go from ~1.01 to ~1.09-1.16. Output is BIT-IDENTICAL to the
+64x64 path (probe_vs_cur rel 0.0; the per-key reduction order is unchanged) and
+matches SDPA at rel 3e-4..3e-3.
+
+GATING: S>=4096 only. S<=2048 is mixed (several causal shapes regress 0.91-0.97)
+so it stays 64x64. Excludes shapes already on a specific qregs path (qpkv6,
+B=1 qregs128/qpkv8/16-causal), local, paged, varlen, qv, sparse, mask/score_mod,
+and learnable_sink. Env kill-switch FLASH_ATTENTION_SM120_D256_WIDE=0.
+
+CORRECTNESS: pytest d=256 seqlen 4096 (gqa) = 20 pass / 20 fail, IDENTICAL set
+with wide ON vs OFF -> the change adds ZERO regressions. (The 20 failures are a
+PRE-EXISTING learnable_sink+D256-large-seqlen bug present on the 64x64 path too;
+flagged separately below, excluded from the wide path.) This is the largest
+forward win of the campaign: it lifts most of the 54 D256 cells by +6-14%.
+
+PRE-EXISTING BUG FLAGGED (not from this campaign): has_learnable_sink=True at
+D256 seqlen 4096 fails the reference check on BOTH 64x64 and 128x64 paths. No
+target model uses learnable sinks; needs a separate investigation.
