@@ -819,8 +819,9 @@ def _flash_attn_fwd(
         and page_table is None
         and qv is None
         and learnable_sink is None
-        and cu_seqlens_q is None
-        and cu_seqlens_k is None
+        # varlen (cu_seqlens) is supported by the wide tile (same SM80-base
+        # kernel; RTX6000 A/B +7-11% on packed D256, bit-identical). seqused
+        # mode stays on the 64x64 path (untested).
         and seqused_q is None
         and seqused_k is None
         and not use_block_sparsity

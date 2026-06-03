@@ -1009,3 +1009,23 @@ with the ncu profiling (D128 compute-bound; D256 occupancy-walled, spill only 8.
 and the occupancy-redesign de-risk (dK/dV split infeasible, head_dim-split net-loss),
 there is no backward win available on sm_120. Forward remains the productive surface
 (1.053 geomean, Q-in-regs wide tile). See [[sm120-d256-backward-occupancy-wall]].
+
+## 2026-06-02 — WIN: extend D256 wide tile to VARLEN forward (+7-11%, packed-seq)
+
+Autonomous forward win-hunt: dense-forward dispatch (tiles/stages/threads) is
+exhausted (a stage/thread explorer found no >3% wins; qpkv5 S4096 causal is
+MMA-issue-efficiency-bound per ncu: FA4 62% SM vs FA2 70%, not dispatch-fixable).
+But the VARLEN forward path was needlessly excluded from the D256 wide tile
+(cu_seqlens gate). varlen D256 forward (packed-sequence training, ubiquitous)
+ran at 64x64; the 128x64+Qregs+256t wide tile helps it too:
+  RTX6000 A/B (packed [4096,2048,1024,1024]):
+    qwen3.5-122b qpkv16 c: wide/cur 1.105 (1.041->1.150 vs FA2)
+    qwen3.5-9b   qpkv4  c: 1.083 (1.038->1.124)
+    qwen3.6-35b  qpkv8  c: 1.075 (1.039->1.116)
+  new-default vs SDPA-varlen: 122b 1.203, 35b nc 1.199, rel 1-5e-3 (PASS).
+Fix: relaxed the cu_seqlens exclusion in sm120_d256_wide (kept seqused excluded —
+untested). Same SM80-base kernel, bit-identical retiling. Validated:
+test_flash_attn_varlen.py d=256 = 1296 passed / 0 failed.
+
+Also benchmarked the rest of varlen forward (D128 qpkv4/8, D256 qpkv4/8/16): all
+parity-to-win (1.01-1.10) on the existing tiles -> no other varlen-fwd gap.
