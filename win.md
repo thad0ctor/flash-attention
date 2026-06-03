@@ -1345,3 +1345,34 @@ cold/short-soak baselines that reversed under rigorous interleaved timing (the s
 live "1.69x win" at D256 S1024 that was actually current-throttled). Confirms again: the prior
 subprocess sweep systematically under-rated FA4; tuned GQA shapes measure parity-to-winning
 in-process. No further forward dispatch wins available without kernel-level work.
+
+## 2026-06-03 — Causal D128 MHA laggard FIXED: LPT scheduler wiring bug (geo 0.943->0.996)
+
+The one consistent forward laggard — causal D128 MHA (qpkv1) at ~0.93-0.94x FA2 across
+ALL seqlens — was NOT intrinsic and NOT a dispatch-tile issue. Root cause (found by ncu
++ A/B): flash_fwd_sm120_tma.py sets `lpt=self.is_causal or self.is_local` in
+TileSchedulerArguments but instantiated `SingleTileScheduler`, which SILENTLY IGNORES the
+lpt field — only `SingleTileLPTScheduler` consumes it. So the longest-processing-time
+ordering meant to balance the causal triangle's load was never wired up: ncu showed causal
+SM% 60.7 vs FA2's 68.5 at constant occupancy/grid = pure tail-wave SM idle (causal load
+imbalance), NOT wasted masked-block work (block_info clamps n_block_max correctly) and NOT
+per-instruction inefficiency (identical warp-stall stats vs the dense path which is ~parity).
+
+Fix (12 LOC, flash_fwd_sm120_tma.py): route causal/local non-varlen to SingleTileLPTScheduler;
+set seqlen_k=cute.size(mK_t.shape[0]) (was hardcoded 0 — the LPT L2-swizzle sizing divides by
+it and faults at 0; SingleTileScheduler ignored it). Dense path untouched (lpt False -> still
+SingleTileScheduler). Varlen untouched (its own scheduler). Output BIT-IDENTICAL (only CTA->tile
+assignment changes); correctness re-verified vs SDPA worst 2.97e-3 (causal MHA/GQA/local/D256/dense).
+
+Re-validated with a HARDER harness (per-shape sustained clock soak + round-wise ratios — time
+both impls under the same clock state each round, 10 samples, report median+spread; this fixes
+the S1024 phantom where clocks dropped between shapes). baseline vs lpt, causal D128 MHA:
+  S1024 0.934->1.035, S2048 0.964->1.050, S4096 0.940->0.989, S8192 0.936->0.961,
+  S16384 0.941->0.950.  geo 0.943 -> 0.996.  Laggard essentially closed; S1024/S2048 now WIN.
+  (Residual ~0.95 at S>=8192 = expected: more waves dilute the single-wave tail imbalance.)
+No real regression: dense numbers (provably unaffected by the fix) drift 0.5-2% between the two
+process runs = the cross-run noise floor; causal GQA/D256 changes (geo within ~1%) are that same
+noise. Causal MHA's +5.3% geo is far above it = real. NOTE the harder harness also SETTLED the
+S1024 question: small-seq is ~parity, just noisy (D128 dense S1024 median ~0.99 with [0.84..1.02]
+spread) — NOT a laggard; the earlier 0.97 (single-soak) and 1.13 (other agent) were both method
+artifacts. The fix is in the SHARED TMA-path scheduler so it helps ANY causal/local TMA shape.

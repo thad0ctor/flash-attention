@@ -37,6 +37,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
+    SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
 
@@ -425,6 +426,14 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
+        elif const_expr(self.is_causal or self.is_local):
+            # Causal/local tiles do unequal work (the masked triangle), so a
+            # linear block_idx->tile map leaves a tail wave of light tiles
+            # idling SMs. SingleTileLPTScheduler honors the `lpt` flag (which
+            # SingleTileScheduler silently ignores) and runs heavy tiles first,
+            # balancing the tail. Output is bit-identical (only CTA->tile
+            # assignment changes). Requires a real seqlen_k below.
+            TileScheduler = SingleTileLPTScheduler
         else:
             TileScheduler = SingleTileScheduler
         num_batch = (
@@ -437,7 +446,9 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             num_head=cute.size(mQ_t.shape[2]),
             num_batch=num_batch,
             num_splits=num_splits,
-            seqlen_k=0,
+            # Real seqlen_k: SingleTileLPTScheduler's L2-swizzle sizing divides by
+            # this (size_one_head); 0 would fault. SingleTileScheduler ignores it.
+            seqlen_k=cute.size(mK_t.shape[0]),
             headdim=mQ_t.shape[1],
             headdim_v=mV_t.shape[1],
             total_q=cute.size(mQ_t.shape[0])
