@@ -501,13 +501,19 @@ def _flash_attn_fwd(
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    # SM120 fp8 KV-cache decode (gated): bf16/fp16 Q with an fp8 (e4m3/e5m2) K/V
-    # cache.  This is the only path where q.dtype may differ from k/v.dtype; every
-    # other path still requires identical dtypes (default behaviour unchanged).
+    # SM120 fp8 KV-cache decode: bf16/fp16 Q with an fp8 (e4m3/e5m2) K/V cache.
+    # This is the only path where q.dtype may differ from k/v.dtype; every other
+    # path still requires identical dtypes (default behaviour unchanged).
+    #
+    # Auto-enabled whenever fp8 K/V is genuinely passed (no env flag required):
+    # the fp8 KV-cache decode kernel is the *only* sm_120 path that can consume an
+    # fp8 K/V cache (fp8 prefill is a no-go and the standard SM120 forward asserts
+    # q.dtype==k.dtype==v.dtype), so a user who quantized their cache must be able
+    # to use it without an env var.  The FLASH_ATTENTION_SM120_DECODE_KERNEL flag
+    # remains the manual override for the *bf16* decode kernel below; for bf16
+    # inputs this expression is always False, so the default path is unchanged.
     fp8_kv_decode = (
-        os.environ.get("FLASH_ATTENTION_SM120_DECODE_KERNEL", "0").lower()
-        in ("1", "true", "on", "yes")
-        and q.dtype in (torch.float16, torch.bfloat16)
+        q.dtype in (torch.float16, torch.bfloat16)
         and k.dtype == v.dtype
         and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     )
@@ -1246,7 +1252,59 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
-    if is_split_kv:
+
+    # fp8 KV-cache decode is the only sm_120 path that can consume an fp8 K/V
+    # cache, so it must route to the decode kernel even when the split heuristic
+    # returns 1 (e.g. large total_mblocks with short seqlen, where the grid is
+    # already full).  The decode kernel only supports num_splits>=2 (its
+    # ceil_div(seqlen_k, num_splits) mainloop tiler rejects num_splits==1), so for
+    # the fp8 path we bump num_splits to 2 and allocate the fp32 partial O/LSE
+    # buffers; the combine kernel handles any num_splits.  This only affects the
+    # fp8 K/V path (fp8_kv_decode is always False for bf16/fp16 inputs, so the
+    # default bf16 dispatch and its num_splits are byte-identical to before).
+    want_fp8_decode = (
+        fp8_kv_decode
+        and arch // 10 == 12
+        and seqlen_q is not None
+        and seqlen_q == 1
+        and qhead_per_kvhead > 1
+        and head_dim == head_dim_v
+        and head_dim in (128, 256)
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and page_table is None
+        and qv is None
+        and not local
+        and mask_mod is None
+        and score_mod is None
+        and softcap is None
+        and learnable_sink is None
+        and block_sparse_tensors is None
+        and q_descale is None
+        and not is_fake_mode()
+        and FlashAttentionDecodeSm120.can_implement(
+            dtype, head_dim, head_dim_v, qhead_per_kvhead, 128,
+            32 if head_dim == 256 else 64, kv_dtype=kv_dtype,
+        )
+    )
+    # fp8 K/V was passed (dtype assert relaxed above) but the shape/config is not
+    # a supported fp8 decode case -> there is NO fp8-capable kernel to fall through
+    # to (the standard forward would run the bf16 MMA over reinterpreted fp8 bytes
+    # and produce garbage).  Fail loudly instead.  is_fake_mode() is allowed
+    # through (compile pass) since want_fp8_decode excludes it by design.
+    if fp8_kv_decode and not want_fp8_decode and not is_fake_mode():
+        raise NotImplementedError(
+            "fp8 (e4m3/e5m2) K/V is only supported for GQA decode on sm_120: "
+            "seqlen_q==1, qhead_per_kvhead>1, head_dim in (128,256), bf16/fp16 Q, "
+            "no varlen/paged/qv/local/mask_mod/score_mod/softcap/sink/sparsity and "
+            "q_descale is None.  Got an unsupported fp8 K/V configuration."
+        )
+    if want_fp8_decode and num_splits < 2:
+        num_splits = 2
+        is_split_kv = True
+    if is_split_kv or want_fp8_decode:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
@@ -1258,9 +1316,17 @@ def _flash_attn_fwd(
     # MMA over empty query rows.  Produces the same fp32 partial O / LSE the
     # combine kernel expects, then reuses _flash_attn_fwd_combine.
     # ----------------------------------------------------------------------
-    if (
+    # Gate: fp8 K/V auto-routes here unconditionally (want_fp8_decode — it is the
+    # only fp8-capable sm_120 path), while the bf16 decode kernel stays behind the
+    # env flag AND is_split_kv exactly as before.  For bf16 inputs want_fp8_decode
+    # is always False and fp8_kv_decode is always False, so when the env flag is
+    # off this whole condition is False and the default path is byte-identical.
+    env_decode_kernel = (
         os.environ.get("FLASH_ATTENTION_SM120_DECODE_KERNEL", "0").lower()
         in ("1", "true", "on", "yes")
+    )
+    if want_fp8_decode or (
+        env_decode_kernel
         and arch // 10 == 12
         and is_split_kv
         and seqlen_q is not None
