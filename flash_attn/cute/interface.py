@@ -501,7 +501,18 @@ def _flash_attn_fwd(
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    # SM120 fp8 KV-cache decode (gated): bf16/fp16 Q with an fp8 (e4m3/e5m2) K/V
+    # cache.  This is the only path where q.dtype may differ from k/v.dtype; every
+    # other path still requires identical dtypes (default behaviour unchanged).
+    fp8_kv_decode = (
+        os.environ.get("FLASH_ATTENTION_SM120_DECODE_KERNEL", "0").lower()
+        in ("1", "true", "on", "yes")
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == v.dtype
+        and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    )
+    if not fp8_kv_decode:
+        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -587,16 +598,21 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse
 
-    if is_fp8:
+    if is_fp8 or fp8_kv_decode:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
                 _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
+        if fp8_kv_decode:
+            assert q_descale is None, (
+                "fp8 KV-cache decode keeps a live bf16/fp16 Q; q_descale is unused"
+            )
     else:
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
 
     dtype = torch2cute_dtype_map[q.dtype]
+    kv_dtype = torch2cute_dtype_map[k.dtype]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -1258,40 +1274,50 @@ def _flash_attn_fwd(
         and seqused_k is None
         and page_table is None
         and qv is None
-        and not causal
+        # seqlen_q==1 (decode): bottom-right causal == attend all keys, so a
+        # causal flag is a no-op here and the kernel needs no causal masking.
         and not local
         and mask_mod is None
         and score_mod is None
         and softcap is None
         and learnable_sink is None
         and block_sparse_tensors is None
-        and q_descale is None and k_descale is None and v_descale is None
+        and q_descale is None
         and not is_fake_mode()
         and FlashAttentionDecodeSm120.can_implement(
             dtype, head_dim, head_dim_v, qhead_per_kvhead, 128,
-            32 if head_dim == 256 else 64
+            32 if head_dim == 256 else 64, kv_dtype=kv_dtype,
         )
     ):
         decode_tile_n = 32 if head_dim == 256 else 64
-        decode_key = (dtype, head_dim, qhead_per_kvhead, num_splits, decode_tile_n)
+        decode_key = (dtype, kv_dtype, head_dim, qhead_per_kvhead, num_splits, decode_tile_n,
+                      k_descale is not None, v_descale is not None)
         if decode_key not in _flash_attn_fwd.decode_compile_cache:
             fa_decode = FlashAttentionDecodeSm120(
                 dtype, head_dim, head_dim_v, qhead_per_kvhead, num_splits,
-                tile_n=decode_tile_n, num_threads=128,
+                tile_n=decode_tile_n, num_threads=128, kv_dtype=kv_dtype,
             )
             q_t = to_cute_tensor(q.detach())
             k_t = to_cute_tensor(k.detach())
             v_t = to_cute_tensor(v.detach())
             op_t = to_cute_tensor(out_partial, assumed_align=4)
             lp_t = to_cute_tensor(lse_partial, assumed_align=4)
+            kd_t = to_cute_tensor(k_descale, assumed_align=4, leading_dim=1) if k_descale is not None else None
+            vd_t = to_cute_tensor(v_descale, assumed_align=4, leading_dim=1) if v_descale is not None else None
             _flash_attn_fwd.decode_compile_cache[decode_key] = cute.compile(
                 fa_decode, q_t, k_t, v_t, op_t, lp_t,
-                Float32(softmax_scale), current_stream,
+                Float32(softmax_scale), kd_t, vd_t, current_stream,
                 options="--enable-tvm-ffi",
             )
+        # torch <2.11 can't DLPack-export fp8; pass the raw bytes as uint8 and let
+        # the cute kernel reinterpret (matches the prefill fp8 path).
+        k_call = k.detach().view(torch.uint8) if fp8_kv_decode else k.detach()
+        v_call = v.detach().view(torch.uint8) if fp8_kv_decode else v.detach()
         _flash_attn_fwd.decode_compile_cache[decode_key](
-            q.detach(), k.detach(), v.detach(),
+            q.detach(), k_call, v_call,
             out_partial, lse_partial, Float32(softmax_scale),
+            *( (k_descale,) if k_descale is not None else () ),
+            *( (v_descale,) if v_descale is not None else () ),
         )
         _flash_attn_fwd_combine(
             out_partial,

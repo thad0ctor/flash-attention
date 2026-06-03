@@ -54,8 +54,13 @@ class FlashAttentionDecodeSm120:
         num_threads: int = 128,
         num_stages: int = 2,
         is_causal: bool = False,
+        kv_dtype=None,
     ):
-        self.dtype = dtype
+        self.dtype = dtype          # Q dtype (compute / score dtype: fp16/bf16)
+        # K/V cache dtype.  Defaults to the Q dtype; may be fp8 (e4m3/e5m2) for a
+        # quantized KV cache while Q stays bf16/fp16.  Only the K/V *loads* become
+        # fp8 -> half the DRAM bytes streamed; the descale scalars restore range.
+        self.kv_dtype = kv_dtype if kv_dtype is not None else dtype
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
         assert head_dim == head_dim_v, "decode kernel assumes head_dim == head_dim_v"
@@ -65,8 +70,11 @@ class FlashAttentionDecodeSm120:
         self.num_threads = num_threads
         self.num_stages = num_stages
         self.is_causal = is_causal
+        self.is_fp8_kv = self.kv_dtype.width == 8
         self.R = qhead_per_kvhead
-        self.vec = 128 // dtype.width            # elems per 16B load
+        # vec = elems per 16B cp.async load, governed by the K/V (load) dtype.
+        # fp8 -> vec=16 (vs 8 for bf16): more elems per coalesced load = the BW win.
+        self.vec = 128 // self.kv_dtype.width    # elems per 16B load
         self.threads_per_row = head_dim // self.vec  # tpr
         assert num_threads % self.threads_per_row == 0
         self.rows_per_iter = num_threads // self.threads_per_row
@@ -74,12 +82,17 @@ class FlashAttentionDecodeSm120:
 
     @staticmethod
     def can_implement(dtype, head_dim, head_dim_v, qhead_per_kvhead, num_threads, tile_n,
-                      num_stages=2):
+                      num_stages=2, kv_dtype=None):
         if dtype not in (cutlass.Float16, cutlass.BFloat16):
+            return False
+        kv_dtype = kv_dtype if kv_dtype is not None else dtype
+        # K/V cache may be fp8 (e4m3/e5m2) while Q/compute stays fp16/bf16.
+        if kv_dtype not in (cutlass.Float16, cutlass.BFloat16,
+                            cutlass.Float8E4M3FN, cutlass.Float8E5M2):
             return False
         if head_dim != head_dim_v or head_dim not in (128, 256):
             return False
-        vec = 128 // dtype.width
+        vec = 128 // kv_dtype.width
         if head_dim % vec != 0:
             return False
         tpr = head_dim // vec
@@ -91,23 +104,30 @@ class FlashAttentionDecodeSm120:
         if num_threads % 32 != 0 or qhead_per_kvhead > 32:
             return False
         R = qhead_per_kvhead
-        sK_smem = num_stages * tile_n * head_dim * 2  # one of K/V
-        sV_smem = sK_smem
-        kv_smem = sK_smem + sV_smem
-        if kv_smem > 99 * 1024:
-            return False
-        # The cross-group reduction scratch (fp32) is ALIASED onto the
-        # finished K/V smem: acc (rpi*R*tpr*vec) over sK, max+sum (2*rpi*R*tpr)
-        # over sV.  Both must fit their respective K/V regions.
+        kv_elem_bytes = kv_dtype.width // 8
+        # The K/V smem region is sized to hold whichever is larger: the K/V tile
+        # (NS*TN*d * kv_elem_bytes) or the fp32 cross-group reduction scratch that
+        # is recast onto the same bytes after the mainloop.  For fp8 the tile
+        # shrinks to 1 byte/elem so the fp32 scratch dominates; for bf16 the tile
+        # bytes dominate (== legacy size), so bf16 smem is byte-identical.
+        kv_tile = num_stages * tile_n * head_dim * kv_elem_bytes
         red_acc = rpi * R * tpr * vec * 4
         red_ms = 2 * rpi * R * tpr * 4
-        if red_acc > sK_smem or red_ms > sV_smem:
+        sK_smem = max(kv_tile, red_acc)
+        sV_smem = max(kv_tile, red_ms)
+        if sK_smem + sV_smem > 99 * 1024:
             return False
         return True
 
     def _smem_bytes(self):
-        # K + V tiles; reduction scratch is aliased onto them (see kernel).
-        return self.num_stages * 2 * self.tile_n * self.head_dim * 2
+        kv_elem_bytes = self.kv_dtype.width // 8
+        kv_tile = self.num_stages * self.tile_n * self.head_dim * kv_elem_bytes
+        rpi, R, tpr, vec = self.rows_per_iter, self.R, self.threads_per_row, self.vec
+        red_acc = rpi * R * tpr * vec * 4
+        red_ms = 2 * rpi * R * tpr * 4
+        sK_bytes = max(kv_tile, red_acc)
+        sV_bytes = max(kv_tile, red_ms)
+        return sK_bytes + sV_bytes
 
     @cute.jit
     def __call__(
@@ -118,6 +138,8 @@ class FlashAttentionDecodeSm120:
         mO: cute.Tensor,    # (num_splits, b, sq, hq, d) fp32
         mLSE: cute.Tensor,  # (num_splits, b, hq, sq) fp32
         softmax_scale: Float32,
+        mKDescale: cute.Tensor = None,  # (b, hkv) fp32, optional (fp8 K cache)
+        mVDescale: cute.Tensor = None,  # (b, hkv) fp32, optional (fp8 V cache)
         stream=None,
     ):
         from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
@@ -125,7 +147,7 @@ class FlashAttentionDecodeSm120:
         b = mK.shape[0]
         hkv = mK.shape[2]
         grid = (self.num_splits, hkv, b)
-        self.kernel(mQ, mK, mV, mO, mLSE, softmax_scale).launch(
+        self.kernel(mQ, mK, mV, mO, mLSE, softmax_scale, mKDescale, mVDescale).launch(
             grid=grid,
             block=[self.num_threads, 1, 1],
             smem=self._smem_bytes(),
@@ -149,8 +171,8 @@ class FlashAttentionDecodeSm120:
                 cute.copy(copy_atom, gVc[gk, lane_d, None], sVc[stage, krow, lane_d, None])
             else:
                 for e in cutlass.range_constexpr(vec):
-                    sKc[stage, krow, lane_d, e] = self.dtype(0.0)
-                    sVc[stage, krow, lane_d, e] = self.dtype(0.0)
+                    sKc[stage, krow, lane_d, e] = self.kv_dtype(0.0)
+                    sVc[stage, krow, lane_d, e] = self.kv_dtype(0.0)
 
     @cute.kernel
     def kernel(
@@ -161,6 +183,8 @@ class FlashAttentionDecodeSm120:
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         softmax_scale: Float32,
+        mKDescale: cute.Tensor,
+        mVDescale: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         split_idx, kv_head, batch = cute.arch.block_idx()
@@ -172,7 +196,19 @@ class FlashAttentionDecodeSm120:
         tpr = const_expr(self.threads_per_row)
         rpi = const_expr(self.rows_per_iter)
         NS = const_expr(self.num_stages)
+        is_fp8_kv = const_expr(self.is_fp8_kv)
         seqlen_k = mK.shape[1]
+
+        # Per-(batch, kv-head) descale scalars for an fp8 K/V cache.  k_descale is
+        # folded into the QK score (it scales every dot equally, so it commutes
+        # through softmax with softmax_scale); v_descale rescales the P.V output.
+        # Both default to 1.0 when no descale tensor is supplied (bf16 cache).
+        k_descale = Float32(1.0)
+        v_descale = Float32(1.0)
+        if const_expr(mKDescale is not None):
+            k_descale = Float32(mKDescale[batch, kv_head])
+        if const_expr(mVDescale is not None):
+            v_descale = Float32(mVDescale[batch, kv_head])
 
         n_block_total = cute.ceil_div(seqlen_k, TN)
         nblk_per_split = cute.ceil_div(n_block_total, self.num_splits)
@@ -181,19 +217,32 @@ class FlashAttentionDecodeSm120:
         n_iters = cutlass.max(n_block_max - n_block_min, Int32(0))
 
         # ---- shared memory: NS-buffered K and V tiles, chunked as (NS,TN,tpr,vec) ----
+        # Allocate each region as a raw byte buffer sized to max(kv tile bytes,
+        # fp32 reduction-scratch bytes), then view it as the K/V (kv_dtype) tile.
+        # For bf16 the kv tile dominates so this is byte-identical to the legacy
+        # allocate_tensor; for fp8 the 1-byte tile is padded up so the fp32 scratch
+        # (recast onto the same bytes after the mainloop) still fits.
+        kv_elem_bytes = const_expr(self.kv_dtype.width // 8)
+        kv_tile_bytes = const_expr(NS * TN * d * kv_elem_bytes)
+        red_acc_bytes = const_expr(rpi * R * tpr * vec * 4)
+        red_ms_bytes = const_expr(2 * rpi * R * tpr * 4)
+        sK_bytes = const_expr(max(kv_tile_bytes, red_acc_bytes))
+        sV_bytes = const_expr(max(kv_tile_bytes, red_ms_bytes))
         smem = cutlass.utils.SmemAllocator()
         smem_layout = cute.make_layout(
             (NS, TN, tpr, vec), stride=(TN * d, d, vec, 1)
         )
-        sKc = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=1024)
-        sVc = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=1024)
+        sK_ptr = smem.allocate(sK_bytes, byte_alignment=1024)
+        sV_ptr = smem.allocate(sV_bytes, byte_alignment=1024)
+        sKc = cute.make_tensor(cute.recast_ptr(sK_ptr, dtype=self.kv_dtype), smem_layout)
+        sVc = cute.make_tensor(cute.recast_ptr(sV_ptr, dtype=self.kv_dtype), smem_layout)
 
         lane_d = tidx % tpr            # which 16B chunk of head dim
         row_grp = tidx // tpr          # which K/V row within a cp.async wave
 
         copy_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype,
+            self.kv_dtype,
             num_bits_per_copy=128,
         )
 
@@ -257,7 +306,9 @@ class FlashAttentionDecodeSm120:
                         p += rQ[r, e] * Float32(sKc[stage, j, lane_d, e])
                     # reduce partial dot across the tpr lanes (butterfly, width tpr)
                     p = utils.warp_reduce(p, lambda a, bb: a + bb, width=tpr)
-                    s = p * softmax_scale
+                    # k_descale (==1.0 for bf16 cache) folds into the QK score: it
+                    # scales every key's dot equally so it commutes through softmax.
+                    s = p * softmax_scale * k_descale
                     s = s if valid else Float32(-1e30)
                     old_max = row_max[r]
                     new_max = cutlass.max(old_max, s)
@@ -317,6 +368,9 @@ class FlashAttentionDecodeSm120:
                 s = row_sum[r]
                 zero_or_nan = (s == Float32(0.0)) or (s != s)
                 inv = cute.arch.rcp_approx(s if not zero_or_nan else Float32(1.0))
+                # v_descale (==1.0 for bf16 cache) restores the fp8-quantized V
+                # range; fold it into the softmax-normalisation reciprocal.
+                inv = inv * v_descale
                 q_head = kv_head * R + r
                 for e in cutlass.range_constexpr(vec):
                     mO[split_idx, batch, 0, q_head, lane_d * vec + e] = acc_o[r, e] * inv

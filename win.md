@@ -1239,3 +1239,39 @@ its x-figures were 5-15x optimistic; always re-verify):
 NET from the hunt: one real win (paged-KV D128 1.84x). Lesson reinforced: trust
 in-process interleaved timing, not agent-reported x-figures (their fresh-process
 baselines are cold-clock/stale-cache inflated).
+
+## 2026-06-03 — fp8 (e4m3) KV-cache DECODE — milestone 1 of the fp8 effort (BANKED, gated)
+
+fp8 feasibility study (opus) returned GO: the `MmaFP8Op(Float8E4M3FN,Float32,(16,8,32))`
+atom IS exposed in CuTeDSL 4.5.1 and runs bit-exact on the RTX 6000 (probe
+`agent_space/fp8_mma_probe.py`) — a real Ada/SM89-class warp MMA, not WGMMA/tcgen05.
+Two regimes: prefill is compute-bound (est 1.3-1.6x, needs the hard fp8 V-transpose),
+DECODE is memory-bound (DRAM 70%) and fp8 KV halves bytes → bigger + cheaper win.
+Decided: both, decode first (de-risks descale/P-scaling/1-byte-smem plumbing).
+
+Built fp8 KV-cache decode on the GEMV decode kernel (NO fp8 MMA, NO V-transpose —
+it's an FMA loop): K/V loads become e4m3 (Q stays bf16 — the real serving case:
+quantized KV cache + live bf16 query), vec 8→16 elems/16B load. k_descale folds
+into the QK score (commutes through softmax), v_descale into the O-norm reciprocal;
+both default 1.0 → bf16 path math unchanged. Gated behind FLASH_ATTENTION_SM120_DECODE_KERNEL;
+default dispatch byte-identical (fp8 inputs without the flag still hit the dtype assert).
+
+VALIDATED in-process on RTX 6000 (re-ran both agent scripts myself):
+- Correctness vs fp8-quantized ref (per-(b,kv-head) amax e4m3): worst rel-err 1.69e-3
+  (target <1e-2); bf16 path still 6e-3. All 12 decode shapes pass.
+- Speed (interleaved A/B, fp8 vs bf16-decode vs FA2), batch16 full grid:
+    R2 (h32/16): 1.61-1.85x vs bf16, 1.64-1.85x vs FA2
+    R4 (h32/8) : 1.63-1.81x vs bf16, 1.59-1.72x vs FA2
+    R8 (h32/4) : 0.70-0.73x vs bf16, 0.37-0.45x vs FA2  ← REGRESSION
+- R8 regression cause: GEMV inner FMA count is TN*R regardless of dtype (fp8 doubles
+  vec but halves keys/thread) → compute/issue-bound, not BW-bound, at high R; plus
+  fp8 R8 needs 80KB fp32 reduction scratch (vs 64KB bf16) lowering occupancy. Kept
+  unguarded: fp8 K/V at R8 still NEEDS this kernel to run at all (no fp8 prefill yet),
+  and the user gets the 2x KV-cache memory saving regardless of the speed cost.
+- Small batch (B1): mixed; long-seq B1 loses to FA2 (split grid underfill, the known
+  orthogonal SM120 issue, not fp8).
+
+NET: clear 1.6-1.85x decode win at R≤4 (Llama-3 8B/70B = R4, many serving configs
+R2-4), beats both bf16 AND FA2. Reusable for milestone 2 (fp8 prefill MMA): the
+descale-folding semantics (k→score scale, v→O rescale) and the uint8-bytes fp8
+call convention are now proven on SM120. Scripts: agent_space/fp8_decode_{correctness,bench}.py.
