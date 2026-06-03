@@ -1172,3 +1172,31 @@ env-var kernel configs (always profiles the default). Trust single-process
 CUDA-event timing (config-responsive) for A/B; use sudo-ncu only for the
 default-config occupancy/SOL snapshot. (My earlier decode ncu numbers were the
 default config, so directionally valid, but cross-config ncu A/B is unreliable.)
+
+## 2026-06-03 — Decode coalescing attempt: NEGATIVE + CORRECTION (it's smem-latency at 1-CTA/SM)
+
+Third decode agent (clean harness, root ncu cache cleared) — coalescing the K/V
+loads is NOT the bottleneck and the prior "4 of 32 bytes/sector" claim does NOT
+reproduce. Authoritative findings on FlashAttentionDecodeSm120 (qpkv8 D256 Sk32768):
+- gmem loads are ALREADY fully coalesced: 32.0 B/sector (100% util), 16 sectors/
+  request (optimal 512B warp load). No uncoalescing to recover.
+- DRAM only 43.9% (NOT bandwidth-bound). Dominant stall = short_scoreboard
+  (SMEM-load latency) at 8.22% occupancy (1 CTA/SM, 254 reg + 65KB smem).
+- The R-fold redundant-smem-read hoist was a measured NO-OP (ptxas already CSE'd it).
+
+CORRECTION to the earlier ledger optimism: across the FULL matrix (clean
+CUDA-event timing vs FA2 2.8.3), the GEMV decode kernel is geomean ~1.8x SLOWER
+than FA2 (D256 ~2.0x), worsening with qpkv (q16 3-6x slower) due to O(R)
+redundant on-chip FMA. The "~0.95x FA2" figure was a cherry-picked low-R shape;
+it does NOT hold across the matrix. (It IS still ~1.2-1.3x faster than the
+SM80-base decode path for D256 — that part stands — but both lose to FA2.)
+Correctness across the full matrix: all PASS, max rel 7.35e-3.
+
+DEFINITIVE decode conclusion (3 deep agents converged): the sm_120 GEMV decode
+kernel is structurally limited and CANNOT beat FA2. The bottleneck is
+smem-latency at the forced 1-CTA/SM occupancy; every lever to raise occupancy
+(less smem -> allkeys redundancy = 4x worse; fewer regs -> n/a) introduces a
+worse penalty, and coalescing is already optimal. Beating FA2 on M=1 decode
+needs a tensor-core formulation, impractical on mma.sync-only sm_120. The gated
+kernel stays as a marginal opt-in D256-decode-over-SM80-base improvement; not a
+default. Decode effort concluded here.
