@@ -949,3 +949,31 @@ accumulators -> maybe <=128 reg -> 2 CTA/SM), trading 2x S=QK^T recompute +
 extra Q/K reloads for 2x occupancy. Speculative (could net zero since it adds
 the very global-reload traffic that dominates), multi-day, high regression risk
 on a parity kernel. Not attempted without explicit go-ahead on that specific gamble.
+
+## 2026-06-02 — Backward redesign DE-RISK (opus design agent + ncu) — predicts NET LOSS
+
+Per user go-ahead to attempt the dK/dV-split redesign, de-risked BEFORE building:
+
+OPUS REGISTER-BUDGET ANALYSIS (flash_bwd.py): acc_dK + acc_dV = exactly 128
+reg/thread ((64,256) fp32 each = 64). Peak adds transient acc_dQ ((m=64,hd=256)
+=64, reduced to gmem per m-tile) -> ~192 reg in accumulators alone -> 255 total.
+- dK/dV KERNEL SPLIT (the requested approach): dK-only ~137, dV-only ~113 ->
+  dK-only does NOT reach <=128, AND doubles the global Q/K/V/dO traffic that is
+  already 91% of load cost. INFEASIBLE.
+- The ONLY path to <=128 is head_dim-splitting acc_dK/dV (quarter-split ~105 reg)
+  PLUS extracting dQ to its own pass PLUS dropping the dead acc_S_pre. But the
+  quarter head_dim-split recomputes S=QK^T and dP=dO@V^T (the dominant GEMMs) 4x.
+
+EMPIRICAL PROXY (n_block=32, halves acc_dK/dV): ncu shows the dKV kernel STAYS
+at 255 reg / 1 CTA/SM (16.64% occ) anyway — because acc_dQ (m_block x head_dim,
+independent of n_block) + working tiles still dominate — and it is 16.5% SLOWER
+(0.79->0.92 ms, D256 MHA S2048 c) from the doubled n-block count. So even a 2x
+overhead with NO occupancy gain already regresses +16%; the head_dim quarter-
+split's 4x GEMM recompute would be worse, and would likely push the (currently
+39%-compute, latency-bound) kernel compute-bound.
+
+VERDICT: the backward occupancy wall is intrinsic. The dK/dV split is infeasible;
+the head_dim quarter-split is the only path to 2 CTA/SM but the recompute cost is
+predicted (by the n=32 proxy + 4x-GEMM accounting) to EXCEED the occupancy gain
+-> net loss. De-risk says do NOT build the multi-day redesign. Reported to user
+for a final call on whether to build the head_dim quarter-split prototype anyway.
