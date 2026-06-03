@@ -915,3 +915,37 @@ CONCLUSION: backward (D128 + D256) is at parity and well-optimized; the register
 wall is intrinsic to sm_120. No safe backward win remains at the dispatch level.
 The forward Q-in-regs wide-tile lever has no backward analogue (the wall is
 registers, not smem). See [[sm120-d256-backward-occupancy-wall]].
+
+## 2026-06-02 — Backward ncu profiling (sudo) — DEFINITIVE: at sm_120 floor, spill-surgery not worth it
+
+ncu (sudo, hardware counters) on the backward main kernels:
+
+D128 qpkv8 S4096 causal — COMPUTE-BOUND (spill-fix would NOT help):
+  dominant kernel (209 reg): 2.25 ms, Compute(SM) 73.8%, warp-cyc/issued 13.2, occ 16.6%
+  dKV kernel (255 reg, local=168B spill): 855 us, Compute(SM) 72.1%, warp-cyc/issued 5.24
+  -> both compute(MMA)-bound; FA2 does the same MMAs -> parity is intrinsic.
+
+D256 qpkv16 S2048 causal — LATENCY/OCCUPANCY-BOUND:
+  dominant dKV kernel (255 reg): 1.82 ms, Compute(SM) 39%, Mem 56%, warp-cyc/issued 24.9,
+  occ 16.6%. Top stall = Long Scoreboard 30.4%. Occupancy section "Est. Local Speedup
+  83.3%" = the 1-CTA/SM wall (need ~6x occ; 255->~42 reg, infeasible).
+  Memory traffic on this kernel:
+    global_op_ld = 208.4M sectors (91%)  <- Q/K/V/dO reloads (structural FA2 pattern)
+    local_op_ld  =  19.5M sectors (8.5%) <- register SPILL reads
+    local_op_st  =   1.2M sectors (0.5%)
+  => the spill is only ~8.5% of load traffic; the stall is dominated by GLOBAL
+     reloads, which FA2 also pays. Eliminating the spill (in-place bf16 P/dS
+     packing surgery) removes ~8.5% of traffic -> ~2% kernel speedup AT BEST, on
+     a parity kernel, for high-risk CuTeDSL surgery. NOT worth it (ncu-confirmed).
+
+CONCLUSION (hardware-backed): the SM120 backward is at its architectural floor.
+- D128 backward: compute(MMA-throughput)-bound -> can't beat FA2's identical MMAs.
+- D256 backward: global-reload latency + 1-CTA/SM occupancy wall (255 reg from
+  acc_dK/dV/dQ); FA2 has the same algorithm -> parity. smem-capped, no room for
+  more staging; no TMA for D256 bwd on sm_120.
+The ONLY theoretical path to break the D256 occupancy wall is a kernel REDESIGN
+splitting dK-only and dV-only into separate kernels (each holds ~half the
+accumulators -> maybe <=128 reg -> 2 CTA/SM), trading 2x S=QK^T recompute +
+extra Q/K reloads for 2x occupancy. Speculative (could net zero since it adds
+the very global-reload traffic that dominates), multi-day, high regression risk
+on a parity kernel. Not attempted without explicit go-ahead on that specific gamble.
