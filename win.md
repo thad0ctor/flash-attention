@@ -1029,3 +1029,17 @@ test_flash_attn_varlen.py d=256 = 1296 passed / 0 failed.
 
 Also benchmarked the rest of varlen forward (D128 qpkv4/8, D256 qpkv4/8/16): all
 parity-to-win (1.01-1.10) on the existing tiles -> no other varlen-fwd gap.
+
+## 2026-06-02 — WIN: extend gemma-LOCAL D256 wide tile to varlen forward
+
+Same as the dense varlen extension, for the sliding-window (local) D256 path
+(gemma packed-sequence training). Relaxed the cu_seqlens exclusion in
+sm120_local_d256_wide. RTX6000 A/B (packed [4096,2048,1024,1024], window):
+  gemma4-31b qpkv2 w1024: wide/cur 1.120 (0.978->1.095 vs FA2)
+  gemma4-e4b  qpkv4 w512: 1.068 (0.885->0.946)
+  gemma4-e2b  qpkv8 w512: 1.005 (marginal)
+new-default vs SDPA-windowed-varlen: 31b 1.023, e4b 0.940 (improved from 0.885),
+rel ~2.5e-3 (PASS). Net positive across all gemma-local varlen shapes. seqused
+stays on the narrow path. (varlen test doesn't parametrize local -> validated via
+SDPA-windowed-varlen on the exact gemma shapes; local-wide and varlen-wide are
+each independently pytest-validated.)

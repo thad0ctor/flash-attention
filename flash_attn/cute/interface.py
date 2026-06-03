@@ -848,8 +848,8 @@ def _flash_attn_fwd(
         and page_table is None
         and qv is None
         and learnable_sink is None
-        and cu_seqlens_q is None
-        and cu_seqlens_k is None
+        # varlen (cu_seqlens) supported (gemma packed sliding-window training);
+        # seqused mode stays on the narrow path (untested).
         and seqused_q is None
         and seqused_k is None
         and not use_block_sparsity
