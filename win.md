@@ -718,3 +718,12 @@ forward win of the campaign: it lifts most of the 54 D256 cells by +6-14%.
 PRE-EXISTING BUG FLAGGED (not from this campaign): has_learnable_sink=True at
 D256 seqlen 4096 fails the reference check on BOTH 64x64 and 128x64 paths. No
 target model uses learnable sinks; needs a separate investigation.
+
+## 2026-06-02 — WIN: qpkv4 D128 S1024 causal fwd tile 64x64 -> 64x96 (+5-6%)
+
+Autonomous explorer found the qpkv4 D128 (Hq32/Hkv8; qwen3-vl & qwen3-embedding)
+S1024 causal cell was a slight loss (0.97-0.98 vs FA2) on the current (64,64,1)
+tile. Among 7 candidates, 64x96 is the robust winner over 3 runs (15 interleaved
+blocks each): +5-6% vs current, flipping it to 1.02-1.04 vs FA2. Correctness vs
+SDPA rel 2.3e-3 (PASS). Surgical: only the (128,4,1024,1) lookup cell; the
+non-causal cell keeps 128x64.
