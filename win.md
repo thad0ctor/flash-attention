@@ -808,3 +808,24 @@ tile (unchanged).
 CORRECTNESS: dedicated SM120 local test (test_flash_attn_sm120_local.py, S=256
 small-S path) 49 passed / 0 failed (unchanged path intact). Wide-path shapes
 SDPA-window rel ~2e-3. High value: local is gemma's PRIMARY attention mode.
+
+## 2026-06-02 — FINAL forward standing after the wide-tile + gemma-local wins
+
+Clean forward sweep (GPU0, no contention) after all this session's commits:
+  geomean 1.053 (campaign start 1.015), median 1.041, wins 59/78.
+  D128 1.004, D256 1.075, gemma 1.087 (was 1.071).
+All gemma-local rows now >=1.0 (1.00-1.08); the gemma-local laggard family is
+fixed. (In-process truth is higher than 1.053 — the subprocess sweep still has
+residual fa2-first bias at S1024; e.g. the sweep's worst row gemma4-e4b S8192 c1
+D256 qpkv4 nc reads 0.888 but is 1.085 in-process; qwen3.6-35b S1024 nc 0.821 is
+~1.0 in-process.)
+
+Session forward-perf commits: qpkv5-S4096 tile (+2.8%), D256 general wide tile
+(+6-14%), qpkv4-S1024 tile (+5-6%), gemma-local wide tile (+3-13%), plus the
+learnable_sink correctness fix. The D256-wide + local-wide Q-in-regs
+generalization is the dominant lever (lifts the bulk of the 54 D256 cells).
+
+ONE genuine forward laggard remains: qwen3-14b qpkv5 S4096 causal D128 = 0.938
+(in-process, consistent). Non-pack -> TMA path, tile already 128x64-optimized
+(tile sweep found nothing better); near its architectural floor on sm_120.
+Not worth further dispatch effort.
