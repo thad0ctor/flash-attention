@@ -167,23 +167,6 @@ def _sm120_bwd_pack_gqa_m_splits(
         auto_splits = 16
     else:
         auto_splits = min(qhead_per_kvhead, max_safe_splits, packed_m_blocks)
-    env_splits = os.environ.get("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS")
-    sm120_qpkv4_s2048_causal = (
-        causal
-        and not local
-        and qhead_per_kvhead == 4
-        and num_head in (8, 16)
-        and num_head_kv == num_head // qhead_per_kvhead
-        and seqlen_q == seqlen_k
-        and seqlen_q == 2048
-        and head_dim == 256
-        and head_dim_v == 256
-    )
-    if env_splits is not None:
-        requested_splits = int(env_splits)
-        if sm120_qpkv4_s2048_causal and requested_splits > 0:
-            max_safe_splits = max(max_safe_splits, requested_splits)
-        auto_splits = requested_splits if requested_splits > 0 else auto_splits
     return max(1, min(auto_splits, max_safe_splits, packed_m_blocks))
 
 
@@ -637,7 +620,6 @@ def _flash_attn_fwd(
         num_threads = 128
     sm120_seq_q = max_seqlen_q if max_seqlen_q is not None else seqlen_q
     sm120_seq_k = max_seqlen_k if max_seqlen_k is not None else seqlen_k
-    sm120_qpkv5_s16384_qregs_env = os.environ.get("FLASH_ATTENTION_SM120_QPKV5_S16384_QREGS", "").lower()
     sm120_qpkv5_s16384_qregs = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -658,9 +640,7 @@ def _flash_attn_fwd(
         and seqused_q is None
         and seqused_k is None
         and not use_block_sparsity
-        and sm120_qpkv5_s16384_qregs_env not in {"0", "false", "off", "no"}
     )
-    sm120_d256_qregs128_env = os.environ.get("FLASH_ATTENTION_SM120_D256_QREGS128", "").lower()
     sm120_d256_qregs128 = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -683,11 +663,7 @@ def _flash_attn_fwd(
         and seqused_q is None
         and seqused_k is None
         and not use_block_sparsity
-        and sm120_d256_qregs128_env not in {"0", "false", "off", "no"}
     )
-    sm120_qpkv8_d256_causal_qregs_env = os.environ.get(
-        "FLASH_ATTENTION_SM120_D256_QPKV8_CAUSAL_QREGS", ""
-    ).lower()
     sm120_qpkv8_d256_causal_qregs_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -711,20 +687,10 @@ def _flash_attn_fwd(
         and seqused_k is None
         and not use_block_sparsity
     )
-    if (
-        sm120_qpkv8_d256_causal_qregs_eligible
-        and sm120_qpkv8_d256_causal_qregs_env in {"64x64", "128x64_t256"}
-    ):
-        sm120_qpkv8_d256_causal_qregs_mode = sm120_qpkv8_d256_causal_qregs_env
-    elif sm120_qpkv8_d256_causal_qregs_env in {"0", "false", "off", "no"}:
-        sm120_qpkv8_d256_causal_qregs_mode = ""
-    elif sm120_qpkv8_d256_causal_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
+    if sm120_qpkv8_d256_causal_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
         sm120_qpkv8_d256_causal_qregs_mode = "128x64_t256"
     else:
         sm120_qpkv8_d256_causal_qregs_mode = ""
-    sm120_qpkv16_d256_causal_qregs_env = os.environ.get(
-        "FLASH_ATTENTION_SM120_D256_QPKV16_CAUSAL_QREGS", ""
-    ).lower()
     sm120_qpkv16_d256_causal_qregs_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -748,18 +714,10 @@ def _flash_attn_fwd(
         and seqused_k is None
         and not use_block_sparsity
     )
-    if (
-        sm120_qpkv16_d256_causal_qregs_eligible
-        and sm120_qpkv16_d256_causal_qregs_env in {"64x64", "128x64_t256"}
-    ):
-        sm120_qpkv16_d256_causal_qregs_mode = sm120_qpkv16_d256_causal_qregs_env
-    elif sm120_qpkv16_d256_causal_qregs_env in {"0", "false", "off", "no"}:
-        sm120_qpkv16_d256_causal_qregs_mode = ""
-    elif sm120_qpkv16_d256_causal_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
+    if sm120_qpkv16_d256_causal_qregs_eligible and sm120_seq_q in (16384, 32768, 65536, 131072):
         sm120_qpkv16_d256_causal_qregs_mode = "128x64_t256"
     else:
         sm120_qpkv16_d256_causal_qregs_mode = ""
-    sm120_qpkv6_d256_qregs_env = os.environ.get("FLASH_ATTENTION_SM120_D256_QPKV6_QREGS", "").lower()
     sm120_qpkv6_d256_qregs_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -783,13 +741,6 @@ def _flash_attn_fwd(
         and not use_block_sparsity
     )
     if (
-        sm120_qpkv6_d256_qregs_eligible
-        and sm120_qpkv6_d256_qregs_env in {"64x64", "128x64_t256"}
-    ):
-        sm120_qpkv6_d256_qregs_mode = sm120_qpkv6_d256_qregs_env
-    elif sm120_qpkv6_d256_qregs_env in {"0", "false", "off", "no"}:
-        sm120_qpkv6_d256_qregs_mode = ""
-    elif (
         sm120_qpkv6_d256_qregs_eligible
         and batch_size == 1
         and sm120_seq_q in (16384, 32768, 65536, 131072)
@@ -816,7 +767,6 @@ def _flash_attn_fwd(
     # reduction order is unchanged). S<=2048 is mixed (several causal shapes
     # regress) so it is gated out. Shapes already routed to a specific qregs
     # path keep theirs.
-    sm120_d256_wide_env = os.environ.get("FLASH_ATTENTION_SM120_D256_WIDE", "").lower()
     sm120_d256_wide = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -850,7 +800,6 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and mask_mod is None
         and score_mod is None
-        and sm120_d256_wide_env not in {"0", "false", "off", "no"}
     )
     # Local (sliding-window) D256: same Q-in-regs win as the dense wide path.
     # The narrow local-window dispatch used a 64x16/64x32 tile; 128x{32,64}
@@ -858,7 +807,6 @@ def _flash_attn_fwd(
     # validated, agent_space/sm120_local_wide_confirm.py). tile_n scales with
     # the window: 32 for window<=512, 64 for window~1024 (gemma4-31b). Gated to
     # S>=4096 (the validated range; gemma local benches there).
-    sm120_local_d256_wide_env = os.environ.get("FLASH_ATTENTION_SM120_LOCAL_D256_WIDE", "").lower()
     sm120_local_d256_wide = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -878,7 +826,6 @@ def _flash_attn_fwd(
         and not use_block_sparsity
         and mask_mod is None
         and score_mod is None
-        and sm120_local_d256_wide_env not in {"0", "false", "off", "no"}
     )
     if (
         arch // 10 == 12
@@ -985,34 +932,22 @@ def _flash_attn_fwd(
                 # Qwen-style D256 qpkv8/qpkv16 noncausal rows fit a wider N
                 # tile on SM120 only when Q is staged through registers.
                 fwd_cfg = FwdConfig(128, 64, True, True)
-                if sm120_d256_qregs128_env != "t128":
-                    num_threads = 256
+                num_threads = 256
             elif sm120_qpkv8_d256_causal_qregs_mode:
                 # Exact qwen3.6-35B-style S16384 causal row benefits from
-                # staging Q in registers; env modes keep alternate schedules
-                # available for validation and profiling.
-                if sm120_qpkv8_d256_causal_qregs_mode == "128x64_t256":
-                    fwd_cfg = FwdConfig(128, 64, True, True)
-                    num_threads = 256
-                else:
-                    fwd_cfg = FwdConfig(64, 64, True, True)
+                # staging Q in registers.
+                fwd_cfg = FwdConfig(128, 64, True, True)
+                num_threads = 256
             elif sm120_qpkv16_d256_causal_qregs_mode:
                 # Exact qwen3.5-122B-style causal rows benefit from staging Q
                 # in registers, matching the accepted qpkv8/qpkv16 D256 paths.
-                if sm120_qpkv16_d256_causal_qregs_mode == "128x64_t256":
-                    fwd_cfg = FwdConfig(128, 64, True, True)
-                    num_threads = 256
-                else:
-                    fwd_cfg = FwdConfig(64, 64, True, True)
+                fwd_cfg = FwdConfig(128, 64, True, True)
+                num_threads = 256
             elif sm120_qpkv6_d256_qregs_mode:
                 # Exact Qwen qpkv6 D256 long rows benefit from staging Q in
-                # registers; env modes keep alternate schedules available for
-                # validation and profiling.
-                if sm120_qpkv6_d256_qregs_mode == "128x64_t256":
-                    fwd_cfg = FwdConfig(128, 64, True, True)
-                    num_threads = 256
-                else:
-                    fwd_cfg = FwdConfig(64, 64, True, True)
+                # registers.
+                fwd_cfg = FwdConfig(128, 64, True, True)
+                num_threads = 256
             elif sm120_d256_wide:
                 # d=256, S>=4096: 128x64 fits via Q-in-regs and beats 64x64 by
                 # +6-14% (see sm120_d256_wide above). 256 threads is the A/B win.
@@ -1464,9 +1399,6 @@ def _flash_attn_fwd(
         and seqused_k is None
         and (seqlen_q * qhead_per_kvhead) % tile_m == 0
     )
-    sm120_pack_gqa_fast_valid_rows_env = os.environ.get(
-        "FLASH_ATTENTION_SM120_PACK_GQA_VALID_ROWS_FAST", ""
-    ).lower()
     sm120_pack_gqa_fast_valid_rows = (
         arch // 10 == 12
         and pack_gqa_all_rows_valid
@@ -1476,7 +1408,6 @@ def _flash_attn_fwd(
         and head_dim_v == 128
         and qhead_per_kvhead in (4, 8)
         and not use_block_sparsity
-        and sm120_pack_gqa_fast_valid_rows_env not in {"0", "false", "off", "no"}
     )
     sm120_skip_dense_seqlen_mask = (
         arch // 10 == 12
@@ -1514,15 +1445,8 @@ def _flash_attn_fwd(
         and seqused_k is None
         and not use_block_sparsity
     )
-    sm120_qpkv5_s4096_nc_tma_exp = (
-        os.environ.get("FLASH_ATTENTION_SM120_QPKV5_S4096_NC_TMA", "").lower()
-        if sm120_qpkv5_s4096_nc_exact else ""
-    )
-    sm120_tma_kv_stages = 1 if sm120_qpkv5_s4096_nc_tma_exp == "stage1" else 2
-    sm120_qpkv5_s4096_nc_notma = (
-        sm120_qpkv5_s4096_nc_exact
-        and sm120_qpkv5_s4096_nc_tma_exp not in {"stage1", "stage2", "tma"}
-    )
+    sm120_tma_kv_stages = 2
+    sm120_qpkv5_s4096_nc_notma = sm120_qpkv5_s4096_nc_exact
     # Keep this narrow: plain bf16 qpkv6 D256 dense kernels benefit from shorter K/V copy
     # live ranges, while qpkv4 and local-window variants regressed in validation.
     sm120_qpkv6_d256_load_hooks = (
@@ -1569,18 +1493,6 @@ def _flash_attn_fwd(
         )
     ):
         sm120_qpkv6_d256_hook_mode = "v"
-    sm120_qpkv6_d256_hook_override = (
-        os.environ.get("FLASH_ATTENTION_SM120_QPKV6_D256_HOOKS", "").lower()
-        if arch // 10 == 12
-        else ""
-    )
-    if sm120_qpkv6_d256_hook_override in {"off", "k", "v", "both"}:
-        sm120_qpkv6_d256_hook_mode = (
-            "" if sm120_qpkv6_d256_hook_override == "off" else sm120_qpkv6_d256_hook_override
-        )
-    sm120_qpkv6_d256_static_causal_env = os.environ.get(
-        "FLASH_ATTENTION_SM120_QPKV6_D256_STATIC_CAUSAL_BLOCKS", ""
-    ).lower()
     sm120_qpkv6_d256_static_causal_default = (
         sm120_qpkv6_d256_load_hooks
         and causal
@@ -1592,14 +1504,7 @@ def _flash_attn_fwd(
         # (+1.6% S16384, +2.8% S32768). S8192 excluded (qregs is on there).
         and sm120_seq_q in (16384, 32768, 65536)
     )
-    if sm120_qpkv6_d256_static_causal_env in {"1", "true", "on", "yes"}:
-        sm120_qpkv6_d256_static_causal_blocks = (
-            sm120_qpkv6_d256_load_hooks and causal and sm120_seq_q == sm120_seq_k
-        )
-    elif sm120_qpkv6_d256_static_causal_env in {"0", "false", "off", "no"}:
-        sm120_qpkv6_d256_static_causal_blocks = False
-    else:
-        sm120_qpkv6_d256_static_causal_blocks = sm120_qpkv6_d256_static_causal_default
+    sm120_qpkv6_d256_static_causal_blocks = sm120_qpkv6_d256_static_causal_default
     sm120_qpkv5_d128_hook_eligible = (
         arch // 10 == 12
         and q.dtype == torch.bfloat16
@@ -1632,15 +1537,6 @@ def _flash_attn_fwd(
         elif sm120_seq_q >= 131072:
             sm120_qpkv5_d128_default_hook_mode = "v"
     sm120_qpkv5_d128_hook_mode = sm120_qpkv5_d128_default_hook_mode
-    sm120_qpkv5_d128_hook_override = (
-        os.environ.get("FLASH_ATTENTION_SM120_QPKV5_HOOKS", "").lower()
-        if arch // 10 == 12
-        else ""
-    )
-    if sm120_qpkv5_d128_hook_override in {"off", "k", "v", "both"}:
-        sm120_qpkv5_d128_hook_mode = (
-            "" if sm120_qpkv5_d128_hook_override == "off" else sm120_qpkv5_d128_hook_override
-        )
     sm120_hook_load_k = sm120_qpkv6_d256_hook_mode in {"k", "both"} or (
         sm120_qpkv5_d128_hook_eligible and sm120_qpkv5_d128_hook_mode in {"k", "both"}
     )
@@ -1758,9 +1654,7 @@ def _flash_attn_fwd(
         # first-compiled kernel.
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
-        (
-            sm120_qpkv5_s4096_nc_tma_exp or ("notma" if sm120_qpkv5_s4096_nc_notma else "")
-        ) if arch // 10 == 12 else None,
+        ("notma" if sm120_qpkv5_s4096_nc_notma else "") if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
         sm120_hook_load_k if arch // 10 == 12 else None,
         sm120_hook_load_v if arch // 10 == 12 else None,
@@ -2407,11 +2301,6 @@ def _sm120_use_fused_dkv_postprocess(
         and head_dim == head_dim_v
         and not dKV_swapAB
     )
-    override = os.environ.get("FLASH_ATTENTION_SM120_FUSED_DKV", "").lower()
-    if override in ("0", "false", "off", "no"):
-        return False
-    if override in ("1", "true", "on", "yes"):
-        return eligible
     sm120_qpkv8_s1024_causal = (
         dtype == cutlass.BFloat16
         and qhead_per_kvhead == 8
@@ -2765,9 +2654,6 @@ def _flash_attn_bwd(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
     )
-    sm120_nonpack_m_split_override = os.environ.get(
-        "FLASH_ATTENTION_SM120_BWD_NONPACK_M_SPLITS", ""
-    )
     # SM120 nonpacked causal-D256 M-split policy (RTX PRO 6000, 188 SMs).
     # Splitting the nonpacked M loop adds CTAs and only helps when the backward
     # grid (~ceil(S/64) * B * Hq CTAs) underfills the SMs (<~3 waves); the split
@@ -2829,8 +2715,6 @@ def _flash_attn_bwd(
                 and num_head_kv == 2
             ):
                 sm120_nonpack_m_split = 4
-        if sm120_nonpack_m_split_override:
-            sm120_nonpack_m_split = max(1, int(sm120_nonpack_m_split_override))
     sm120_nonpack_m_split_eligible = sm120_nonpack_base_ok and sm120_nonpack_m_split > 1
     if sm120_nonpack_m_split_eligible:
         pack_gqa_m_splits = sm120_nonpack_m_split
@@ -2896,15 +2780,7 @@ def _flash_attn_bwd(
             and seqlen_q == 1024
         )
     )
-    sm120_skip_full_causal_mask_override = os.environ.get(
-        "FLASH_ATTENTION_SM120_BWD_SKIP_FULL_CAUSAL_MASK", ""
-    ).lower()
-    if sm120_skip_full_causal_mask_override in {"0", "false", "off", "no"}:
-        sm120_skip_full_causal_mask = False
-    elif sm120_skip_full_causal_mask_override in {"1", "true", "on", "yes"}:
-        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_base
-    else:
-        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
+    sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
