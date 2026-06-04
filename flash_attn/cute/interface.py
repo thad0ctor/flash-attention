@@ -1669,6 +1669,11 @@ def _flash_attn_fwd(
         # num_stages would otherwise share a compile_key and silently reuse the
         # first-compiled kernel.
         sm120_num_stages if arch // 10 == 12 else None,
+        # The SM120 TMA forward's K/V pipeline depth (kv_stages) changes the
+        # compiled kernel (SMEM layout / pipeline), so it must be in the key.
+        # Constant today, but keying it now keeps any future kv_stages tuning from
+        # silently reusing a binary compiled with a different depth.
+        sm120_tma_kv_stages if arch // 10 == 12 else None,
         sm120_skip_dense_seqlen_mask if arch // 10 == 12 else None,
         ("notma" if sm120_qpkv5_s4096_nc_notma else "") if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
