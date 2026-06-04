@@ -1186,17 +1186,15 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
-    # learnable_sink with SplitKV: each split folds exp(sink-rowmax) into its own
-    # LSE/denominator, and the combine reconstructs the denominator as
-    # sum_s exp(LSE_s) — so a naive split counts the sink once per split.
-    # The sm_120 / SM80-base forward fixes this by folding the sink only in
-    # split 0 (compute_sink_val suppresses it to -inf in splits >0), so SplitKV
-    # is correct there. The SM90/SM100 forwards have their own sink handling that
-    # was NOT given the split-0 gating, so keep forcing a single split for those
-    # archs (conservative — correctness over the SplitKV speedup).
-    if learnable_sink is not None and arch // 10 != 12:
-        num_splits = 1
-
+    # learnable_sink + SplitKV is correct on every SplitKV-capable arch: the sink
+    # is a single virtual logit, so it must be folded into the LSE exactly once
+    # across splits, and each forward does so by applying it only in split 0 —
+    # SM100 via flash_fwd_sm100.py (`not is_split_kv or split_idx == 0`, which
+    # also handles the empty-split row_max==-inf case), and the SM80-base / SM120
+    # forward via compute_sink_val (suppressed to -inf in splits >0, with the
+    # matching guard in softmax.finalize). SM90 has no SplitKV. So no single-split
+    # fallback is needed. (SM120 verified in-process vs SDPA; SM100/SM80 verified
+    # by the split-0 gating in their kernels — no sm100/sm90 hardware available here.)
     is_split_kv = num_splits > 1
 
     # fp8 KV-cache decode is the only sm_120 path that can consume an fp8 K/V
