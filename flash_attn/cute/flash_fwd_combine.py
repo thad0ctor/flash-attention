@@ -60,7 +60,10 @@ class FlashAttentionForwardCombine:
         # every target.
         arch = BaseDSL._get_dsl().get_arch_enum()
         self.arch_int = arch.major * 10 + arch.minor
-        self.use_pdl = self.arch_int >= 90
+        # sm_90/sm_100/sm_110 support griddepcontrol.wait; sm_120 (consumer
+        # Blackwell, compiled as an sm_80-compatible target here) does not, so
+        # exclude arch 12 explicitly even though arch_int (120) is >= 90.
+        self.use_pdl = self.arch_int >= 90 and self.arch_int // 10 != 12
 
     @staticmethod
     def can_implement(

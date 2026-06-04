@@ -101,10 +101,16 @@ class FlashAttentionBackwardSm80:
         self.Mma_dKV_is_RS = AtomLayoutMSdP == 1 and AtomLayoutNdKV == num_mma_warps and SdP_swapAB and not dKV_swapAB
         self.V_in_regs = V_in_regs
         self.share_QV_smem = V_in_regs
+        # The reuse path hardcodes stage 0 for the Q/LSE and dO/dPsum loads and
+        # forces cp_async_wait_group(0), so it is only correct for single-stage
+        # pipelines.  Requiring both stage counts == 1 keeps a future tuning hook
+        # that sets num_stages>1 for D256 from silently corrupting dK/dV.
         self.reuse_qk_dov_smem = (
             getattr(self, "arch", 80) == 120
             and self.head_dim_padded == 256
             and self.head_dim_v_padded == 256
+            and num_stages_Q == 1
+            and num_stages_dO == 1
         )
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
@@ -713,13 +719,28 @@ class FlashAttentionBackwardSm80:
                 # this n-block within the window are non-empty. Mirror
                 # BlockInfo.get_m_block_min_max. Without this the kernel processes
                 # the full S^2 triangle (correct but ~2-7x slower than FA2).
+                #
+                # Negative-offset (one-sided open) windows — window_size with a
+                # negative bound, e.g. (None, -X) or (-X, None) — make some
+                # n-blocks attend NO queries, so this prune yields an empty/
+                # inverted m-range [m_block_min >= m_block_max]. The kernel does
+                # not safely store dK/dV for an n-block whose m-loop runs zero
+                # iterations (acc_dK/dV are emitted from stale smem / an
+                # un-cleared accumulator), so those fully-masked key blocks get
+                # garbage gradients. The window value is only known at runtime,
+                # so detect a negative bound at runtime and fall back to the full
+                # (un-pruned) m-range for that side; correctness then comes purely
+                # from the per-block mask, exactly as the slower full-triangle
+                # path. Non-negative windows keep the fast prune unchanged.
                 pack_f = self.qhead_per_kvhead if cutlass.const_expr(getattr(self, "arch", 80) == 120 and self.pack_gqa) else 1
                 if cutlass.const_expr(window_size_right is not None):
-                    m_idx_right = n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k - window_size_right
-                    m_block_min = max(m_block_min, (pack_f * m_idx_right) // self.m_block_size)
+                    if window_size_right >= Int32(0):
+                        m_idx_right = n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k - window_size_right
+                        m_block_min = max(m_block_min, (pack_f * m_idx_right) // self.m_block_size)
                 if cutlass.const_expr(window_size_left is not None):
-                    m_idx_left = (n_block + 1) * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k + window_size_left
-                    m_block_max = min(m_block_max, cute.ceil_div(pack_f * m_idx_left, self.m_block_size))
+                    if window_size_left >= Int32(0):
+                        m_idx_left = (n_block + 1) * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k + window_size_left
+                        m_block_max = min(m_block_max, cute.ceil_div(pack_f * m_idx_left, self.m_block_size))
             if cutlass.const_expr(
                 getattr(self, "arch", 80) == 120
                 and self.pack_gqa_m_splits > 1
@@ -1756,7 +1777,6 @@ class FlashAttentionBackwardSm80:
                 tidx,
                 block,
                 seqlen,
-                zero_oob_rows=True,
                 all_rows_valid=self.pack_gqa_all_rows_valid,
             )
             sLSE_stage = sLSE_full[None, stage]
@@ -1832,7 +1852,6 @@ class FlashAttentionBackwardSm80:
                 tidx,
                 block,
                 seqlen,
-                zero_oob_rows=True,
                 all_rows_valid=self.pack_gqa_all_rows_valid,
             )
             sdPsum_stage = sdPsum_full[None, stage]

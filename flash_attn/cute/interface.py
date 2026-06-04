@@ -1186,15 +1186,15 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
-    # learnable_sink is folded into each KV-split's running denominator/LSE, and
-    # the combine kernel does NOT de-duplicate it across splits — it ends up
-    # counted once per split, giving wrong output. SplitKV is therefore
-    # unsupported with a learnable sink: force a single split (always correct).
-    # This guard sits after every num_splits decision (incl. the sm_120 decode
-    # auto-split above, which otherwise silently engaged SplitKV for sink decode
-    # workloads). Costs the decode SplitKV speedup for sink models; correctness
-    # over speed. (Proper fix = apply the sink once during combine.)
-    if learnable_sink is not None:
+    # learnable_sink with SplitKV: each split folds exp(sink-rowmax) into its own
+    # LSE/denominator, and the combine reconstructs the denominator as
+    # sum_s exp(LSE_s) — so a naive split counts the sink once per split.
+    # The sm_120 / SM80-base forward fixes this by folding the sink only in
+    # split 0 (compute_sink_val suppresses it to -inf in splits >0), so SplitKV
+    # is correct there. The SM90/SM100 forwards have their own sink handling that
+    # was NOT given the split-0 gating, so keep forcing a single split for those
+    # archs (conservative — correctness over the SplitKV speedup).
+    if learnable_sink is not None and arch // 10 != 12:
         num_splits = 1
 
     is_split_kv = num_splits > 1
@@ -1238,9 +1238,12 @@ def _flash_attn_fwd(
     # fp8 K/V was passed (dtype assert relaxed above) but the shape/config is not
     # a supported fp8 decode case -> there is NO fp8-capable kernel to fall through
     # to (the standard forward would run the bf16 MMA over reinterpreted fp8 bytes
-    # and produce garbage).  Fail loudly instead.  is_fake_mode() is allowed
-    # through (compile pass) since want_fp8_decode excludes it by design.
-    if fp8_kv_decode and not want_fp8_decode and not is_fake_mode():
+    # and produce garbage).  Fail loudly instead.  We also block fake mode here:
+    # want_fp8_decode excludes fake mode by design, so a fake-mode fp8-KV call
+    # would otherwise fall through into the regular SM120 forward path (which is
+    # instantiated with dtype=q.dtype, not an fp8-K/V decode signature) and
+    # compile the wrong kernel / trip type checks for compile-only callers.
+    if fp8_kv_decode and not want_fp8_decode:
         raise NotImplementedError(
             "fp8 (e4m3/e5m2) K/V is only supported for GQA decode on sm_120: "
             "seqlen_q==1, qhead_per_kvhead>1, head_dim in (128,256), bf16/fp16 Q, "
@@ -2383,24 +2386,6 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
-
-    # SM120 backward dK/dV is incorrect for negative-offset (one-sided open)
-    # sliding windows — window_size with a negative bound, e.g. (None, -X) or
-    # (-X, None), where the bound is an offset off the diagonal rather than a
-    # non-negative span. The forward is correct, but the backward column-range /
-    # local masking for these offset windows produces garbage dK/dV (nonzero
-    # gradient at fully-masked positions). Refuse loudly rather than silently
-    # return wrong gradients. Non-negative windows and causal-local are fine.
-    if arch // 10 == 12 and local and (
-        (window_size_left is not None and window_size_left < 0)
-        or (window_size_right is not None and window_size_right < 0)
-    ):
-        raise NotImplementedError(
-            "sm_120 backward does not support negative-offset sliding windows "
-            "(window_size with a negative bound, e.g. (None, -X) or (-X, None)). "
-            "The forward is supported; only the backward dK/dV is affected. Use a "
-            "non-negative window, or compute the backward on a different arch."
-        )
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).

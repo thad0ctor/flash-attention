@@ -884,24 +884,43 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         m_block: Int32,
         head_idx: Int32,
         thr_mma_qk,
+        split_idx: Int32 = Int32(0),
     ):
         """Per-row learnable-sink logit for softmax.finalize (mirrors SM90).
 
         Non-pack: head_idx is the query head -> a single scalar. Pack-GQA:
         head_idx is the KV head and each packed row maps to a different query
         head, so produce a per-row fragment shaped like softmax.row_max.
+
+        SplitKV: the sink is a single virtual logit shared by every column, so
+        it must be folded into the LSE/denominator EXACTLY ONCE across splits.
+        Each split would otherwise add exp(sink) to its own row_sum, and the
+        combine kernel reconstructs the final denominator as sum_s exp(LSE_s),
+        which would count the sink num_splits times. We therefore apply it only
+        in split 0 and suppress it (logit -> -inf, so exp2(-inf) == 0 in
+        finalize) in every other split. With a single split this is a no-op.
         """
         if const_expr(learnable_sink is None):
             return None
+        # Only split 0 carries the sink; suppress it in every other SplitKV split
+        # by adding a runtime bias of 0 (split 0) or -inf (split>0). Adding (not
+        # selecting) keeps the result Float32 and lets the -inf collapse the
+        # exp2() term in softmax.finalize to 0. With a single split this is a
+        # no-op. split_idx is a runtime value, so the choice is made at runtime.
+        if const_expr(self.is_split_kv):
+            suppress_bias = Float32(0.0) if split_idx == Int32(0) else -Float32.inf
+        else:
+            suppress_bias = Float32(0.0)
         if const_expr(not self.pack_gqa):
-            return Float32(learnable_sink[head_idx])
+            sink_logit = Float32(learnable_sink[head_idx])
+            return sink_logit + suppress_bias
         sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
         for r in cutlass.range(cute.size(sink_val), unroll_full=True):
             row = m_block * self.tile_m + tScS_mn[r][0]
             q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
-            sink_val[r] = Float32(learnable_sink[q_head_idx])
+            sink_val[r] = Float32(learnable_sink[q_head_idx]) + suppress_bias
         return sink_val
 
     @cute.kernel
@@ -1249,7 +1268,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                             tidx,
                             m_block,
                             seqlen.seqlen_q,
-                            zero_oob_rows=True,
                         )
                 else:
                     self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block,
@@ -1295,7 +1313,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
 
             row_scale = softmax.finalize(
-                sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, num_head, thr_mma_qk)
+                sink_val=self.compute_sink_val(
+                    learnable_sink, softmax, m_block, num_head, thr_mma_qk, split_idx
+                )
             )
             softmax.rescale_O(acc_O, row_scale)
             sO = cute.make_tensor(sQ.iterator, sO_layout)
@@ -1338,7 +1358,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         tidx,
                         m_block,
                         seqlen.seqlen_q,
-                        zero_oob_rows=True,
                     )
             else:
                 self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
@@ -1501,7 +1520,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
             # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize(
-                sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, num_head, thr_mma_qk)
+                sink_val=self.compute_sink_val(
+                    learnable_sink, softmax, m_block, num_head, thr_mma_qk, split_idx
+                )
             )
             softmax.rescale_O(acc_O, row_scale)
 
@@ -1616,6 +1637,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     learnable_sink,
                     gQ,
                     tidx,
+                    mQ_cur,
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
                 )
@@ -1890,6 +1912,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor],
         gQ: cute.Tensor,
         tidx: Int32,
+        mQ_cur: cute.Tensor,
         aux_tensors=None,
         fastdiv_mods=None,
     ):
@@ -1913,10 +1936,34 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         # Prologue: Q load, first K load.
         gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-        self.load_Q(
-            gmem_thr_copy_Q, gQ, sQ, m_block,
-            seqlen=seqlen.seqlen_q, headdim=mQ.shape[1],
-        )
+        if const_expr(self.pack_gqa):
+            # Mirror the dense / block-sparse prologue: the plain cp_async
+            # self.load_Q cannot address the packed composite
+            # (qhead_per_kvhead, seqlen) Q layout (cute.local_tile collapses
+            # adjacent qhead rows that live at non-adjacent strides), so use
+            # the PackGQA per-row pointer loader instead.
+            pack_gqa_helper = PackGQA(
+                self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+            )
+            if const_expr(self.pack_gqa_all_rows_valid):
+                if const_expr(self.pack_gqa_fast_valid_rows):
+                    pack_gqa_helper.load_Q(
+                        mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q,
+                        all_rows_valid=True,
+                    )
+                else:
+                    pack_gqa_helper.load_Q_all_rows_valid(
+                        mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q,
+                    )
+            else:
+                pack_gqa_helper.load_Q(
+                    mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q,
+                )
+        else:
+            self.load_Q(
+                gmem_thr_copy_Q, gQ, sQ, m_block,
+                seqlen=seqlen.seqlen_q, headdim=mQ.shape[1],
+            )
         cute.arch.cp_async_commit_group()
 
         paged_kv_manager.load_page_table(n_block)
@@ -2021,7 +2068,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                 seqlen, m_block, n_block_min
             )
-            unmasked_n_block_start = n_block_min_causal_local_mask
+            # Mirror the dense path: a non-causal local window whose right bound
+            # reaches the seqlen boundary can make get_n_block_min_causal_local_mask
+            # return >= n_block_max, which would make the unmasked loop below
+            # reprocess the first block or step past the valid range.
+            unmasked_n_block_start = cutlass.min(
+                n_block_min_causal_local_mask, n_block_max - 1
+            )
             for n_tile in cutlass.range(
                 n_block_max - 1 - n_block_min_causal_local_mask, unroll=1
             ):

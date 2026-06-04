@@ -164,9 +164,14 @@ class PackGQA:
         tidx: cutlass.Int32,
         block: cutlass.Int32,
         seqlen: cutlass.Int32,
-        zero_oob_rows: cutlass.Constexpr[bool] = False,
         all_rows_valid: cutlass.Constexpr[bool] = False,
     ):
+        # Note: there is no separate "zero OOB rows" path. Out-of-bounds rows
+        # (m >= seqlen) are simply not copied (pred=False below). That is safe
+        # because OOB Q rows never affect stored output: in the forward their O
+        # rows are not written, and in the backward they produce P==0 under the
+        # row mask, so they contribute nothing to dK/dV. Whatever stale value
+        # sits in sQ for those rows is therefore inert.
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
         cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         tQsQ = gmem_thr_copy.partition_D(sQ)

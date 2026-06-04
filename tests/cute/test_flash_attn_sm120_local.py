@@ -21,17 +21,22 @@ def _ensure_worktree_cute_loaded():
         finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
         if finder.MAPPING.get("flash_attn.cute") != str(worktree_cute):
             finder.MAPPING["flash_attn.cute"] = str(worktree_cute)
+            # Scope the reset to flash_attn.cute (and its children) so we do not
+            # tear down the rest of an already-imported flash_attn package, which
+            # would create a second live copy with separate globals/JIT caches and
+            # make failures depend on test collection order.
             for name in list(sys.modules):
-                if name == "flash_attn" or name.startswith("flash_attn."):
+                if name == "flash_attn.cute" or name.startswith("flash_attn.cute."):
                     del sys.modules[name]
     except ModuleNotFoundError:
         for name in list(sys.modules):
-            if name == "flash_attn" or name.startswith("flash_attn."):
+            if name == "flash_attn.cute" or name.startswith("flash_attn.cute."):
                 del sys.modules[name]
-        pkg = types.ModuleType("flash_attn")
-        pkg.__path__ = [str(worktree_root / "flash_attn")]
-        pkg.__package__ = "flash_attn"
-        sys.modules["flash_attn"] = pkg
+        if "flash_attn" not in sys.modules:
+            pkg = types.ModuleType("flash_attn")
+            pkg.__path__ = [str(worktree_root / "flash_attn")]
+            pkg.__package__ = "flash_attn"
+            sys.modules["flash_attn"] = pkg
 
 
 _ensure_worktree_cute_loaded()

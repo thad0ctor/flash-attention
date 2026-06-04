@@ -229,6 +229,20 @@ def phase_repro(args):
     if not os.path.exists(main_path):
         print(f"ERROR: missing {main_path}; run --phase main first")
         sys.exit(1)
+    # Idempotency: unlike phase_main, this phase appends to sweep_repro.jsonl
+    # without clearing it, so a re-run would add duplicate repeats and bias
+    # phase_analyze toward whichever candidates were rerun more often. Clear on
+    # --force, otherwise skip already-recorded (cell, tile, repeat) entries.
+    if args.force and os.path.exists(repro_path):
+        os.remove(repro_path)
+    existing = {
+        (
+            r["preset"], r["sl"], r["causal"],
+            r["tile_m"], r["tile_n"], r["num_stages"],
+            r.get("repeat", 0),
+        )
+        for r in read_jsonl(repro_path)
+    }
     main_rows = read_jsonl(main_path)
     by_cell = defaultdict(list)
     for r in main_rows:
@@ -245,6 +259,9 @@ def phase_repro(args):
         for r in rows:
             tm, tn, ns = r["tile_m"], r["tile_n"], r["num_stages"]
             for repeat in range(2):
+                rkey = (name, sl, causal, tm, tn, ns, repeat)
+                if rkey in existing:
+                    continue
                 rr = run_measure(name, sl, causal, tm, tn, ns,
                                  skip_correctness=True)  # already validated in main
                 rr["phase"] = "repro"
@@ -403,12 +420,19 @@ def phase_validate(args):
     val_path = os.path.join(ROOT, "validate.jsonl")
     if args.force and os.path.exists(val_path):
         os.remove(val_path)
+    # Include the tuned tile in the resume key: if bwd_lookup_candidate.py
+    # changes between runs, "tuned" rows with a different (tile_m, tile_n,
+    # num_stages) must NOT be treated as cache hits, or the report would
+    # compare the new lookup against stale measurements.
     existing = {
         (
             r["preset"],
             r["sl"],
             r["causal"],
             r.get("mode_label") or r.get("mode"),
+            r["tile_m"],
+            r["tile_n"],
+            r["num_stages"],
             r.get("repeat", 0),
         )
         for r in read_jsonl(val_path)
@@ -426,7 +450,7 @@ def phase_validate(args):
             tile = baseline_tile if mode == "baseline" else tuned_tile
             tm, tn, ns = tile
             for repeat in range(args.N):
-                rkey = (name, sl, causal, mode, repeat)
+                rkey = (name, sl, causal, mode, tm, tn, ns, repeat)
                 if rkey in existing:
                     continue
                 r = run_measure(name, sl, causal, tm, tn, ns,

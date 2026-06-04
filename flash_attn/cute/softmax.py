@@ -134,9 +134,19 @@ class Softmax(ParamsBase):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
+                # Guard against an all-masked row (row_max == -inf), which arises
+                # for empty SplitKV splits: exp2(sink - (-inf)) would overflow to
+                # +inf and poison the LSE. Treating row_max as 0 there makes the
+                # sink term exp(sink), i.e. the row attends only to the sink token
+                # (the mathematically correct denominator). For finite row_max the
+                # value is unchanged. When sink_val itself is -inf (the suppressed
+                # non-zero SplitKV splits) the term is exp2(-inf) == 0 as intended.
+                row_max_safe = 0.0 if row_max[r] == -Float32.inf else row_max[r]
                 row_sum[r] += cute.math.exp2(
-                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
+                    sink_val_cur * LOG2_E - row_max_safe * scale_log2, fastmath=True
                 )
+            else:
+                row_max_safe = row_max[r]
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -145,8 +155,11 @@ class Softmax(ParamsBase):
             ) * final_scale
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
+            # Use row_max_safe so a row whose only mass is the sink token
+            # (row_max == -inf, sink finite -> empty SplitKV split 0) reports
+            # LSE == sink instead of -inf, which the combine must keep.
             row_sum[r] = (
-                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                (row_max_safe * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
