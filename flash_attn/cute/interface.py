@@ -1186,6 +1186,17 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
+    # learnable_sink is folded into each KV-split's running denominator/LSE, and
+    # the combine kernel does NOT de-duplicate it across splits — it ends up
+    # counted once per split, giving wrong output. SplitKV is therefore
+    # unsupported with a learnable sink: force a single split (always correct).
+    # This guard sits after every num_splits decision (incl. the sm_120 decode
+    # auto-split above, which otherwise silently engaged SplitKV for sink decode
+    # workloads). Costs the decode SplitKV speedup for sink models; correctness
+    # over speed. (Proper fix = apply the sink once during combine.)
+    if learnable_sink is not None:
+        num_splits = 1
+
     is_split_kv = num_splits > 1
 
     # fp8 KV-cache decode is the only sm_120 path that can consume an fp8 K/V
@@ -2372,6 +2383,24 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+
+    # SM120 backward dK/dV is incorrect for negative-offset (one-sided open)
+    # sliding windows — window_size with a negative bound, e.g. (None, -X) or
+    # (-X, None), where the bound is an offset off the diagonal rather than a
+    # non-negative span. The forward is correct, but the backward column-range /
+    # local masking for these offset windows produces garbage dK/dV (nonzero
+    # gradient at fully-masked positions). Refuse loudly rather than silently
+    # return wrong gradients. Non-negative windows and causal-local are fine.
+    if arch // 10 == 12 and local and (
+        (window_size_left is not None and window_size_left < 0)
+        or (window_size_right is not None and window_size_right < 0)
+    ):
+        raise NotImplementedError(
+            "sm_120 backward does not support negative-offset sliding windows "
+            "(window_size with a negative bound, e.g. (None, -X) or (-X, None)). "
+            "The forward is supported; only the backward dK/dV is affected. Use a "
+            "non-negative window, or compute the backward on a different arch."
+        )
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).

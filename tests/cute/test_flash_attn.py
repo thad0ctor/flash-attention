@@ -373,6 +373,13 @@ def test_flash_attn_output(
                     "bwd kernel lacks the dQ_semaphore code path (asserts in "
                     "interface.py:~2421); only SM90/SM100 implement it."
                 )
+            if local_enum in (2, 3) and IS_SM120:
+                pytest.skip(
+                    "SM120 backward is incorrect for negative-offset windows "
+                    "(local_enum 2/3 -> window (None,-X)/(-X,None)); the forward "
+                    "is correct but bwd dK/dV is wrong, so interface.py raises "
+                    "NotImplementedError on the bwd path. Known limitation."
+                )
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -860,6 +867,13 @@ def test_flash_attn_varlen_output(
                     "SM120 deterministic backward not supported: the SM80-base "
                     "bwd kernel lacks the dQ_semaphore code path (asserts in "
                     "interface.py:~2421); only SM90/SM100 implement it."
+                )
+            if local_enum in (2, 3) and IS_SM120:
+                pytest.skip(
+                    "SM120 backward is incorrect for negative-offset windows "
+                    "(local_enum 2/3 -> window (None,-X)/(-X,None)); the forward "
+                    "is correct but bwd dK/dV is wrong, so interface.py raises "
+                    "NotImplementedError on the bwd path. Known limitation."
                 )
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)

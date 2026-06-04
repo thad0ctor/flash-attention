@@ -51,6 +51,16 @@ KV-cache bandwidth. Accuracy is within ~2e-3 of an fp8-quantized reference.
   compute-bound); it still halves KV memory, so it remains the only fp8-cache path.
 - Backward is at ~parity with FA2; fp8 is forward/decode-only (no fp8 backward).
 
+**Feature limitations on sm_120:**
+- `learnable_sink` is incompatible with SplitKV (each split would double-count the sink
+  in the combine step), so SplitKV is disabled when a sink is present — attention runs
+  in a single split (correct, but without the decode SplitKV speedup).
+- Negative-offset sliding windows (`window_size` with a negative bound, e.g. `(None, -X)`
+  or `(-X, None)`) are forward-only: the backward raises `NotImplementedError` (its
+  dK/dV are incorrect for these offset windows). Non-negative windows are fully supported.
+- Deterministic backward (`deterministic=True`) is not supported (the SM80-base backward
+  lacks the dQ-semaphore path).
+
 ## Development
 
 ```sh
