@@ -135,6 +135,32 @@ def _sm120_bwd_pack_gqa_m_splits(
         and num_head * batch_size <= 32
     ):
         return 2
+    # B=1 D256 backward underfills the 188 SMs (grid = ceil(S/64)*Hq*1 CTAs, all
+    # <~1.4 waves for these small-Hq shapes) so the unsplit default idles SMs.
+    # These exact cells win from an M-split (RTX6000 A/B vs current dispatch:
+    # +12-20%, robust across seeds). B=1 runs non-packed, so handle before the
+    # pack-only early-return. B>=2 is excluded: it either auto-splits already or
+    # the split is noise (verified). Only these validated cells are listed.
+    if (
+        arch // 10 == 12
+        and batch_size == 1
+        and not local
+        and head_dim == 256
+        and head_dim_v == 256
+        and seqlen_q == seqlen_k
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+    ):
+        if causal and qhead_per_kvhead == 8 and num_head == 8 and num_head_kv == 1 and seqlen_q == 512:
+            return 4  # +20%
+        if causal and qhead_per_kvhead == 4 and num_head == 8 and num_head_kv == 2 and seqlen_q == 512:
+            return 3  # +18%
+        if not causal and qhead_per_kvhead == 4 and num_head == 16 and num_head_kv == 4 and seqlen_q == 1024:
+            return 2  # +20%
+        if not causal and qhead_per_kvhead == 4 and num_head == 8 and num_head_kv == 2 and seqlen_q == 2048:
+            return 2  # +18%
+        if not causal and qhead_per_kvhead == 6 and num_head == 24 and num_head_kv == 4 and seqlen_q == 1024:
+            return 3  # +12%
     if (
         arch // 10 != 12
         or not pack_gqa
