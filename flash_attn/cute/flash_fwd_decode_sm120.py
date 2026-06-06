@@ -1,4 +1,4 @@
-# Copyright (c) 2025
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # SM120 (consumer Blackwell, RTX PRO 6000) decode-specialized forward pass.
 #
 # Decode = seqlen_q == 1 with a large KV cache.  The general SM80-base forward
@@ -126,7 +126,7 @@ class FlashAttentionDecodeSm120:
     def _smem_bytes(self):
         kv_elem_bytes = self.kv_dtype.width // 8
         kv_tile = self.num_stages * self.tile_n * self.head_dim * kv_elem_bytes
-        rpi, R, tpr, vec = self.rows_per_iter, self.R, self.threads_per_row, self.vec
+        R, tpr, vec = self.R, self.threads_per_row, self.vec
         nwarps = self.num_threads // 32
         red_acc = nwarps * R * tpr * vec * 4
         red_ms = 2 * nwarps * R * tpr * 4
@@ -201,7 +201,6 @@ class FlashAttentionDecodeSm120:
         tpr = const_expr(self.threads_per_row)
         rpi = const_expr(self.rows_per_iter)
         NS = const_expr(self.num_stages)
-        is_fp8_kv = const_expr(self.is_fp8_kv)
         seqlen_k = mK.shape[1]
 
         # Per-(batch, kv-head) descale scalars for an fp8 K/V cache.  k_descale is

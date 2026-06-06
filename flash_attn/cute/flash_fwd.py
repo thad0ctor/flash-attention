@@ -746,6 +746,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        # Only the sm_120 specialization (FlashAttentionForwardSm120 /
+        # ...Sm120Tma) supports a learnable sink in this SM80-base kernel. Real
+        # SM80 rejects it exactly as main did, which also keeps the softmax
+        # row_max_safe sink path unreachable on SM80. NOTE: the sm120 forward
+        # forces self.arch = Arch.sm_80, so the backward's `arch == 120` idiom
+        # does not work here; gate on the is_sm120 marker instead.
+        assert (
+            learnable_sink is None or getattr(self, "is_sm120", False)
+        ), "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -1035,29 +1044,35 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        # With pack_gqa, num_head iterates over KV heads (mQ.shape[2] is
-        # nheads_kv) and equals head_idx_kv directly; without pack_gqa,
-        # num_head iterates over all Q heads and we divide to get the KV head.
-        num_head_kv = (
-            num_head // self.qhead_per_kvhead
-            if const_expr(not self.pack_gqa)
-            else num_head
-        )
+        if const_expr(getattr(self, "is_sm120", False)):
+            # With pack_gqa, num_head iterates over KV heads (mQ.shape[2] is
+            # nheads_kv) and equals head_idx_kv directly; without pack_gqa,
+            # num_head iterates over all Q heads and we divide to get the KV head.
+            num_head_kv = (
+                num_head // self.qhead_per_kvhead
+                if const_expr(not self.pack_gqa)
+                else num_head
+            )
+        else:
+            num_head_kv = num_head // self.qhead_per_kvhead
         if const_expr(not seqlen.has_cu_seqlens_q):
             mQ_cur = mQ[None, None, num_head, batch_size]
         else:
-            # Under pack_gqa, mode 0 of mQ is the composite (qhead_per_kvhead,
-            # seqlen_q). A scalar token offset_q against that composite is
-            # decomposed colexicographically by crd2idx (offset_q % qpkv,
-            # offset_q // qpkv), which advances the base pointer by the wrong
-            # amount for qpkv>1 and batch>0 -> garbage for varlen GQA seq>=1.
-            # Offset the seqlen sub-mode only (matches the O/LSE offset_batch_Q
-            # epilogue). MHA (qpkv=1) and batch 0 are unaffected.
-            q_offset = (
-                ((None, seqlen.offset_q), 0)
-                if const_expr(self.pack_gqa)
-                else (seqlen.offset_q, 0)
-            )
+            if const_expr(getattr(self, "is_sm120", False)):
+                # Under pack_gqa, mode 0 of mQ is the composite (qhead_per_kvhead,
+                # seqlen_q). A scalar token offset_q against that composite is
+                # decomposed colexicographically by crd2idx (offset_q % qpkv,
+                # offset_q // qpkv), which advances the base pointer by the wrong
+                # amount for qpkv>1 and batch>0 -> garbage for varlen GQA seq>=1.
+                # Offset the seqlen sub-mode only (matches the O/LSE offset_batch_Q
+                # epilogue). MHA (qpkv=1) and batch 0 are unaffected.
+                q_offset = (
+                    ((None, seqlen.offset_q), 0)
+                    if const_expr(self.pack_gqa)
+                    else (seqlen.offset_q, 0)
+                )
+            else:
+                q_offset = (seqlen.offset_q, 0)
             mQ_cur = cute.domain_offset(q_offset, mQ[None, None, num_head])
         # gK/gV are only used by the contiguous (non-paged) load path. For paged KV
         # the PagedKVManager indexes mK/mV directly via the page table.

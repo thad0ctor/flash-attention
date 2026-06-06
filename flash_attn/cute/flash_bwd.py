@@ -714,7 +714,7 @@ class FlashAttentionBackwardSm80:
                         (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
                         m_block_min,
                     )
-            if cutlass.const_expr(self.is_local):
+            if cutlass.const_expr(self.is_local and getattr(self, "arch", 80) == 120):
                 # Local/sliding-window: only m-blocks whose queries attend keys in
                 # this n-block within the window are non-empty. Mirror
                 # BlockInfo.get_m_block_min_max. Without this the kernel processes
@@ -1157,14 +1157,17 @@ class FlashAttentionBackwardSm80:
                 # Local/sliding-window masking. The backward must apply the same
                 # window the forward used; otherwise it recomputes the attention
                 # matrix with the wrong mask and produces garbage dK/dV/dQ. Only
-                # pass the window when local so the causal path is unchanged.
-                window_size_left=window_size_left if cutlass.const_expr(self.is_local) else None,
-                window_size_right=window_size_right if cutlass.const_expr(self.is_local) else None,
+                # pass the window when local so the causal path is unchanged. This
+                # is sm_120-only; real SM80 reproduces main's causal-only mask
+                # (no window, no local) here.
+                window_size_left=window_size_left if cutlass.const_expr(self.is_local and getattr(self, "arch", 80) == 120) else None,
+                window_size_right=window_size_right if cutlass.const_expr(self.is_local and getattr(self, "arch", 80) == 120) else None,
             )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local,
+                mask_seqlen=True, mask_causal=self.is_causal,
+                mask_local=self.is_local and cutlass.const_expr(getattr(self, "arch", 80) == 120),
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)
@@ -1407,7 +1410,11 @@ class FlashAttentionBackwardSm80:
             )
             # ((1, 1), num_elements)
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
-            if cutlass.const_expr(self.pack_gqa and not gmem_copy_params.dq_accum_is_packed):
+            if cutlass.const_expr(
+                getattr(self, "arch", 80) == 120
+                and self.pack_gqa
+                and not gmem_copy_params.dq_accum_is_packed
+            ):
                 # Phase 17B-v3: under pack_gqa, each thread's MMA accumulator
                 # values span 2 different m_block rows (e.g., for SM80 m16n8 fp32,
                 # vals 0/1 are at (r, c)/(r, c+1) and vals 2/3 are at

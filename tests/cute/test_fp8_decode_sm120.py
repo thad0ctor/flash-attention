@@ -13,7 +13,8 @@ fp32 SDPA reference (bottom-right causal), and check the kernel output against
 that fp8-quantized reference.  Tolerance is rel-err < 1e-2 (fp8 quant noise; the
 observed baseline is ~1.7e-3).
 
-The reference quant+SDPA mirrors ``agent_space/fp8_decode_correctness.py``.
+The reference applies the same per-(batch, kv-head) fp8 quantization to K/V and
+runs an fp32 SDPA on the dequantized tensors.
 
 Runs both with and without the env flag (parametrized): the auto-enable path must
 pass without the flag, and the flag must remain a harmless no-op for fp8 K/V.
@@ -23,55 +24,13 @@ Skips when not on sm_120 (compute capability 12.x) or when CUDA is unavailable.
 
 from __future__ import annotations
 
-import importlib
 import math
 import os
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
 
-
-def _route_flash_attn_cute_to_this_worktree():
-    """Point ``flash_attn.cute`` at the worktree we live in (see test_paged_kv_sm120)."""
-    worktree_root = Path(__file__).resolve().parents[2]
-    cute_dir = worktree_root / "flash_attn" / "cute"
-    if not cute_dir.exists():
-        return
-    try:
-        finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
-    except ModuleNotFoundError:
-        if str(worktree_root) not in sys.path:
-            sys.path.insert(0, str(worktree_root))
-        pkg = types.ModuleType("flash_attn")
-        pkg.__path__ = [str(worktree_root / "flash_attn")]
-        pkg.__package__ = "flash_attn"
-        sys.modules["flash_attn"] = pkg
-        return
-    if finder.MAPPING.get("flash_attn.cute") == str(cute_dir):
-        pkg = types.ModuleType("flash_attn")
-        pkg.__path__ = [str(worktree_root / "flash_attn")]
-        pkg.__package__ = "flash_attn"
-        sys.modules["flash_attn"] = pkg
-        return
-    finder.MAPPING["flash_attn.cute"] = str(cute_dir)
-    for name in list(sys.modules):
-        if name == "flash_attn" or name.startswith("flash_attn."):
-            del sys.modules[name]
-    pkg = types.ModuleType("flash_attn")
-    pkg.__path__ = [str(worktree_root / "flash_attn")]
-    pkg.__package__ = "flash_attn"
-    sys.modules["flash_attn"] = pkg
-
-
-_route_flash_attn_cute_to_this_worktree()
-
-try:
-    from flash_attn.cute.interface import _flash_attn_fwd
-except ImportError as _e:  # pragma: no cover
-    pytest.skip(f"flash_attn.cute not importable: {_e}", allow_module_level=True)
+from flash_attn.cute.interface import _flash_attn_fwd
 
 
 FP8 = torch.float8_e4m3fn

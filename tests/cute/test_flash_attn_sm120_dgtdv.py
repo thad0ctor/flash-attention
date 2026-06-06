@@ -1,6 +1,6 @@
 """Regression tests for Bug E (head_dim > head_dim_v) routing on SM120.
 
-Bug E (`/sm120-overnight-logs/phase4Y/REPORT.md`, fix in commit 886f04f):
+Bug E (fix in commit 886f04f):
 ``head_dim > head_dim_v`` on SM120 hangs the TMA forward kernel. The shipped
 fix is a two-gate dispatcher pattern in ``flash_attn.cute.interface``:
 
@@ -37,65 +37,13 @@ Skips when not running on sm_120.
 
 from __future__ import annotations
 
-import importlib
-import sys
-import types
-from pathlib import Path
 from typing import Tuple
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-
-def _route_flash_attn_cute_to_this_worktree():
-    """Point ``flash_attn.cute`` at the worktree we live in.
-
-    Same overlay shim used by ``test_paged_kv_sm120.py`` and
-    ``sm120-overnight-logs/phase4R/_use_worktree.py``. When pytest is run
-    against the editable FA4 install, the finder maps ``flash_attn.cute``
-    to whatever directory was active at install time — usually the main
-    checkout, not this worktree. We patch the finder's MAPPING (and drop
-    any cached ``flash_attn`` modules) so subsequent imports resolve here.
-    """
-    worktree_root = Path(__file__).resolve().parents[2]  # tests/cute/.. -> repo root
-    cute_dir = worktree_root / "flash_attn" / "cute"
-    if not cute_dir.exists():
-        return
-    try:
-        finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
-    except ModuleNotFoundError:
-        if str(worktree_root) not in sys.path:
-            sys.path.insert(0, str(worktree_root))
-        pkg = types.ModuleType("flash_attn")
-        pkg.__path__ = [str(worktree_root / "flash_attn")]
-        pkg.__package__ = "flash_attn"
-        sys.modules["flash_attn"] = pkg
-        return
-    if finder.MAPPING.get("flash_attn.cute") == str(cute_dir):
-        pkg = types.ModuleType("flash_attn")
-        pkg.__path__ = [str(worktree_root / "flash_attn")]
-        pkg.__package__ = "flash_attn"
-        sys.modules["flash_attn"] = pkg
-        return
-    finder.MAPPING["flash_attn.cute"] = str(cute_dir)
-    for name in list(sys.modules):
-        if name == "flash_attn" or name.startswith("flash_attn."):
-            del sys.modules[name]
-    pkg = types.ModuleType("flash_attn")
-    pkg.__path__ = [str(worktree_root / "flash_attn")]
-    pkg.__package__ = "flash_attn"
-    sys.modules["flash_attn"] = pkg
-
-
-_route_flash_attn_cute_to_this_worktree()
-
-# Import directly from flash_attn.cute to avoid touching the legacy
-# flash_attn_2_cuda package (which may not be installed alongside FA4).
-try:
-    from flash_attn.cute import flash_attn_func
-except ImportError as _e:
-    pytest.skip(f"flash_attn.cute not importable: {_e}", allow_module_level=True)
+from flash_attn.cute import flash_attn_func
 
 
 def _sm120_only():

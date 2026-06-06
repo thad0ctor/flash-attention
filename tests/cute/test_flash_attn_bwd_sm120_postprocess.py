@@ -19,38 +19,12 @@ noise.
 """
 from __future__ import annotations
 
-import importlib
-import sys
-import types
 from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-
-
-# Repoint `flash_attn.cute` to this worktree if there's an editable FA4 install
-# whose MAPPING hardcodes another checkout (e.g. the integration repo).
-def _ensure_worktree_cute_loaded():
-    worktree_root = Path(__file__).resolve().parents[2]
-    worktree_cute = Path(__file__).resolve().parents[2] / "flash_attn" / "cute"
-    try:
-        finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
-        if finder.MAPPING.get("flash_attn.cute") != str(worktree_cute):
-            finder.MAPPING["flash_attn.cute"] = str(worktree_cute)
-            for name in list(sys.modules):
-                if name == "flash_attn" or name.startswith("flash_attn."):
-                    del sys.modules[name]
-    except ModuleNotFoundError:
-        pass
-    pkg = types.ModuleType("flash_attn")
-    pkg.__path__ = [str(worktree_root / "flash_attn")]
-    pkg.__package__ = "flash_attn"
-    sys.modules["flash_attn"] = pkg
-
-
-_ensure_worktree_cute_loaded()
 
 
 def _sm120_only():

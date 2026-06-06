@@ -13,6 +13,12 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
 
 class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
+    # Marker for arch-gated logic inside the SM80-shared forward body. self.arch
+    # is forced to Arch.sm_80 below (so the SM80 epilogue/MMA paths are used), so
+    # the backward's `arch == 120` idiom does not work in the forward; gate sm120-
+    # only forward behavior on this flag instead. Base class defaults False.
+    is_sm120: bool = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Override arch to sm_80 so that __call__ uses CpAsync (not TMA) for the O epilogue.

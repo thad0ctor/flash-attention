@@ -2,39 +2,12 @@
 
 from __future__ import annotations
 
-import importlib
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-
-def _route_flash_attn_cute_to_this_worktree():
-    worktree_root = Path(__file__).resolve().parents[2]
-    cute_dir = worktree_root / "flash_attn" / "cute"
-    try:
-        finder = importlib.import_module("__editable___flash_attn_4_0_0_0_finder")
-    except ModuleNotFoundError:
-        if str(worktree_root) not in sys.path:
-            sys.path.insert(0, str(worktree_root))
-        return
-    if finder.MAPPING.get("flash_attn.cute") == str(cute_dir):
-        return
-    finder.MAPPING["flash_attn.cute"] = str(cute_dir)
-    for name in list(sys.modules):
-        if name == "flash_attn" or name.startswith("flash_attn."):
-            del sys.modules[name]
-
-
-_route_flash_attn_cute_to_this_worktree()
-
-try:
-    from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
-except ImportError as _e:
-    pytest.skip(f"flash_attn.cute not importable: {_e}", allow_module_level=True)
+from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
 
 
 def _sm120_only():
