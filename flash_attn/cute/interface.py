@@ -105,8 +105,36 @@ def _sm120_bwd_pack_gqa_m_splits(
     n_block_size: int,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    batch_size: int = 1,
 ) -> int:
-    """Internal SM120 explicit-PackGQA M-split policy for backward."""
+    """Internal SM120 explicit-PackGQA M-split policy for backward.
+
+    Returns the backward M-split count (used as the m-split regardless of
+    pack_gqa). Normally only the explicit-PackGQA path is split; the one
+    exception is the dense D256 qpkv4 S512 small-grid case below, which underfills
+    the SMs and wins from a split even though it runs non-packed.
+    """
+    # Dense D256 qpkv4 S512 underfills the 188 SMs: grid = ceil(S/64)*Hq*B =
+    # 8*num_head*batch CTAs; num_head*batch <= 32 means <= 256 CTAs (~1.36 waves).
+    # split=2 fills to ~2.7 waves and is ~8% faster than the unsplit default
+    # (RTX6000 interleaved A/B). This shape runs non-packed (pack_gqa=False), so
+    # it must be handled before the pack-only early-return. Filled grids
+    # (num_head*batch > 32, e.g. B>=4 or Hq32) regress with the split -> excluded;
+    # qpkv8 regresses even when underfilled -> excluded by qpkv==4.
+    if (
+        arch // 10 == 12
+        and not causal
+        and not local
+        and qhead_per_kvhead == 4
+        and head_dim == 256
+        and head_dim_v == 256
+        and seqlen_q == seqlen_k
+        and seqlen_q == 512
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and num_head * batch_size <= 32
+    ):
+        return 2
     if (
         arch // 10 != 12
         or not pack_gqa
@@ -2674,6 +2702,7 @@ def _flash_attn_bwd(
         n_block_size=n_block_size,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        batch_size=batch_size,
     )
     # SM120 nonpacked causal-D256 M-split policy (RTX PRO 6000, 188 SMs).
     # Splitting the nonpacked M loop adds CTAs and only helps when the backward
