@@ -1251,19 +1251,20 @@ def _flash_attn_fwd(
     ):
         num_splits = 0  # request the heuristic (engages SplitKV iff underfilled)
 
-    # TODO: fix GQA + SplitKV + non-varlen
-    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+    # GQA + SplitKV + pack_gqa.
+    #
+    # sm120: the SplitKV partial-O/LSE epilogue now scatters the packed rows to
+    # their correct physical partial slots (pack_gqa.store_O_partial /
+    # store_LSE_partial), so pack_gqa stays ENABLED for both non-varlen and
+    # varlen on sm120.
+    #
+    # Other archs: preserve prior behavior exactly. The non-varlen case was
+    # disabled for all archs (TODO: fix GQA + SplitKV + non-varlen); keep it
+    # disabled for non-sm120. SM100 keeps its own pack_gqa+SplitKV kernel for
+    # the varlen case (untouched).
+    if arch // 10 != 12 and pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
 
-    # SM120: pack_gqa + SplitKV is also broken for the *varlen* path (the SplitKV
-    # partial-O/LSE epilogue in flash_fwd.py writes with the unpacked layout while
-    # the buffers are folded to the packed (qhead_per_kvhead, seqlen_q) layout, so
-    # rows are scattered to the wrong partial slots -> NaN/garbage). The non-varlen
-    # case is already disabled above; mirror it for varlen on sm120 only so other
-    # archs (SM100, which uses its own pack_gqa+SplitKV kernel) are unaffected.
-    if arch // 10 == 12 and pack_gqa and num_splits != 1 and cu_seqlens_q is not None:
-        pack_gqa = False
-    
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
         pack_gqa = False
 

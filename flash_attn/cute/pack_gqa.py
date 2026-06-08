@@ -449,6 +449,94 @@ class PackGQA:
                     )
 
     @cute.jit
+    def store_O_partial(
+        self,
+        mO: cute.Tensor,  # composite mode 0 (qhead_per_kvhead, seqlen_q), headdim_v
+        acc_O_mn: cute.Tensor,  # reshape_acc_to_mn(acc_O): (M, N) MMA view in registers
+        tiled_mma: cute.TiledMma,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+        headdim_v: cutlass.Int32,
+    ):
+        """Direct fp32 register -> gmem scatter of the SplitKV partial output.
+
+        Mirrors the unpacked SplitKV partial epilogue (direct MMA-layout
+        register store) but scatters each packed MMA row to its physical
+        (h_idx, m_idx) slot in the original-layout partial buffer via the
+        composite mode-0 stride, exactly like store_O/compute_ptr do for the
+        packed dtype output.  No smem roundtrip (the fp32 partial does not fit
+        in the bf16-sized smem O buffer) and no dtype conversion (mO is fp32).
+        """
+        thr_mma = tiled_mma.get_slice(tidx)
+        caccO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(caccO))
+        # Per-row row offset (within the tile) for this thread, and the column
+        # coordinate (head_dim_v position) per MMA column element.
+        taccOcO_row = taccOcO[None, 0]
+        head_stride = mO.stride[0][0]
+        seqlen_stride = mO.stride[0][1]
+        base_ptr = mO.iterator
+        for m in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
+            packed_row = block * self.m_block_size + taccOcO_row[m][0]
+            m_idx = packed_row // self.qhead_per_kvhead
+            h_idx = packed_row - m_idx * self.qhead_per_kvhead
+            if packed_row < seqlen * self.qhead_per_kvhead:
+                elem_offset = cutlass.Int64(h_idx) * cutlass.Int64(head_stride) + cutlass.Int64(
+                    m_idx
+                ) * cutlass.Int64(seqlen_stride)
+                o_ptr_i64 = (base_ptr + elem_offset).toint()
+                o_gmem_ptr = cute.make_ptr(
+                    mO.element_type, o_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+                )
+                mO_row = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded,))
+                for n in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
+                    col = taccOcO[0, n][1]
+                    if cutlass.const_expr(not self.check_hdim_oob):
+                        mO_row[col] = acc_O_mn[m, n]
+                    elif col < headdim_v:
+                        mO_row[col] = acc_O_mn[m, n]
+
+    @cute.jit
+    def store_LSE_partial(
+        self,
+        mLSE: cute.Tensor,  # composite mode 0 (qhead_per_kvhead, seqlen_q)
+        lse: cute.Tensor,  # (M,) per-row LSE in registers
+        tiled_mma: cute.TiledMma,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        """Scatter the SplitKV partial LSE to its physical (h_idx, m_idx) slot.
+
+        Like store_LSE but writes the fp32 partial-LSE buffer; only the thread
+        owning column 0 of each MMA row writes (matches the unpacked path).
+        """
+        thr_mma = tiled_mma.get_slice(tidx)
+        caccO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(caccO))
+        taccOcO_row = taccOcO[None, 0]
+        head_stride = mLSE.stride[0][0]
+        seqlen_stride = mLSE.stride[0][1]
+        base_ptr = mLSE.iterator
+        # Only the thread owning column 0 writes the per-row LSE (matches the
+        # unpacked SplitKV LSE epilogue predicate taccOcO[0][1] == 0).
+        if taccOcO[0][1] == 0:
+            for m in cutlass.range_constexpr(cute.size(lse)):
+                packed_row = block * self.m_block_size + taccOcO_row[m][0]
+                m_idx = packed_row // self.qhead_per_kvhead
+                h_idx = packed_row - m_idx * self.qhead_per_kvhead
+                if packed_row < seqlen * self.qhead_per_kvhead:
+                    elem_offset = cutlass.Int64(h_idx) * cutlass.Int64(
+                        head_stride
+                    ) + cutlass.Int64(m_idx) * cutlass.Int64(seqlen_stride)
+                    lse_ptr_i64 = (base_ptr + elem_offset).toint()
+                    lse_gmem_ptr = cute.make_ptr(
+                        mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+                    )
+                    cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse[m]
+
+    @cute.jit
     def load_scalar_per_row(
         self,
         mLSE: cute.Tensor,  # composite mode 0: (qhead_per_kvhead, seqlen_q) — rank 1

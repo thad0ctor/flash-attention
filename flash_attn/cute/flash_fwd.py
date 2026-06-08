@@ -412,7 +412,15 @@ class FlashAttentionForwardBase:
                 mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx, split_idx]
             else:
                 mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
-            if const_expr(not self.pack_gqa):
+            if const_expr(self.is_split_kv and self.pack_gqa):
+                # SplitKV partial LSE: mLSE_cur keeps composite mode 0
+                # (qhead_per_kvhead, seqlen_q); scatter packed rows to their
+                # physical (h_idx, m_idx) slots so the (unpacked-layout) combine
+                # reads them correctly.
+                pack_gqa.store_LSE_partial(
+                    mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q
+                )
+            elif const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 gLSE_expanded_layout = cute.append(
                     gLSE.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))
@@ -463,22 +471,32 @@ class FlashAttentionForwardBase:
             # gives a 2D (M, N) view; predicate rows by seqlen_q and columns by
             # head_dim_v via the identity-tensor coordinates (matches the LSE
             # write above and the SM100 split epilogue).
-            gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
-            thr_mma = tiled_mma.get_slice(tidx)
-            taccOgO_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gO))
             acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
-            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
-            t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
-            for m in cutlass.range_constexpr(cute.size(taccOgO_mn.shape[0])):
-                if (
-                    t0accOcO[m, 0][0]
-                    < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
-                ):
-                    for n in cutlass.range_constexpr(cute.size(taccOgO_mn.shape[1])):
-                        if const_expr(not self.check_hdim_v_oob):
-                            taccOgO_mn[m, n] = acc_O_mn[m, n]
-                        elif taccOcO[0, n][1] < mO.shape[1]:
-                            taccOgO_mn[m, n] = acc_O_mn[m, n]
+            if const_expr(self.pack_gqa):
+                # SplitKV partial O under pack_gqa: mO_cur keeps composite mode 0
+                # (qhead_per_kvhead, seqlen_q).  cute.local_tile cannot decompose
+                # the packed row to its physical (h_idx, m_idx) slot, so scatter
+                # the fp32 MMA accumulator directly via the composite stride
+                # (same mapping as store_O/compute_ptr).  No smem roundtrip.
+                pack_gqa.store_O_partial(
+                    mO_cur, acc_O_mn, tiled_mma, tidx, m_block, seqlen.seqlen_q, mO.shape[1]
+                )
+            else:
+                gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+                thr_mma = tiled_mma.get_slice(tidx)
+                taccOgO_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gO))
+                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+                t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+                for m in cutlass.range_constexpr(cute.size(taccOgO_mn.shape[0])):
+                    if (
+                        t0accOcO[m, 0][0]
+                        < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
+                    ):
+                        for n in cutlass.range_constexpr(cute.size(taccOgO_mn.shape[1])):
+                            if const_expr(not self.check_hdim_v_oob):
+                                taccOgO_mn[m, n] = acc_O_mn[m, n]
+                            elif taccOcO[0, n][1] < mO.shape[1]:
+                                taccOgO_mn[m, n] = acc_O_mn[m, n]
         elif const_expr(self.use_tma_O):
             # ensure smem writes are visible to TMA
             cute.arch.fence_view_async_shared()
