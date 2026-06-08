@@ -1196,6 +1196,15 @@ def _flash_attn_fwd(
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
+
+    # SM120: pack_gqa + SplitKV is also broken for the *varlen* path (the SplitKV
+    # partial-O/LSE epilogue in flash_fwd.py writes with the unpacked layout while
+    # the buffers are folded to the packed (qhead_per_kvhead, seqlen_q) layout, so
+    # rows are scattered to the wrong partial slots -> NaN/garbage). The non-varlen
+    # case is already disabled above; mirror it for varlen on sm120 only so other
+    # archs (SM100, which uses its own pack_gqa+SplitKV kernel) are unaffected.
+    if arch // 10 == 12 and pack_gqa and num_splits != 1 and cu_seqlens_q is not None:
+        pack_gqa = False
     
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
         pack_gqa = False
