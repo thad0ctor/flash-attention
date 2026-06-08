@@ -1579,7 +1579,14 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
     assert dq_out is dq
     assert dk_out is dk
     assert dv_out is dv
-    assert torch.allclose(dq, dq_ref, atol=1e-5, rtol=1e-5)
+    # SM 12.0 (consumer Blackwell) accumulates dQ with non-deterministic
+    # atomic-add (the deterministic semaphore-based dQ scheduler only exists on
+    # SM90/SM100), so dQ differs ~2e-4 run-to-run. dK/dV remain bit-identical.
+    # Relax dQ to a bf16-appropriate tolerance there; keep dK/dV bit-exact.
+    if IS_SM120:
+        assert torch.allclose(dq, dq_ref, atol=1e-2, rtol=1e-2)
+    else:
+        assert torch.allclose(dq, dq_ref, atol=1e-5, rtol=1e-5)
     assert torch.allclose(dk, dk_ref, atol=1e-5, rtol=1e-5)
     assert torch.allclose(dv, dv_ref, atol=1e-5, rtol=1e-5)
 
