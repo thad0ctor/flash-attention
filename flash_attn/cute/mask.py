@@ -278,7 +278,9 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB and self.r2p_compatible)  # R2P trick, see apply_mask_sm100
+                    r2p = const_expr(
+                        not self.swap_AB and self.r2p_compatible
+                    )  # R2P trick, see apply_mask_sm100
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):

@@ -56,7 +56,7 @@ class FlashAttentionDecodeSm120:
         is_causal: bool = False,
         kv_dtype=None,
     ):
-        self.dtype = dtype          # Q dtype (compute / score dtype: fp16/bf16)
+        self.dtype = dtype  # Q dtype (compute / score dtype: fp16/bf16)
         # K/V cache dtype.  Defaults to the Q dtype; may be fp8 (e4m3/e5m2) for a
         # quantized KV cache while Q stays bf16/fp16.  Only the K/V *loads* become
         # fp8 -> half the DRAM bytes streamed; the descale scalars restore range.
@@ -74,21 +74,33 @@ class FlashAttentionDecodeSm120:
         self.R = qhead_per_kvhead
         # vec = elems per 16B cp.async load, governed by the K/V (load) dtype.
         # fp8 -> vec=16 (vs 8 for bf16): more elems per coalesced load = the BW win.
-        self.vec = 128 // self.kv_dtype.width    # elems per 16B load
+        self.vec = 128 // self.kv_dtype.width  # elems per 16B load
         self.threads_per_row = head_dim // self.vec  # tpr
         assert num_threads % self.threads_per_row == 0
         self.rows_per_iter = num_threads // self.threads_per_row
         assert tile_n % self.rows_per_iter == 0
 
     @staticmethod
-    def can_implement(dtype, head_dim, head_dim_v, qhead_per_kvhead, num_threads, tile_n,
-                      num_stages=2, kv_dtype=None):
+    def can_implement(
+        dtype,
+        head_dim,
+        head_dim_v,
+        qhead_per_kvhead,
+        num_threads,
+        tile_n,
+        num_stages=2,
+        kv_dtype=None,
+    ):
         if dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False
         kv_dtype = kv_dtype if kv_dtype is not None else dtype
         # K/V cache may be fp8 (e4m3/e5m2) while Q/compute stays fp16/bf16.
-        if kv_dtype not in (cutlass.Float16, cutlass.BFloat16,
-                            cutlass.Float8E4M3FN, cutlass.Float8E5M2):
+        if kv_dtype not in (
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        ):
             return False
         if head_dim != head_dim_v or head_dim not in (128, 256):
             return False
@@ -137,10 +149,10 @@ class FlashAttentionDecodeSm120:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,    # (b, sq, hq, d)
-        mK: cute.Tensor,    # (b, sk, hkv, d)
-        mV: cute.Tensor,    # (b, sk, hkv, d)
-        mO: cute.Tensor,    # (num_splits, b, sq, hq, d) fp32
+        mQ: cute.Tensor,  # (b, sq, hq, d)
+        mK: cute.Tensor,  # (b, sk, hkv, d)
+        mV: cute.Tensor,  # (b, sk, hkv, d)
+        mO: cute.Tensor,  # (num_splits, b, sq, hq, d) fp32
         mLSE: cute.Tensor,  # (num_splits, b, hq, sq) fp32
         softmax_scale: Float32,
         mKDescale: cute.Tensor = None,  # (b, hkv) fp32, optional (fp8 K cache)
@@ -148,6 +160,7 @@ class FlashAttentionDecodeSm120:
         stream=None,
     ):
         from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+
         mQ, mK, mV = [assume_tensor_aligned(t) for t in (mQ, mK, mV)]
         b = mK.shape[0]
         hkv = mK.shape[2]
@@ -234,16 +247,14 @@ class FlashAttentionDecodeSm120:
         sK_bytes = const_expr(max(kv_tile_bytes, red_acc_bytes))
         sV_bytes = const_expr(max(kv_tile_bytes, red_ms_bytes))
         smem = cutlass.utils.SmemAllocator()
-        smem_layout = cute.make_layout(
-            (NS, TN, tpr, vec), stride=(TN * d, d, vec, 1)
-        )
+        smem_layout = cute.make_layout((NS, TN, tpr, vec), stride=(TN * d, d, vec, 1))
         sK_ptr = smem.allocate(sK_bytes, byte_alignment=1024)
         sV_ptr = smem.allocate(sV_bytes, byte_alignment=1024)
         sKc = cute.make_tensor(cute.recast_ptr(sK_ptr, dtype=self.kv_dtype), smem_layout)
         sVc = cute.make_tensor(cute.recast_ptr(sV_ptr, dtype=self.kv_dtype), smem_layout)
 
-        lane_d = tidx % tpr            # which 16B chunk of head dim
-        row_grp = tidx // tpr          # which K/V row within a cp.async wave
+        lane_d = tidx % tpr  # which 16B chunk of head dim
+        row_grp = tidx // tpr  # which K/V row within a cp.async wave
 
         copy_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -254,11 +265,9 @@ class FlashAttentionDecodeSm120:
         # chunked gmem views: (sk, tpr, vec).  Each thread's innermost load is
         # vec contiguous elements = one 16B chunk; the row base and lane_d*vec
         # offset are both 16B aligned.
-        gK = mK[batch, None, kv_head, None]   # (sk, d)
+        gK = mK[batch, None, kv_head, None]  # (sk, d)
         gV = mV[batch, None, kv_head, None]
-        gK_chunk_layout = cute.make_layout(
-            (seqlen_k, tpr, vec), stride=(gK.stride[0], vec, 1)
-        )
+        gK_chunk_layout = cute.make_layout((seqlen_k, tpr, vec), stride=(gK.stride[0], vec, 1))
         gKc = cute.make_tensor(gK.iterator, gK_chunk_layout)
         gVc = cute.make_tensor(gV.iterator, gK_chunk_layout)
 
@@ -280,8 +289,9 @@ class FlashAttentionDecodeSm120:
                 acc_o[r, e] = Float32(0.0)
 
         # prologue: prefetch first tile (bounds-checked; empty split -> zero-fill)
-        self.load_tile(gKc, gVc, sKc, sVc, copy_atom, n_block_min, Int32(0),
-                       lane_d, row_grp, seqlen_k)
+        self.load_tile(
+            gKc, gVc, sKc, sVc, copy_atom, n_block_min, Int32(0), lane_d, row_grp, seqlen_k
+        )
         cute.arch.cp_async_commit_group()
 
         for it in cutlass.range(n_iters, unroll=1):
@@ -289,8 +299,18 @@ class FlashAttentionDecodeSm120:
             stage = it % NS
             nxt = (it + 1) % NS
             if it + 1 < n_iters:
-                self.load_tile(gKc, gVc, sKc, sVc, copy_atom, n_block_min + it + 1, nxt,
-                               lane_d, row_grp, seqlen_k)
+                self.load_tile(
+                    gKc,
+                    gVc,
+                    sKc,
+                    sVc,
+                    copy_atom,
+                    n_block_min + it + 1,
+                    nxt,
+                    lane_d,
+                    row_grp,
+                    seqlen_k,
+                )
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(1)
             else:
@@ -421,6 +441,8 @@ class FlashAttentionDecodeSm120:
                     mO[split_idx, batch, 0, q_head, lane_d * vec + e] = acc_o[r, e] * inv
                 if lane_d == 0:
                     lse = (
-                        row_max[r] * LOG2_E + cute.math.log2(s, fastmath=True)
-                    ) * LN2 if not zero_or_nan else Float32(-1e30)
+                        (row_max[r] * LOG2_E + cute.math.log2(s, fastmath=True)) * LN2
+                        if not zero_or_nan
+                        else Float32(-1e30)
+                    )
                     mLSE[split_idx, batch, q_head, 0] = lse

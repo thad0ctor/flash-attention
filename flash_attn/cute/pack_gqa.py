@@ -148,10 +148,9 @@ class PackGQA:
             idx = block * self.m_block_size + row
             m_idx = idx // self.qhead_per_kvhead
             h_idx = idx - m_idx * self.qhead_per_kvhead
-            elem_offset = (
-                cutlass.Int64(h_idx) * cutlass.Int64(head_stride)
-                + cutlass.Int64(m_idx) * cutlass.Int64(seqlen_stride)
-            )
+            elem_offset = cutlass.Int64(h_idx) * cutlass.Int64(head_stride) + cutlass.Int64(
+                m_idx
+            ) * cutlass.Int64(seqlen_stride)
             tPrPtr[i] = (base_ptr + elem_offset).toint()
         return tPrPtr
 
@@ -215,7 +214,8 @@ class PackGQA:
                     for i in cutlass.range_constexpr(cute.size(predicate)):
                         predicate[i] = (
                             cute.elem_less(coord[i][1], mQ.shape[1])
-                            if cutlass.const_expr(self.check_hdim_oob) else True
+                            if cutlass.const_expr(self.check_hdim_oob)
+                            else True
                         ) and row_valid
                     cute.copy(
                         gmem_thr_copy,
@@ -395,7 +395,8 @@ class PackGQA:
                     for i in cutlass.range_constexpr(cute.size(predicate)):
                         predicate[i] = (
                             cute.elem_less(coord[i][1], mO.shape[1])
-                            if cutlass.const_expr(self.check_hdim_oob) else True
+                            if cutlass.const_expr(self.check_hdim_oob)
+                            else True
                         ) and row_valid
                     cute.copy(
                         gmem_thr_copy,
@@ -471,10 +472,9 @@ class PackGQA:
             idx = block * self.m_block_size + row
             m_idx = idx // self.qhead_per_kvhead
             h_idx = idx - m_idx * self.qhead_per_kvhead
-            elem_offset = (
-                cutlass.Int64(h_idx) * cutlass.Int64(head_stride)
-                + cutlass.Int64(m_idx) * cutlass.Int64(seqlen_stride)
-            )
+            elem_offset = cutlass.Int64(h_idx) * cutlass.Int64(head_stride) + cutlass.Int64(
+                m_idx
+            ) * cutlass.Int64(seqlen_stride)
             lse_ptr_i64 = (base_ptr + elem_offset).toint()
             lse_gmem_ptr = cute.make_ptr(
                 mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
@@ -549,9 +549,7 @@ class PackGQA:
         configurations a separate code path would be needed.
         """
         thr_mma = tiled_mma_dq.get_slice(tidx)
-        cdQ = cute.make_identity_tensor(
-            (self.m_block_size, self.head_dim_padded)
-        )
+        cdQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         taccdQcdQ = thr_mma.partition_C(cdQ)
         assert cute.size(taccdQcdQ) == cute.size(acc_dQ_atomic), (
             "partition_C identity must have same size as acc_dQ_atomic"
@@ -602,11 +600,9 @@ class PackGQA:
             k_within_mblock = outer_iter * 1024 + thread_target * 4 + v
             position_in_head_slot = m_block_in_unpacked * mblock_size_flat + k_within_mblock
 
-            elem_offset = (
-                cutlass.Int64(h_actual) * cutlass.Int64(head_stride)
-                + cutlass.Int64(dq_accum_batch_offset + position_in_head_slot)
-                * cutlass.Int64(seqlen_stride)
-            )
+            elem_offset = cutlass.Int64(h_actual) * cutlass.Int64(head_stride) + cutlass.Int64(
+                dq_accum_batch_offset + position_in_head_slot
+            ) * cutlass.Int64(seqlen_stride)
             dq_ptr_i64 = (base_ptr + elem_offset).toint()
             dq_gmem_ptr = cute.make_ptr(
                 cutlass.Float32, dq_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
