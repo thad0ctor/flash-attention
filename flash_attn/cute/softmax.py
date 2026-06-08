@@ -117,7 +117,10 @@ class Softmax(ParamsBase):
 
     @cute.jit
     def finalize(
-        self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None
+        self,
+        final_scale: Float32 = 1.0,
+        sink_val: Float32 | cute.Tensor | None = None,
+        is_sm120: cutlass.Constexpr[bool] = False,
     ) -> cute.Tensor:
         """Finalize the online softmax by computing the scale and logsumexp."""
         if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
@@ -141,7 +144,13 @@ class Softmax(ParamsBase):
                 # (the mathematically correct denominator). For finite row_max the
                 # value is unchanged. When sink_val itself is -inf (the suppressed
                 # non-zero SplitKV splits) the term is exp2(-inf) == 0 as intended.
-                row_max_safe = 0.0 if row_max[r] == -Float32.inf else row_max[r]
+                # sm120-only: this guard does not exist on main and is reachable on
+                # SM90 (which shares this base finalize), so restrict it to sm120
+                # callers; SM90/SM80 revert to main's plain row_max[r].
+                if cutlass.const_expr(is_sm120):
+                    row_max_safe = 0.0 if row_max[r] == -Float32.inf else row_max[r]
+                else:
+                    row_max_safe = row_max[r]
                 row_sum[r] += cute.math.exp2(
                     sink_val_cur * LOG2_E - row_max_safe * scale_log2, fastmath=True
                 )

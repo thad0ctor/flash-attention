@@ -798,7 +798,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Fold qhead_per_kvhead into the seqlen mode of mQ/mO/mLSE so the
         # mainloop iterates over KV heads with packed Q rows. Required for
         # the epilogue's pack_gqa.store_O strides to make sense.
-        if const_expr(self.pack_gqa):
+        # sm120-only: this layout folding does not exist on main and must not
+        # run for real SM80 (which keeps the unfolded layout, == main).  The
+        # sm120 forward forces self.arch = Arch.sm_80, so gate on the is_sm120
+        # marker, not self.arch.
+        if const_expr(self.pack_gqa and getattr(self, "is_sm120", False)):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
@@ -1330,7 +1334,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             row_scale = softmax.finalize(
                 sink_val=self.compute_sink_val(
                     learnable_sink, softmax, m_block, num_head, thr_mma_qk, split_idx
-                )
+                ),
+                is_sm120=getattr(self, "is_sm120", False),
             )
             softmax.rescale_O(acc_O, row_scale)
             sO = cute.make_tensor(sQ.iterator, sO_layout)
@@ -1537,7 +1542,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             row_scale = softmax.finalize(
                 sink_val=self.compute_sink_val(
                     learnable_sink, softmax, m_block, num_head, thr_mma_qk, split_idx
-                )
+                ),
+                is_sm120=getattr(self, "is_sm120", False),
             )
             softmax.rescale_O(acc_O, row_scale)
 
@@ -2284,7 +2290,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
         row_scale = softmax.finalize(
-            sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, head_idx, thr_mma_qk)
+            sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, head_idx, thr_mma_qk),
+            is_sm120=getattr(self, "is_sm120", False),
         )
         softmax.rescale_O(acc_O, row_scale)
         sO = cute.make_tensor(sQ.iterator, sO_layout)
