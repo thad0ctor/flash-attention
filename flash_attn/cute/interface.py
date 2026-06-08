@@ -2024,6 +2024,14 @@ def _flash_attn_fwd(
                     static_causal_blocks=sm120_qpkv6_d256_static_causal_blocks,
                     is_split_kv=is_split_kv,
                     num_splits=num_splits,
+                    # Block-sparse: when the sparse Q block size exceeds the kernel
+                    # tile_m (e.g. a 256-wide BlockMask block run with a 128 tile),
+                    # q_subtile_factor maps each kernel m_block to its owning sparse
+                    # block (m_block // factor). Without it the kernel uses factor=1
+                    # and reads past the (smaller) sparse m-block dim -> wrong output
+                    # + illegal memory access. SM80/SM100 pass this; SM120 was the
+                    # lone omission.
+                    q_subtile_factor=q_subtile_factor,
                 )
         else:
             raise ValueError(
