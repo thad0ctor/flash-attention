@@ -1103,11 +1103,11 @@ def _flash_attn_fwd(
             elif (
                 head_dim <= 128
                 and head_dim_v <= 128
-                and sm120_seq_q <= 8
                 and cu_seqlens_q is None
                 and seqused_q is None
                 and page_table is None
                 and qv is None
+                and sm120_seq_q <= 8
             ):
                 # Decode (seqlen_q<=8): the default 128x64 tile wastes the MMA on
                 # ~120 empty query rows -> compute-bound (81% SM, 19% DRAM) while
