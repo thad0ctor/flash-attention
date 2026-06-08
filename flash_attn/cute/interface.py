@@ -173,10 +173,10 @@ def _sm120_bwd_pack_gqa_m_splits(
     exception is the dense D256 qpkv4 S512 small-grid case below, which underfills
     the SMs and wins from a split even though it runs non-packed.
     """
-    # Dense D256 qpkv4 S512 underfills the 188 SMs: grid = ceil(S/64)*Hq*B =
-    # 8*num_head*batch CTAs; num_head*batch <= 32 means <= 256 CTAs (~1.36 waves).
-    # split=2 fills to ~2.7 waves and is ~8% faster than the unsplit default
-    # (RTX6000 interleaved A/B). This shape runs non-packed (pack_gqa=False), so
+    # Dense D256 qpkv4 S512 underfills the SMs: grid = ceil(S/64)*Hq*B =
+    # 8*num_head*batch CTAs; num_head*batch <= 32 means <= 256 CTAs (~1.36 waves
+    # on a high-SM-count sm120 part). split=2 fills to ~2.7 waves and is ~8%
+    # faster than the unsplit default. This shape runs non-packed (pack_gqa=False), so
     # it must be handled before the pack-only early-return. Filled grids
     # (num_head*batch > 32, e.g. B>=4 or Hq32) regress with the split -> excluded;
     # qpkv8 regresses even when underfilled -> excluded by qpkv==4.
@@ -194,10 +194,10 @@ def _sm120_bwd_pack_gqa_m_splits(
         and num_head * batch_size <= 32
     ):
         return 2
-    # B=1 D256 backward underfills the 188 SMs (grid = ceil(S/64)*Hq*1 CTAs, all
+    # B=1 D256 backward underfills the SMs (grid = ceil(S/64)*Hq*1 CTAs, all
     # <~1.4 waves for these small-Hq shapes) so the unsplit default idles SMs.
-    # These exact cells win from an M-split (RTX6000 A/B vs current dispatch:
-    # +12-20%, robust across seeds). B=1 runs non-packed, so handle before the
+    # These exact cells win from an M-split (+12-20% vs the unsplit dispatch,
+    # robust across seeds). B=1 runs non-packed, so handle before the
     # pack-only early-return. B>=2 is excluded: it either auto-splits already or
     # the split is noise (verified). Only these validated cells are listed.
     if (
@@ -864,7 +864,7 @@ def _flash_attn_fwd(
         and batch_size == 2
         and (
             (not causal and sm120_seq_q in (4096, 8192))
-            # RTX6000: causal S4096 also wins with Q-in-regs (0.976 -> 1.067 vs FA2)
+            # causal S4096 also wins with Q-in-regs (measured on sm120)
             or (causal and sm120_seq_q in (4096, 8192))
         )
     ):
@@ -874,9 +874,9 @@ def _flash_attn_fwd(
     # General D256 forward: the 99 KB SMEM cap forces a 64x64 tile only because
     # 128x64 won't fit Q+K+V — but staging Q through registers (max(Q,V)+K)
     # makes 128x64 fit, and it is materially faster for any reasonably long
-    # sequence. RTX 6000 interleaved A/B (agent_space/sm120_d256_wide_confirm.py):
-    # at S>=4096 (square) 128x64+Qregs+256t beats 64x64 by +6-14% across qpkv
-    # 4/8/16, causal and non-causal, with bit-identical output (the per-key
+    # sequence. Measured on sm120: at S>=4096 (square) 128x64+Qregs+256t beats
+    # 64x64 by +6-14% across qpkv 4/8/16, causal and non-causal, with
+    # bit-identical output (the per-key
     # reduction order is unchanged). S<=2048 is mixed (several causal shapes
     # regress) so it is gated out. Shapes already routed to a specific qregs
     # path keep theirs.
@@ -894,7 +894,7 @@ def _flash_attn_fwd(
             # Hq8 (qwen3.5-0.8b) regresses, so gate S2048 nc to num_head>=16.
             # S2048 causal only the widest head count (qpkv16, Hq32 qwen3.5-122b)
             # wins (+6.5%); Hq16 (9b/35b) regress, so gate causal to num_head>=32.
-            # RTX6000 interleaved A/B validated.
+            # Validated on sm120.
             or (sm120_seq_q == 2048 and not causal and num_head >= 16)
             or (sm120_seq_q == 2048 and causal and num_head >= 32)
         )
@@ -906,7 +906,7 @@ def _flash_attn_fwd(
         and qv is None
         and learnable_sink is None
         # varlen (cu_seqlens) is supported by the wide tile (same SM80-base
-        # kernel; RTX6000 A/B +7-11% on packed D256, bit-identical). seqused
+        # kernel; +7-11% on packed D256, bit-identical). seqused
         # mode stays on the 64x64 path (untested).
         and seqused_q is None
         and seqused_k is None
@@ -916,8 +916,8 @@ def _flash_attn_fwd(
     )
     # Local (sliding-window) D256: same Q-in-regs win as the dense wide path.
     # The narrow local-window dispatch used a 64x16/64x32 tile; 128x{32,64}
-    # +Qregs+256t is faster by +3-13% (RTX 6000 interleaved A/B + SDPA-window
-    # validated, agent_space/sm120_local_wide_confirm.py). tile_n scales with
+    # +Qregs+256t is faster by +3-13% (measured on sm120, SDPA-window
+    # validated). tile_n scales with
     # the window: 32 for window<=512, 64 for window~1024 (gemma4-31b). Gated to
     # S>=4096 (the validated range; gemma local benches there).
     sm120_local_d256_wide = (
@@ -954,9 +954,8 @@ def _flash_attn_fwd(
     sm120_num_stages = 1
     if tile_mn is None:
         if arch // 10 == 12:
-            # SM120 forward tile lookup tuned on RTX 5090. See phase5c/REPORT.md
-            # for methodology and per-cell wins. Misses fall back to the
-            # head_dim-only brackets below.
+            # SM120 forward tile lookup tuned per shape on sm120 hardware.
+            # Misses fall back to the head_dim-only brackets below.
             _SM120_TILE_LOOKUP = {
                 # (head_dim, qhead_per_kvhead, seqlen, causal): (tile_m, tile_n, num_stages)
                 (64, 1, 512, 0): (128, 128, 1), (64, 1, 512, 1): (64, 64, 1),
@@ -971,18 +970,18 @@ def _flash_attn_fwd(
                 (64, 4, 4096, 0): (64, 128, 1), (64, 4, 4096, 1): (64, 48, 1),
                 (64, 4, 8192, 0): (128, 128, 1),(64, 4, 8192, 1): (64, 128, 1),
                 (64, 4, 16384, 0): (128, 128, 1),(64, 4, 16384, 1): (64, 64, 2),
-                # RTX6000 S512 D128 GQA: smaller tiles fit 2 CTA/SM (49 KB vs 64-98 KB
+                # S512 D128 GQA: smaller tiles fit 2 CTA/SM (49 KB vs 64-98 KB
                 # -> 8.3%->16.7% occupancy), +5-11% over the larger tile at B2 and B16
                 # and beats FA2 (mirrors upstream FA2 PR #2592's small-seq hd=128 win).
                 (128, 4, 512, 0): (128, 32, 1), (128, 4, 512, 1): (64, 64, 1),
                 (128, 8, 512, 0): (128, 32, 1),
-                (128, 4, 1024, 0): (128, 64, 1), (128, 4, 1024, 1): (64, 96, 1),  # RTX6000: c 64x64->64x96 (+5-6%, 0.97->1.03 vs FA2); nc keeps 128x64 (1.14x)
-                (128, 4, 2048, 0): (128, 64, 1), (128, 4, 2048, 1): (128, 64, 2),  # RTX6000: nc 64x64->128x64 (1.07x); c 64x96->128x64+ns2: stable 1.07x vs FA2 (old 64x96 erratic 0.98-1.08, sometimes lost)
-                (128, 4, 4096, 0): (128, 64, 1), (128, 4, 4096, 1): (128, 48, 1),  # RTX6000: nc 64x64->128x64 (1.10x); c 64x96->128x48 (1.07x)
+                (128, 4, 1024, 0): (128, 64, 1), (128, 4, 1024, 1): (64, 96, 1),  # c 64x64->64x96 (+5-6%); nc keeps 128x64
+                (128, 4, 2048, 0): (128, 64, 1), (128, 4, 2048, 1): (128, 64, 2),  # nc 64x64->128x64; c 64x96->128x64+ns2: more stable than the old erratic 64x96
+                (128, 4, 4096, 0): (128, 64, 1), (128, 4, 4096, 1): (128, 48, 1),  # nc 64x64->128x64; c 64x96->128x48
                 (128, 4, 8192, 0): (128, 32, 1),(128, 4, 8192, 1): (128, 64, 1),
                 (128, 4, 16384, 0): (128, 32, 1),(128, 4, 16384, 1): (128, 64, 1),
                 (128, 5, 1024, 1): (64, 128, 1),
-                (128, 5, 4096, 1): (128, 64, 1),  # RTX6000: 64x128->128x64 (+2.8%, 0.906->0.932 vs FA2); S1024/S8192 keep 64x128 (those regress)
+                (128, 5, 4096, 1): (128, 64, 1),  # 64x128->128x64 (+2.8%); S1024/S8192 keep 64x128 (those regress)
                 (128, 5, 8192, 1): (128, 128, 1),
                 (128, 5, 16384, 1): (64, 128, 1),
                 (128, 5, 32768, 1): (128, 128, 1),
@@ -994,9 +993,9 @@ def _flash_attn_fwd(
                 (128, 7, 4096, 0): (128, 64, 1),(128, 7, 4096, 1): (64, 96, 1),
                 (128, 7, 8192, 0): (128, 64, 1),(128, 7, 8192, 1): (64, 128, 1),
                 (128, 7, 16384, 0): (128, 64, 1),(128, 7, 16384, 1): (64, 128, 1),
-                (128, 8, 1024, 1): (64, 128, 1),  # RTX6000: 64x64->64x128 (1.13x)
-                (128, 8, 4096, 1): (128, 64, 1),  # RTX6000: 64x64->128x64 (1.03x)
-                (128, 8, 4096, 0): (128, 64, 1),  # RTX6000: 64x64->128x64 (1.28x)
+                (128, 8, 1024, 1): (64, 128, 1),  # 64x64->64x128 (1.13x)
+                (128, 8, 4096, 1): (128, 64, 1),  # 64x64->128x64 (1.03x)
+                (128, 8, 4096, 0): (128, 64, 1),  # 64x64->128x64 (1.28x)
                 (128, 8, 8192, 0): (128, 32, 1),
                 (128, 8, 8192, 1): (128, 64, 1),
                 (128, 8, 32768, 1): (128, 32, 1),
@@ -1011,7 +1010,7 @@ def _flash_attn_fwd(
             # non-TMA path below.
             if page_table is not None and head_dim <= 128 and head_dim_v <= 128:
                 # Paged-KV D128: the old 128x128 tile is ~1.4-1.9x slower than
-                # 64x64 / 128-thread on the RTX 6000 (tile_n=128 + the paged
+                # 64x64 / 128-thread on sm120 (tile_n=128 + the paged
                 # cp.async load is inefficient). qpkv5 (Hq40/Hkv8) is the lone
                 # exception — it prefers 128x128 — so it keeps the old tile.
                 # Validated vs SDPA on reconstructed K/V (rel ~1e-3).
@@ -1042,8 +1041,8 @@ def _flash_attn_fwd(
             ):
                 # Gemma local attention only loads a narrow K window;
                 # smaller N tiles reduce wasted local-window work on SM120.
-                # RTX6000: qpkv8 (Gemma e2b) wins ~7% with N=32 vs N=16
-                # (shuffled-tile A/B); qpkv4 (e4b) stays best at N=16.
+                # qpkv8 (Gemma e2b) wins ~7% with N=32 vs N=16 on sm120;
+                # qpkv4 (e4b) stays best at N=16.
                 fwd_cfg = FwdConfig(64, 32 if qhead_per_kvhead == 8 else 16, True, True)
             elif sm120_d256_qregs128:
                 # Qwen-style D256 qpkv8/qpkv16 noncausal rows fit a wider N
@@ -1086,7 +1085,7 @@ def _flash_attn_fwd(
                 and seqused_q is None
                 and seqused_k is None
             ):
-                # B=1 qpkv4 S8192 causal favors a smaller M tile on RTX 5090,
+                # B=1 qpkv4 S8192 causal favors a smaller M tile on sm120,
                 # while the B=2 Qwen/Gemma sweep keeps the lookup path above.
                 fwd_cfg = FwdConfig(64, 64, True, True)
             elif (
@@ -1172,7 +1171,7 @@ def _flash_attn_fwd(
                 # ~120 empty query rows -> compute-bound (81% SM, 19% DRAM) while
                 # decode should be memory-bound. A tiny 16x64 / 1-warp tile cuts
                 # the wasted MMA; with the decode SplitKV trigger this is +50-68%
-                # on D128 decode (RTX6000). D256 decode does not benefit (kept on
+                # on D128 decode (sm120). D256 decode does not benefit (kept on
                 # the path below).
                 fwd_cfg = FwdConfig(16, 64, True, True)
                 num_threads = 32
@@ -1642,8 +1641,8 @@ def _flash_attn_fwd(
         sm120_qpkv6_d256_load_hooks
         and causal
         and sm120_seq_q == sm120_seq_k
-        # RTX 6000: S16384 added. Static causal block bounds was a regression on
-        # the 5090 at S16384 but is a clean +1.6% here (controlled A/B); this
+        # S16384 added. Static causal block bounds is a clean +1.6% here on
+        # sm120 (controlled A/B); this
         # B=2 row uses no Q-regs (qregs is B=2 S4096/8192 only), so the
         # qregs+static wrong-output combo does not apply. Gain scales with S
         # (+1.6% S16384, +2.8% S32768). S8192 excluded (qregs is on there).
@@ -1670,7 +1669,7 @@ def _flash_attn_fwd(
         and sm120_num_stages == 1
     )
     # qpkv5 causal rows are sensitive to both seqlen and batch. Keep this exact
-    # to the RTX 5090 paired A/B winners instead of applying a broad qpkv5 rule.
+    # to the measured per-shape winners instead of applying a broad qpkv5 rule.
     sm120_qpkv5_d128_default_hook_mode = ""
     if sm120_qpkv5_d128_hook_eligible:
         if sm120_seq_q == 8192:
@@ -1788,12 +1787,12 @@ def _flash_attn_fwd(
         sm120_pack_gqa_fast_valid_rows if arch // 10 == 12 else None,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
-        # On SM120 the SM80-base paged-KV mainloop (phase4R) bakes
+        # On SM120 the SM80-base paged-KV mainloop bakes
         # page_size assumptions into FastDivmodDivisor; without keying on
         # page_size, reusing the kernel across calls with different
         # page_size values produces cudaErrorIllegalAddress.
         page_size if (arch // 10 == 12 and page_size is not None) else None,
-        # SM120 forward picks num_stages per shape from the Phase 5c lookup;
+        # SM120 forward picks num_stages per shape from the tile lookup;
         # different lookup entries with the same (tile_m, tile_n) but differing
         # num_stages would otherwise share a compile_key and silently reuse the
         # first-compiled kernel.
@@ -2538,13 +2537,12 @@ def _flash_attn_bwd(
         # num_stages=1 across all head_dim on consumer Blackwell. At
         # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base
         # default was ns=2 but the async pipeline overhead exceeds the
-        # latency-hiding benefit at small tile size. Phase 17C tightened
-        # paired validation (RTX 5090, n_measure=30, interleaved trials)
-        # confirms geomean speedup ~1.06x on 19 d=64 cells with 0
-        # regressions >2%.
+        # latency-hiding benefit at small tile size. Tightened paired
+        # validation (n_measure=30, interleaved trials) confirms geomean
+        # speedup ~1.06x on 19 d=64 cells with 0 regressions >2%.
         num_stages_Q = 1
         num_stages_dO = 1
-        # RTX 6000: D128 long-seq backward is under-pipelined at stages=1. Unlike
+        # D128 long-seq backward is under-pipelined at stages=1. Unlike
         # D256 (which needs the smem alias and is capped at ns=1), D128 has room
         # for a 2nd Q stage; at S>=8192 the long mainloop makes pipelining the Q
         # loads a consistent ~2% win (controlled A/B; gradients match SDPA).
@@ -2773,7 +2771,7 @@ def _flash_attn_bwd(
         and seqused_q is None
         and seqused_k is None
     )
-    # Phase 17B-v2: pack_gqa is now supported in the SM120 backward kernel
+    # pack_gqa is now supported in the SM120 backward kernel
     # as an explicit opt-in.  Keep auto-selection disabled for most SM120
     # backward shapes; the packed Q/dO row-pointer path is only a measured
     # win for narrow fixed dense bf16 D256 rows. Other archs (SM80/SM90/SM100)
@@ -2842,7 +2840,7 @@ def _flash_attn_bwd(
             qhead_per_kvhead == 2 and num_head == 32 and num_head_kv == 16
         )
         if seqlen_q == 1024:
-            # qpkv2 Gemma31 was a 5090 regression but a clean S1024 win here.
+            # qpkv2 Gemma31 is a clean S1024 win on sm120.
             # B=1 halves the grid, so both qpkv8 rows (Hq8/Hkv1 and Hq16/Hkv2)
             # want split4 (+6% / +9% vs the B>=2-tuned split3 / split2).
             if batch_size == 1 and qhead_per_kvhead == 8:
