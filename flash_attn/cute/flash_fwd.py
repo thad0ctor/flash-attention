@@ -1661,6 +1661,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     mQ_cur,
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
+                    split_idx=split_idx if const_expr(self.is_split_kv) else Int32(0),
                 )
 
     @cute.jit
@@ -1936,6 +1937,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ_cur: cute.Tensor,
         aux_tensors=None,
         fastdiv_mods=None,
+        split_idx: Int32 = Int32(0),
     ):
         """Inline mainloop for paged-KV (cp.async, num_stages=1) on SM80/SM120.
 
@@ -2022,63 +2024,79 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # body is open-coded per iteration site below.
         nb = n_block
 
+        # SplitKV: a split with no assigned KV blocks (n_block_min == n_block_max)
+        # must skip ALL compute and fall straight through to the finalize/epilogue,
+        # which then writes the clean empty-split sentinel (O=0, LSE=-inf) the
+        # combine kernel drops.  Without this guard the unconditional first
+        # iteration below would process block max(n_block_max-1, 0) — a block that
+        # actually belongs to a lower split — and emit a finite garbage partial
+        # that the combine double-counts.  Mirrors the dense path's has_work guard.
+        # For the non-split path has_work is always True (a valid tile always has
+        # >= 1 block), so this is a no-op there.
+        has_work = (
+            n_block_max > n_block_min
+            if const_expr(self.is_split_kv)
+            else cutlass.Boolean(True)
+        )
+
         # ---- First (masked) iteration ----
-        acc_S = cute.make_fragment(
-            thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
-        )
-        acc_S.fill(0.0)
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-        # Issue V(nb)
-        paged_kv_manager.load_KV(nb, sV[None, None, 0], "V")
-        cute.arch.cp_async_commit_group()
-        sm80_utils.gemm(
-            thr_mma_qk,
-            acc_S,
-            tSrQ,
-            tSrK,
-            tSsQ,
-            tSsK[None, None, None, 0],
-            smem_thr_copy_Q,
-            smem_thr_copy_K,
-            A_in_regs=self.Q_in_regs,
-        )
-        if const_expr(self.score_mod is not None):
-            self.apply_score_mod(
-                thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
-                softmax_scale=softmax.softmax_scale, seqlen=seqlen,
-                aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+        if has_work:
+            acc_S = cute.make_fragment(
+                thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
             )
-        # Wait for V; issue K(nb-1) if any remaining
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-        if nb - 1 >= n_block_min:
-            paged_kv_manager.load_page_table(nb - 1)
-            paged_kv_manager.load_KV(nb - 1, sK[None, None, 0], "K")
-        cute.arch.cp_async_commit_group()
-        mask.apply_mask(
-            acc_S, n_block=nb,
-            batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
-            thr_mma=thr_mma_qk,
-            mask_causal=self.is_causal, mask_local=self.is_local,
-            aux_tensors=aux_tensors,
-            fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
-            mask_mod=self.mask_mod,
-            mask_seqlen=True,
-        )
-        row_scale = softmax.online_softmax(acc_S, is_first=True, check_inf=True)
-        softmax.rescale_O(acc_O, row_scale)
-        rP = cute.make_fragment_like(acc_S, self.dtype)
-        rP.store(acc_S.load().to(self.dtype))
-        tOrP = layout_utils.reshape_acc_to_frgA(rP)
-        sm80_utils.gemm_rs(
-            thr_mma_pv,
-            acc_O,
-            tOrP,
-            tOrVt,
-            tOsVt[None, None, None, 0],
-            smem_thr_copy_V,
-        )
+            acc_S.fill(0.0)
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            # Issue V(nb)
+            paged_kv_manager.load_KV(nb, sV[None, None, 0], "V")
+            cute.arch.cp_async_commit_group()
+            sm80_utils.gemm(
+                thr_mma_qk,
+                acc_S,
+                tSrQ,
+                tSrK,
+                tSsQ,
+                tSsK[None, None, None, 0],
+                smem_thr_copy_Q,
+                smem_thr_copy_K,
+                A_in_regs=self.Q_in_regs,
+            )
+            if const_expr(self.score_mod is not None):
+                self.apply_score_mod(
+                    thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
+                    softmax_scale=softmax.softmax_scale, seqlen=seqlen,
+                    aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                )
+            # Wait for V; issue K(nb-1) if any remaining
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            if nb - 1 >= n_block_min:
+                paged_kv_manager.load_page_table(nb - 1)
+                paged_kv_manager.load_KV(nb - 1, sK[None, None, 0], "K")
+            cute.arch.cp_async_commit_group()
+            mask.apply_mask(
+                acc_S, n_block=nb,
+                batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+                thr_mma=thr_mma_qk,
+                mask_causal=self.is_causal, mask_local=self.is_local,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+                mask_mod=self.mask_mod,
+                mask_seqlen=True,
+            )
+            row_scale = softmax.online_softmax(acc_S, is_first=True, check_inf=True)
+            softmax.rescale_O(acc_O, row_scale)
+            rP = cute.make_fragment_like(acc_S, self.dtype)
+            rP.store(acc_S.load().to(self.dtype))
+            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+            sm80_utils.gemm_rs(
+                thr_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+                tOsVt[None, None, None, 0],
+                smem_thr_copy_V,
+            )
 
         # ---- Causal/local masked iterations ----
         # After this block, `unmasked_n_block_start` is the n_block from
@@ -2290,7 +2308,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
         row_scale = softmax.finalize(
-            sink_val=self.compute_sink_val(learnable_sink, softmax, m_block, head_idx, thr_mma_qk),
+            sink_val=self.compute_sink_val(
+                learnable_sink, softmax, m_block, head_idx, thr_mma_qk, split_idx
+            ),
             is_sm120=getattr(self, "is_sm120", False),
         )
         softmax.rescale_O(acc_O, row_scale)
@@ -2309,6 +2329,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             head_idx,
             batch_idx,
+            split_idx,
         )
 
 
