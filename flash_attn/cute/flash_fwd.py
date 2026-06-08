@@ -1841,6 +1841,19 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         acc_S.fill(0.0)
 
+        # WAR hazard guard (sm120): this block reuses the single-stage smem K/V
+        # buffers (smem_pipe_write=0). Before overwriting sK/sV with the next
+        # block's cp.async loads we must ensure the *previous* block's QK/PV MMAs
+        # have finished reading those same buffers. Without this, multi-mask-block
+        # tiles (e.g. block-sparse + a within-tile mask_mod such as mini_causal at
+        # seqlen >= 1024) race the load against the prior block's PV GEMM and
+        # produce nondeterministic wrong output once enough heads/CTAs are in
+        # flight. The first block has no predecessor within this tile, and its
+        # prologue already synchronizes after load_Q. Gated to sm120; the SM80
+        # base path is fixed separately.
+        if const_expr(not is_first_n_block and getattr(self, "is_sm120", False)):
+            cute.arch.barrier()
+
         load_K(n_block, smem_pipe_write=0, need_predicates=True)
         cute.arch.cp_async_commit_group()
         load_V(n_block, smem_pipe_write=0, need_predicates=True)
