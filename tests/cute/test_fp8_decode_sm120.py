@@ -30,7 +30,7 @@ import os
 import pytest
 import torch
 
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.interface import _flash_attn_fwd, _fp8_decode_dsl_supported
 
 
 FP8 = torch.float8_e4m3fn
@@ -43,6 +43,17 @@ def _sm120_only():
     cc = torch.cuda.get_device_capability(0)
     if cc != (12, 0):
         pytest.skip(f"Test targets sm_120, current device is sm_{cc[0]}{cc[1]}")
+    if not _fp8_decode_dsl_supported():
+        from importlib.metadata import version as _pkg_version
+        try:
+            _v = _pkg_version("nvidia-cutlass-dsl")
+        except Exception:
+            _v = "<unknown>"
+        pytest.skip(
+            f"sm120 fp8 KV-cache decode is unsupported on nvidia-cutlass-dsl {_v} "
+            "(4.5.x >= 4.5.2 DSL codegen regression: nvgpu.cvt_fpext rejects scalar "
+            "f8E4M3FN). Install 4.5.1 to exercise the fp8 decode path."
+        )
 
 
 def _quantize_kv_e4m3(x: torch.Tensor):

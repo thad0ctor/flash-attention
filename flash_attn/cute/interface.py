@@ -69,6 +69,65 @@ def _parse_arch_str(arch_str):
     return int(major) * 10 + int(minor)
 
 
+def _parse_dsl_version(ver: str) -> tuple:
+    """Parse a nvidia-cutlass-dsl version string (e.g. '4.5.1', '4.6.0.dev0')
+    into a comparable numeric tuple, e.g. (4, 5, 1).  Trailing non-numeric
+    components (rc/dev/post suffixes) are dropped; a leading numeric run is
+    enough for an ordering comparison."""
+    import re
+    parts = []
+    for tok in ver.split("."):
+        m = re.match(r"^(\d+)", tok)
+        if m is None:
+            break
+        parts.append(int(m.group(1)))
+    return tuple(parts)
+
+
+# nvidia-cutlass-dsl 4.5.2 introduced a DSL codegen regression that breaks the
+# sm120 fp8 KV-cache decode kernel: nvgpu.cvt_fpext rejects a scalar f8E4M3FN
+# operand, so the kernel fails to compile.  4.5.1 compiles and runs correctly.
+# Whether a future >4.5.2 release fixes it is unknown, so the predicate guards a
+# half-open interval [4.5.2, _DSL_FP8_DECODE_FIXED_VERSION) of known/assumed-broken
+# versions.  When the DSL is fixed, set _DSL_FP8_DECODE_FIXED_VERSION to the first
+# good release (e.g. (4, 5, 4)) -- no other code change needed.  Chosen over an
+# exact "==4.5.2" check (would silently let a still-broken 4.5.3 through and emit a
+# confusing compile failure) and over a compile-time try/except probe (more robust
+# to version numbers but far more complex/fragile to wire into the JIT path); the
+# floor-and-ceiling window is the most maintainable option that still fails loud.
+_DSL_FP8_DECODE_BROKEN_FLOOR = (4, 5, 2)
+_DSL_FP8_DECODE_FIXED_VERSION = None  # set to the first fixed version tuple once known
+
+
+def _fp8_decode_dsl_supported(version: Optional[str] = None) -> bool:
+    """Whether the installed nvidia-cutlass-dsl can compile the sm120 fp8 KV-cache
+    decode kernel.  Returns False for versions in the known-broken window
+    [4.5.2, _DSL_FP8_DECODE_FIXED_VERSION).  Unknown/unparseable versions are
+    treated as supported (don't over-guard).  `version` is overridable for tests."""
+    if version is None:
+        from importlib.metadata import version as _pkg_version
+        try:
+            version = _pkg_version("nvidia-cutlass-dsl")
+        except Exception:
+            return True  # can't determine -> don't block
+    v = _parse_dsl_version(version)
+    if not v:
+        return True
+    if v < _DSL_FP8_DECODE_BROKEN_FLOOR:
+        return True
+    if _DSL_FP8_DECODE_FIXED_VERSION is not None and v >= _DSL_FP8_DECODE_FIXED_VERSION:
+        return True
+    return False
+
+
+_FP8_DECODE_DSL_ERROR = (
+    "sm120 fp8 (e4m3/e5m2) KV-cache decode requires nvidia-cutlass-dsl 4.5.1 "
+    "(4.5.x >= 4.5.2 has a DSL codegen regression: nvgpu.cvt_fpext rejects a "
+    "scalar f8E4M3FN operand, so the decode kernel fails to compile). "
+    "Install nvidia-cutlass-dsl==4.5.1, or pass bf16/fp16 K/V instead of fp8."
+)
+
+
 @lru_cache(maxsize=None)
 def _get_device_arch():
     """Cached device arch check.
@@ -1315,6 +1374,13 @@ def _flash_attn_fwd(
             "no varlen/paged/qv/local/mask_mod/score_mod/softcap/sink/sparsity and "
             "q_descale is None.  Got an unsupported fp8 K/V configuration."
         )
+    # The sm120 fp8 KV-cache decode kernel fails to compile on a known-broken
+    # nvidia-cutlass-dsl version window (see _fp8_decode_dsl_supported).  Fail loud
+    # with an actionable message instead of letting it surface as a confusing DSL
+    # compile error.  Do NOT silently fall back to bf16: the K/V cache is physically
+    # stored as fp8, so a dtype switch would reinterpret bytes and produce garbage.
+    if want_fp8_decode and not _fp8_decode_dsl_supported():
+        raise NotImplementedError(_FP8_DECODE_DSL_ERROR)
     if want_fp8_decode and num_splits < 2:
         num_splits = 2
         is_split_kv = True
