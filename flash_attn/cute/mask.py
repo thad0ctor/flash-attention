@@ -13,9 +13,41 @@ from quack import layout_utils
 import flash_attn.cute.utils as utils
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.utils import AuxData
 
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
 MASK_R2P_CHUNK_SIZE: int = 32
+
+
+@cute.jit
+def call_mask_mod(
+    mask_mod: cutlass.Constexpr,
+    batch_idx,
+    head_idx,
+    q_idx,
+    kv_idx,
+    seqlen_info,
+    aux_data: AuxData,
+):
+    # Compatibility shim for pre-aux_scalars mask_mod callables.
+    if const_expr(aux_data.scalars is not None):
+        return mask_mod(
+            batch_idx,
+            head_idx,
+            q_idx,
+            kv_idx,
+            seqlen_info,
+            aux_data.tensors,
+            aux_data.scalars,
+        )
+    return mask_mod(
+        batch_idx,
+        head_idx,
+        q_idx,
+        kv_idx,
+        seqlen_info,
+        aux_data.tensors,
+    )
 
 
 @cute.jit
@@ -132,6 +164,16 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    # When True, the R2P bitmask fast-path is used for non-causal seqlen-mask
+    # and causal masks (when not swap_AB). This path assumes the per-thread
+    # column indices in the MMA accumulator follow the standard SM80/SM90
+    # pattern (col_pair stride = 1 within a pair, 8 between pairs). When the
+    # tiled MMA has multiple N-warps (e.g. SM120 backward at 256 threads with
+    # AtomLayoutSdP = (4, 2, 1)), the per-thread column indices interleave
+    # differently and the R2P bitmask produces wrong results. Callers in that
+    # regime should pass r2p_compatible=False to force the general-purpose
+    # per-element comparison path.
+    r2p_compatible: cutlass.Constexpr[bool] = True
 
     @property
     def seqlen_q(self) -> Int32:
@@ -154,7 +196,7 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
@@ -178,7 +220,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
-                r2p = const_expr(not self.swap_AB)
+                r2p = const_expr(not self.swap_AB and self.r2p_compatible)
                 if const_expr(not r2p):
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
@@ -200,7 +242,7 @@ class AttentionMask:
                 and fastdiv_mods[1] is not None
             )
             wrap_aux_indices = const_expr(
-                has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+                has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
             )
 
             for r in cutlass.range_constexpr(nrow):
@@ -229,13 +271,14 @@ class AttentionMask:
                     head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
                     q_idx_ssa = utils.scalar_to_ssa(row_for_mod, cutlass.Int32)
                     kv_idx_ssa = utils.scalar_to_ssa(col_for_mod, cutlass.Int32)
-                    mask_value = mask_mod(
+                    mask_value = call_mask_mod(
+                        mask_mod,
                         batch_idx_ssa,
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
                         self.seqlen_info,
-                        aux_tensors,
+                        aux_data,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
                     if const_expr(mask_seqlen):
@@ -268,7 +311,9 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
+                    r2p = const_expr(
+                        not self.swap_AB and self.r2p_compatible
+                    )  # R2P trick, see apply_mask_sm100
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
@@ -306,7 +351,7 @@ class AttentionMask:
                         if const_expr(self.window_size_left is not None)
                         else None
                     )
-                    r2p_local = const_expr(not self.swap_AB)
+                    r2p_local = const_expr(not self.swap_AB and self.r2p_compatible)
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
                             row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
@@ -401,7 +446,7 @@ class AttentionMask:
         mask_mod: cutlass.Constexpr[Callable],
         batch_idx: Int32,
         head_idx: Int32,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
@@ -434,23 +479,24 @@ class AttentionMask:
                 mask_row = global_row
 
             mask_row_for_mod = mask_row
-            if const_expr(has_fastdiv and aux_tensors is not None):
+            if const_expr(has_fastdiv and aux_data.tensors is not None):
                 if check_q_boundary:
                     _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
             global_col_for_mod = global_col
-            if const_expr(has_fastdiv and mask_seqlen and aux_tensors is not None):
+            if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
                 _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
 
             head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
             mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
             kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
-            mask_value = mask_mod(
+            mask_value = call_mask_mod(
+                mask_mod,
                 batch_idx_ssa,
                 head_idx_ssa,
                 mask_row_ssa,
                 kv_idx_ssa,
                 self.seqlen_info,
-                aux_tensors,
+                aux_data,
             )
             cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
             acc_S[i] = acc_S[i] if cond else -Float32.inf
@@ -471,7 +517,7 @@ class AttentionMask:
         batch_idx: Int32,
         head_idx: Int32,
         vec_size: cutlass.Constexpr[int],
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
@@ -512,7 +558,7 @@ class AttentionMask:
                 head_idx_for_mod = head_idx
                 mask_row = global_row
             mask_row_for_mod = mask_row
-            if const_expr(has_fastdiv and aux_tensors is not None):
+            if const_expr(has_fastdiv and aux_data.tensors is not None):
                 if check_q_boundary:
                     _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
 
@@ -530,19 +576,20 @@ class AttentionMask:
                 col_j_coord = tScS_t2r[i + j][1] if not self.swap_AB else tScS_t2r[i + j][0]
                 col_j_global = col_j_coord + n_block * self.tile_n
                 col_j_for_mod = col_j_global
-                if const_expr(has_fastdiv and mask_seqlen and aux_tensors is not None):
+                if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
                     _, col_j_for_mod = divmod(col_j_global, fastdiv_mods[1])
                 kv_idx_vec[j] = col_j_for_mod
             kv_idx_ssa = kv_idx_vec.load()
 
             # mask_value is already bit-packed by the vectorized mask_mod.
-            mask_value = mask_mod(
+            mask_value = call_mask_mod(
+                mask_mod,
                 batch_idx_ssa_call,
                 head_idx_ssa,
                 mask_row_ssa,
                 kv_idx_ssa,
                 self.seqlen_info,
-                aux_tensors,
+                aux_data,
             )
 
             # For vec_size < 32, multiple mask_mod calls fill one R2P chunk.
@@ -590,7 +637,7 @@ class AttentionMask:
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
         vec_size: cutlass.Constexpr[int] = 1,
@@ -653,7 +700,7 @@ class AttentionMask:
                     mask_mod,
                     batch_idx,
                     head_idx,
-                    aux_tensors,
+                    aux_data,
                     fastdiv_mods,
                     head_divmod,
                     check_q_boundary,
@@ -669,7 +716,7 @@ class AttentionMask:
                     batch_idx,
                     head_idx,
                     vec_size,
-                    aux_tensors,
+                    aux_data,
                     fastdiv_mods,
                     head_divmod,
                     check_q_boundary,
@@ -752,7 +799,7 @@ class AttentionMask:
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         is_full_block: bool = False,
         check_m_boundary: bool = True,
@@ -810,7 +857,7 @@ class AttentionMask:
                     and fastdiv_mods[1] is not None
                 )
                 wrap_aux_indices = const_expr(
-                    has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+                    has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
                 )
                 batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
                 head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
@@ -831,13 +878,14 @@ class AttentionMask:
                     q_idx_ssa = utils.scalar_to_ssa(q_idx_for_mod, cutlass.Int32)
                     kv_idx_ssa = utils.scalar_to_ssa(kv_idx_for_mod, cutlass.Int32)
 
-                    mask_value = mask_mod(
+                    mask_value = call_mask_mod(
+                        mask_mod,
                         batch_idx_ssa,
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
                         self.seqlen_info,
-                        aux_tensors,
+                        aux_data,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
                     acc_S[i] = acc_S[i] if cond else -cutlass.Float32.inf
@@ -1075,6 +1123,7 @@ class Sm100FusedMask:
             has_cu_seqlens_k=False,
             has_seqused_q=False,
             has_seqused_k=False,
+            has_cu_block_idx_offsets=False,
         )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         return n_block_min, n_block_max - n_block_min
@@ -1118,6 +1167,7 @@ class Sm100FusedMask:
             has_cu_seqlens_k=False,
             has_seqused_q=False,
             has_seqused_k=False,
+            has_cu_block_idx_offsets=False,
         )
         n_block_min, _ = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
